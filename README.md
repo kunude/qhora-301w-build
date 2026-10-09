@@ -38,7 +38,7 @@
 [Qualcommax_NSS_Builder](https://github.com/JuliusBairaktaris/Qualcommax_NSS_Builder)
 的 `devices/common/config` 与 `devices/ipq807x-1g/config` —— 那是这套 NSS 栈
 **唯一被持续验证过**的配置组合，所以基本保持原样，只做了两处针对性改动（见下），
-外加在文件末尾追加了 ddns-go / msd_lite / WireGuard / passwall2 四组独立的功能包（见第五节）。
+外加在文件末尾追加了 ddns-go / msd_lite / WireGuard / passwall2 / statistics 五组独立的功能包（见第五节）。
 
 ---
 
@@ -201,8 +201,12 @@ uci set nss.general.enabled='0'; uci commit nss; reboot
 | **msd_lite** | 开机自启 | 客户端按 `http://<路由器IP>:7088/udp/<组播地址>:<端口>` 取流。**接收组播的网卡需要在 `服务 → msd_lite` 里选**（见下） |
 | **WireGuard** | 仅装好 | 没有常驻服务，到 `网络 → 接口` 新建一个 `wg` 协议接口即可，内核模块会自动加载 |
 | **passwall2** | 装好，未启用 | `服务 → Pass Wall 2` 里加节点/订阅后手动起。界面、`xray-core`、`sing-box` 等组件都在固件里；缺的组件可在页面里「组件更新」在线拉（见第五节） |
+| **statistics** | 开机自启 | `状态 → 统计` 里有 CPU（每核占用）、**温度**、内存、接口流量、无线的曲线图。温度采集默认是开的（uci-defaults 打开了 thermal 插件），如果想调去 `统计 → 设置` |
 
 LuCI 界面默认就是简体中文（`CONFIG_LUCI_LANG_zh_Hans=y`，见第六节）。
+注意「状态 → NSS Offload」那一页是英文 —— 它定义在 NSS 分支主树的
+`package/nss/nss-tools` 里，是纯 JS 页面（`luci-nss-{status,qos,connections}.js`），
+**不走 luci.mk、没有 po/ 翻译文件**，所以语言开关对它无效；上游没有翻译，只能保持英文。
 
 想验证服务真的起来了：
 
@@ -213,6 +217,8 @@ ls /etc/rc.d/ | grep -E 'ddns-go|msd_lite'   # 有 S99 开头的链接说明开�
 wg show                                      # 建好 wg 接口后可用
 /etc/init.d/passwall2 status                 # 配好节点后才有意义
 xray version; sing-box version               # 确认核心二进制在固件里
+/etc/init.d/luci_statistics status           # collectd 在跑就有图表
+cat /sys/class/thermal/thermal_zone*/type    # 固件里有哪些温度传感器
 ```
 
 **关于 msd_lite 的组播网卡（`network` 项）**：出厂留空。它填的是"从哪张网卡收组播"，
@@ -231,6 +237,7 @@ xray version; sing-box version               # 确认核心二进制在固件里
 | 只加一个 luci 前端页面 | 在 `scripts/extra-packages.sh` 的 `LUCI_PATHS` 里加路径，再到 `common.config` 加符号 |
 | 开关 passwall2 的某个组件 | 改 `common.config` 里 `CONFIG_PACKAGE_luci-app-passwall2_*` 那几行（例如把 `INCLUDE_Shadowsocks_Rust_Client` 改成 `=y` 就是把 ss-rust 编进固件） |
 | 换 passwall 的仓库 / 分支 | 改 `extra-packages.sh` 顶部的 `PW_APP_REPO` / `PW_PKGS_REPO` / `PW_REF` 默认值（也可以用同名环境变量在 CI 里覆盖） |
+| 调 statistics 采集哪些数据 | `统计 → 设置` 页面，或直接改 `/etc/config/luci_statistics`（温度在 `collectd_thermal` 段） |
 | 钉死 ddns-go / msd_lite 的版本 | `Run workflow` 时填 `ddns_go_version` / `msd_lite_sha`，或改 `packages/net/*/Makefile` 里的兜底值 |
 | 开关某个内核选项 | `common.config` 加 `CONFIG_KERNEL_xxx=y` |
 | 换编译分支 | 工作流 `Run workflow` 时填 `upstream_ref`，或改 YAML 里 `UPSTREAM_REF` 的默认值 |
@@ -522,7 +529,7 @@ make defconfig
    `luci.mk` 生成的 i18n 包都带 `HIDDEN:=1`，没有 prompt，
    `.config` 里的值会被 kconfig 直接忽略。原因见第八节陷阱②。
 
-在上面三条之外，追加了四组功能包（`ddns-go` / `msd_lite` / `WireGuard` / `passwall2`，见第五节）：
+在上面三条之外，追加了五组功能包（`ddns-go` / `msd_lite` / `WireGuard` / `passwall2` / `statistics`，见第五节）：
 
 4. **`ddns-go` / `msd_lite` 改为自带配方**（`packages/net/`），直接引用上游源码
    （`jeessy2/ddns-go`、`rozhuk-im/msd_lite`），版本/ref 由
@@ -538,11 +545,20 @@ make defconfig
    官方 feed 那份；`shadowsocks-rust` / `shadow-tls` 因为会拖进 Rust 工具链而**不编**
    （开关关着，需要时在 LuCI 里在线拉）。详见第五节。
 
+6. **`luci-app-statistics` 补上官方 LuCI 缺的 CPU/温度图表**。官方总览页只有
+   负载均值 —— 10_system.js 里就没有 CPU 占用率和温度这两项，这不是缺包，
+   是官方 LuCI 就这样设计。统计图表走标准方案：collectd + rrdtool1 +
+   cpu/memory/interface/load/iwinfo 采集插件（由 luci-app-statistics 的依赖带出），
+   另外温度插件 `collectd-mod-thermal` **不在**它的默认依赖里，必须显式写出。
+   采集开关在 `/etc/config/luci_statistics`，thermal 出厂是关的，由
+   `files/etc/uci-defaults/99-luci-statistics` 在开机时打开。
+   全套在官方 feed 里，不需要 `extra-packages.sh` 介入。
+
 另外，工作流本身也加了一条能力：**编译失败可远程诊断**（make 输出落盘 + 失败时把
 失败包名和真实报错行发成公开注解，见第八节）。
 
-这四组都是**独立追加**的，删掉它们不影响 NSS 卸载栈本身。
-`WireGuard` 走的是官方 feed 的原生包，不需要额外脚本。
+这五组都是**独立追加**的，删掉它们不影响 NSS 卸载栈本身。
+`WireGuard` 走的是官方 feed 的原生包，`statistics` 也在官方 feed 里，都不需要额外脚本。
 
 ---
 
@@ -664,6 +680,21 @@ CONFIG_LUCI_LANG_zh_Hans=y
 它 `=y` 之后上面那个 `default` 成立，所有 luci 包的简体中文翻译会一起被打开。
 
 ## 九、常见问题
+
+**首页（状态 → 总览）怎么没有 CPU 占用率和温度？**
+官方 LuCI 的总览页本来就没有这两项 —— `10_system.js` 只显示主机名/型号/内核/
+时间/运行时长/负载均值。要看曲线图去 `状态 → 统计`（collectd 那套，本固件已带，
+温度采集默认开着）；`状态 → NSS Offload` 里还有 NSS 专用的核心负载和端口卸载统计。
+
+**「状态 → NSS Offload」为什么是英文？**
+这个页面不是 luci feed 里的应用，而是 NSS 分支主树 `package/nss/nss-tools` 附带的
+纯 JS 页面，上游没有提供任何翻译文件（也不走 luci.mk 的翻译机制），所以
+`CONFIG_LUCI_LANG_zh_Hans` 管不到它。除非上游加翻译，否则只能英文。
+
+**统计页里没有温度曲线？**
+温度插件（`collectd-mod-thermal`）固件里已带、开机脚本也已打开采集开关；
+如果还是空的，去 `统计 → 设置 → Thermal` 看传感器列表有没有被选上，
+或者 `cat /sys/class/thermal/thermal_zone*/type` 确认内核暴露了哪些温度区。
 
 **构建超时（6 小时）。**
 首次运行没有 ccache，最慢；GitHub 托管 runner 单 job 上限就是 6 小时。

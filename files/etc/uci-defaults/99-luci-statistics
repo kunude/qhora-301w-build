@@ -1,0 +1,17 @@
+#!/bin/sh
+#
+# luci-app-statistics 出厂配置里 thermal（温度）采集默认是关的
+# （/etc/config/luci_statistics 的 collectd_thermal 段 enable='0'）。
+# 加这个包就是为了看温度，所以这里打开它；其余插件（cpu / memory /
+# interface / load / iwinfo）上游默认就是开的，不动。
+#
+# collectd-mod-thermal 不给 Sensor 列表时读 /sys/class/thermal/ 下全部
+# 温度区，ipq8072 的几个 zone（CPU / WiFi / PLL）都会被采到。
+# 想微调去 LuCI「统计 - 设置」里改。
+
+if [ -f /etc/config/luci_statistics ]; then
+	uci -q set luci_statistics.collectd_thermal.enable='1'
+	uci -q commit luci_statistics
+fi
+
+exit 0

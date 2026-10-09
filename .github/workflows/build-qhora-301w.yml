@@ -405,6 +405,8 @@ jobs:
           #
           # dnsmasq-full 是"nftables 透明代理那支真的生效了"的凭证（默认镜像是
           # dnsmasq，被 dnsmasq-full 挤掉）。kmod-nft-* 是 TPROXY 的内核侧前提。
+          # statistics 三个：CPU/内存/温度图表（collectd-mod-thermal 不在
+          # luci-app-statistics 的默认依赖里，必须显式选）。
           WANT="msd_lite luci-app-msd_lite luci-i18n-msd_lite-zh-cn \
                 ddns-go luci-app-ddns-go luci-i18n-ddns-go-zh-cn \
                 wireguard-tools luci-proto-wireguard kmod-wireguard \
@@ -412,7 +414,9 @@ jobs:
                 xray-core sing-box chinadns-ng geoview tcping \
                 v2ray-geoip v2ray-geosite shadowsocksr-libev-ssr-local \
                 simple-obfs-client v2ray-plugin haproxy lyaml \
-                dnsmasq-full kmod-nft-tproxy kmod-nft-socket"
+                dnsmasq-full kmod-nft-tproxy kmod-nft-socket \
+                luci-app-statistics luci-i18n-statistics-zh-cn \
+                collectd-mod-thermal rrdtool1"
 
           # ── ① 先搞清楚这个分支用的是 apk 还是 opkg ─────────────────
           # 新版 OpenWrt 默认 CONFIG_USE_APK=y，包文件是 <name>-<version>.apk；
