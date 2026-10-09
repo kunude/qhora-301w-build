@@ -1,0 +1,12 @@
+# 构建过程中会拉到仓库目录下的 OpenWrt 源码树（本地编译时用）
+/openwrt/
+/dl/
+/build/
+/bin/
+/tmp/
+
+# 编译产物
+*.bin
+*.itb
+*.tar.zst
+!configs/**

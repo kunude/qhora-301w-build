@@ -1,0 +1,7 @@
+# 强制 LF 换行：在 Windows 上提交也不会把 shell 脚本写成 CRLF，
+# 否则 Linux runner 上会报 "bad interpreter: /usr/bin/env bash^M"。
+* text=auto eol=lf
+*.sh text eol=lf
+*.config text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf

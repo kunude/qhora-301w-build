@@ -1,0 +1,13 @@
+#!/bin/sh
+#
+# QHora-301W 首次启动执行一次，执行成功后 OpenWrt 会自动删除本脚本。
+#
+# 只做最小改动：改主机名，并把 Wi-Fi 已知状态写进说明。
+# 无线默认关闭且没有密钥，需要自己到「网络 -> 无线」开起来并设置密码。
+
+uci -q batch <<EOF
+set system.@system[0].hostname='QHora-301W'
+commit system
+EOF
+
+exit 0

@@ -1,0 +1,283 @@
+name: Build QHora-301W (NSS EDMA)
+
+# 从 JuliusBairaktaris/openwrt-nss-edma 的 nss-edma-rework 分支，为 QNAP QHora-301W
+# （qualcommax / ipq807x / qnap_301w）编译带 Qualcomm NSS 硬件卸载的 OpenWrt 固件。
+#
+# 触发方式：
+#   · 手动：Actions -> 左侧本工作流 -> Run workflow（可勾选是否创建 Release）
+#   · 推送：本文件、configs/、scripts/、files/ 有改动时
+#   · 定时：每周一 00:30（东八区）检查上游是否有新提交
+#
+# 产物（actions artifact，勾选 Release 时同时挂到 release）：
+#   openwrt-qualcommax-ipq807x-qnap_301w-squashfs-sysupgrade.bin   日常升级用
+#   openwrt-qualcommax-ipq807x-qnap_301w-initramfs-uImage.itb      首次安装用（U-Boot TFTP）
+#   openwrt-qualcommax-ipq807x-qnap_301w-squashfs-factory.bin      eMMC 整盘写入用
+#   sha256sums / config.buildinfo / profiles.json                  校验与构建溯源
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "要编译的 openwrt-nss-edma ref（分支 / 标签 / commit）"
+        required: true
+        default: nss-edma-rework
+      release:
+        description: "构建成功后创建 GitHub Release 并附带镜像"
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/build-qhora-301w.yml"
+      - "configs/**"
+      - "scripts/**"
+      - "files/**"
+  schedule:
+    # GitHub 的 cron 用 UTC；16:30 UTC = 次日 00:30 东八区
+    - cron: "30 16 * * 0"
+
+# 不要并发跑两个全量编译，否则磁盘和 runner 都不够用。
+concurrency:
+  group: build-qhora-301w-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # ── 上游源码 ────────────────────────────────────────────────
+  # 如果你想用自己 fork 的源码，把这里改成 "你的用户名/openwrt-nss-edma" 即可。
+  UPSTREAM_REPOSITORY: JuliusBairaktaris/openwrt-nss-edma
+  # 用 github.event.inputs 而不是 inputs：两者在 workflow_dispatch 下等价，
+  # 但前者在 push / schedule 事件下也能安全求值（返回空）。
+  UPSTREAM_REF: ${{ github.event.inputs.upstream_ref || 'nss-edma-rework' }}
+  # NSS 驱动 / ECM / qdisc / 固件所在的独立 feed。
+  # 缺了它 ATH11K_NSS_SUPPORT 的依赖不满足，连 defconfig 都会失败。
+  NSS_FEED: "src-git nss https://github.com/JuliusBairaktaris/nss-packages.git;edma-nss"
+
+  # ── 目标机型 ────────────────────────────────────────────────
+  TARGET: qualcommax
+  SUBTARGET: ipq807x
+  DEVICE: qnap_301w
+  DEVICE_LABEL: QHora-301W
+  OPENWRT_DIR: ${{ github.workspace }}/openwrt
+  BUILDER_DIR: ${{ github.workspace }}/builder
+
+jobs:
+  build:
+    name: Build ${{ github.event.inputs.upstream_ref || 'nss-edma-rework' }} -> QHora-301W
+    # 上游作者自己的 CI 就跑在 ubuntu-26.04 上，照抄可以避免踩环境坑。
+    # 如果这个 label 不可用，换成 ubuntu-24.04 也可以。
+    runs-on: ubuntu-26.04
+    # GitHub 托管 runner 单个 job 硬上限 6 小时，这里留 5 分钟收尾。
+    timeout-minutes: 355
+    permissions:
+      # 勾选 release 时需要有写权限。仓库设置里
+      # Settings -> Actions -> General -> Workflow permissions 需要允许读写。
+      contents: write
+
+    steps:
+      # ── 释放磁盘 ──────────────────────────────────────────────
+      # 全量编译（工具链 + 内核 + 全部软件包）大约需要 25-35GB，
+      # runner 根分区默认不够，先删掉用不到的预装 SDK。
+      - name: 释放磁盘空间
+        run: |
+          set -euo pipefail
+          df -h / | tail -1
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /usr/local/share/boost \
+            /opt/hostedtoolcache/CodeQL || true
+          sudo apt-get clean
+          df -h / | tail -1
+
+      # ── 系统依赖 ──────────────────────────────────────────────
+      - name: 安装构建依赖
+        run: |
+          set -euo pipefail
+          # OpenWrt 自建 flex/bison 等 host 工具，所以宿主机只需要最小集合。
+          # 这个列表与上游 Qualcommax_NSS_Builder 的 CI 保持一致，是验证过的组合。
+          sudo apt-get update || true
+          sudo apt-get install -y \
+            bzip2 g++ gawk gcc git glibc-source libncurses-dev make rsync
+
+      # ── 拉取源码 ──────────────────────────────────────────────
+      # 注意：nss-edma-rework 分支和 edma-nss feed 上游会定期 rebase，
+      # 所以每次都用远端最新状态，不做增量 pull。
+      - name: 检出 OpenWrt 源码（nss-edma-rework）
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.UPSTREAM_REPOSITORY }}
+          ref: ${{ env.UPSTREAM_REF }}
+          fetch-depth: 0
+          path: openwrt
+
+      - name: 检出本仓库（配置与脚本）
+        uses: actions/checkout@v7
+        with:
+          path: builder
+
+      # ── 组装构建环境 ──────────────────────────────────────────
+      - name: 准备构建环境（feeds + .config + 覆盖文件）
+        run: bash "$BUILDER_DIR/scripts/prepare-build.sh"
+
+      # ── 可复现构建 ────────────────────────────────────────────
+      - name: 设置可复现构建环境变量
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+          git log -1 --format='  upstream commit : %H %ci%n  subject         : %s'
+          {
+            echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)"
+            echo "TZ=UTC"
+            echo "LC_ALL=C"
+            echo "KBUILD_BUILD_USER=builder"
+            echo "KBUILD_BUILD_HOST=github-actions"
+          } >>"$GITHUB_ENV"
+
+      # ── 下载源码包 ────────────────────────────────────────────
+      # 上游镜像偶尔抽风，重试三次。下载好的包在多次运行之间缓存复用。
+      - name: 恢复源码包缓存
+        uses: actions/cache/restore@v6
+        with:
+          path: openwrt/dl
+          # 带上 run_attempt：整个 run 重跑时不会撞上已存在的 key
+          key: dl-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: dl-
+
+      - name: 下载源码包
+        id: download
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+          mkdir -p dl
+          before=$(find dl -maxdepth 1 -type f | wc -l)
+          for attempt in 1 2 3; do
+            if make download -j"$(nproc)"; then break; fi
+            if [[ $attempt -ge 3 ]]; then echo "::error::源码包下载连续失败三次"; exit 1; fi
+            echo "::warning::第 $attempt 次下载失败，重试"
+            sleep 10
+          done
+          if [[ "$(find dl -maxdepth 1 -type f | wc -l)" -gt "$before" ]]; then
+            echo "grew=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "grew=false" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: 保存源码包缓存
+        if: steps.download.outputs.grew == 'true'
+        # 缓存只是加速手段，存不进去（配额满、key 冲突）不该让整个构建失败
+        continue-on-error: true
+        uses: actions/cache/save@v6
+        with:
+          path: openwrt/dl
+          key: dl-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # ── ccache ────────────────────────────────────────────────
+      # 缓存 key 里带上工具链目录树的哈希和 binutils/gcc/libc 的配置：
+      # 任何一项变了都从空缓存开始，避免命中错误的目标文件。
+      - name: 计算 ccache key
+        id: ccache
+        run: |
+          set -euo pipefail
+          tree=$(git -C openwrt rev-parse HEAD:toolchain)
+          sum=$({
+            echo "$tree"
+            grep -E '^CONFIG_(BINUTILS|GCC|LIBC|MUSL|GLIBC)_' openwrt/.config
+            gcc --version; as --version
+          } | sha256sum | cut -c1-16)
+          echo "prefix=ccache-qhora301w-$sum-" >>"$GITHUB_OUTPUT"
+
+      - name: 恢复 ccache
+        uses: actions/cache@v6
+        with:
+          path: openwrt/.ccache
+          key: ${{ steps.ccache.outputs.prefix }}${{ github.run_id }}
+          restore-keys: ${{ steps.ccache.outputs.prefix }}
+
+      # ── 编译 ──────────────────────────────────────────────────
+      # 首次运行没有缓存会慢很多；如果撞到 6 小时上限，直接重跑一次，
+      # ccache 和 dl 缓存都会复用。
+      - name: 编译
+        working-directory: openwrt
+        env:
+          CCACHE_COMPILERCHECK: content
+          CCACHE_MAXSIZE: 5G
+        run: |
+          set -euo pipefail
+          if ! make -j"$(nproc)"; then
+            echo "::warning::并行编译失败，改用单线程 -j1 V=s 重跑以拿到完整报错"
+            make -j1 V=s
+          fi
+          staging_dir/host/bin/ccache -s || true
+
+      # ── 收集产物 ──────────────────────────────────────────────
+      - name: 收集并校验产物
+        run: |
+          set -euo pipefail
+          out="openwrt/bin/targets/${TARGET}/${SUBTARGET}"
+          [[ -d "$out" ]] || { echo "::error::输出目录不存在：$out"; exit 1; }
+
+          ls -lh "$out"
+
+          # 必须有 sysupgrade；没有就说明设备压根没编进去。
+          compgen -G "$out/*${DEVICE}*squashfs-sysupgrade.bin" >/dev/null ||
+            { echo "::error::$out 下没有 ${DEVICE} 的 sysupgrade 镜像"; exit 1; }
+
+          {
+            echo "## QHora-301W 构建产物"
+            echo
+            echo '```'
+            (cd "$out" && ls -lh . | grep -E "${DEVICE}|sha256sums|config.buildinfo" || true)
+            echo '```'
+            echo
+            echo "- 上游：\`${UPSTREAM_REPOSITORY}@$(git -C openwrt rev-parse --short HEAD)\`"
+            if [[ -f "$out/config.buildinfo" ]]; then
+              echo "- NSS 固件档位：\`$(grep -m1 '^CONFIG_NSS_FIRMWARE_VERSION' "$out/config.buildinfo" || true)\`"
+            fi
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: 上传镜像（artifact）
+        uses: actions/upload-artifact@v7
+        with:
+          name: openwrt-${{ env.DEVICE }}-${{ github.run_number }}
+          path: |
+            openwrt/bin/targets/qualcommax/ipq807x/*qnap_301w*
+            openwrt/bin/targets/qualcommax/ipq807x/sha256sums
+            openwrt/bin/targets/qualcommax/ipq807x/config.buildinfo
+            openwrt/bin/targets/qualcommax/ipq807x/profiles.json
+          if-no-files-found: error
+          retention-days: 30
+
+      # ── 可选：发 Release ──────────────────────────────────────
+      - name: 计算 Release 标签
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.release == 'true'
+        id: tag
+        run: echo "tag=qhora-301w-$(date -u +%Y%m%d)-${{ github.run_number }}" >>"$GITHUB_OUTPUT"
+
+      - name: 创建 Release
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.release == 'true'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: QHora-301W NSS EDMA ${{ steps.tag.outputs.tag }}
+          draft: false
+          prerelease: false
+          body: |
+            QNAP QHora-301W（qualcommax / ipq807x / qnap_301w）固件，
+            基于 `${{ env.UPSTREAM_REPOSITORY }}` 的 `${{ env.UPSTREAM_REF }}` 分支，
+            带 Qualcomm NSS 硬件卸载。
+
+            | 文件 | 用途 |
+            |---|---|
+            | `*-initramfs-uImage.itb` | **首次安装**：U-Boot 里用 TFTP 引导，再 sysupgrade |
+            | `*-squashfs-sysupgrade.bin` | 日常升级（已在跑 OpenWrt 时） |
+            | `*-squashfs-factory.bin` | eMMC 整盘写入 |
+
+            刷机前先用 `sha256sums` 校验。
+            NSS 卸载开机自启，`nss-status` 可查看运行状态；
+            想退回纯主机协议栈：`uci set nss.general.enabled='0'; uci commit nss; reboot`。
+          files: |
+            openwrt/bin/targets/qualcommax/ipq807x/*qnap_301w*
