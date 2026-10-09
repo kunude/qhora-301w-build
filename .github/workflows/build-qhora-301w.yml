@@ -280,6 +280,53 @@ jobs:
             fi
           } >>"$GITHUB_STEP_SUMMARY"
 
+      # ── 校验功能包真的进了固件 ────────────────────────────────
+      # 配置里写 CONFIG_PACKAGE_x=y 只证明"被选中"，不证明"编出来了"。
+      # 这里从两个互相独立的角度核对：
+      #   ① 包有没有生成 .ipk —— 没生成就是压根没编译；
+      #   ② 包名有没有出现在设备 .manifest —— 那是最终 rootfs 的包清单。
+      # 结果用 ::notice:: 输出：注解是公开可读的，而作业日志和 artifact
+      # 内容都要登录才能看，这样远程（含无人值守脚本）也能核对。
+      - name: 校验功能包是否真的编进固件
+        run: |
+          set -euo pipefail
+          out="openwrt/bin/targets/${TARGET}/${SUBTARGET}"
+
+          # 用户显式要求打开的功能包；缺任何一个都说明这份固件不含该功能。
+          WANT="msd_lite luci-app-msd_lite luci-i18n-msd_lite-zh-cn \
+                ddns-go luci-app-ddns-go luci-i18n-ddns-go-zh-cn \
+                wireguard-tools luci-proto-wireguard kmod-wireguard"
+
+          manifests=$(ls "$out"/*.manifest 2>/dev/null || true)
+          [[ -n "$manifests" ]] || echo "::warning::$out 下没有 .manifest，只能核对 .ipk"
+
+          bad=0
+          for p in $WANT; do
+            # ① 构建产物：普通包在 bin/packages/<arch>/<feed>/，
+            #    内核模块可能落在 bin/targets/<t>/<s>/packages/。find 用 -quit
+            #    拿到第一个就停；找不到也返回 0，不会被 set -e 杀掉。
+            ipk=$(find openwrt/bin/packages openwrt/bin/targets \
+                    -name "${p}_*.ipk" -print -quit 2>/dev/null || true)
+
+            # ② 最终 rootfs 清单（.manifest 每行形如 "msd_lite - 2023-..."）
+            inmanifest=""
+            for m in $manifests; do
+              if grep -qE "^${p} " "$m"; then inmanifest=$(basename "$m"); break; fi
+            done
+
+            if [[ -z "$ipk" ]]; then
+              echo "::error::$p 没有生成 .ipk —— 它没有被编译"
+              bad=$((bad + 1))
+            elif [[ -n "$inmanifest" ]]; then
+              echo "::notice title=功能包已编入::$p  ($(basename "$ipk"))  出现在 $inmanifest"
+            else
+              echo "::warning::$p 编出来了（$(basename "$ipk")）但设备 manifest 里没有它"
+            fi
+          done
+
+          [[ "$bad" -eq 0 ]] || { echo "::error::有 $bad 个要求的功能包没有被编译"; exit 1; }
+          echo "要求的功能包全部已编译并进入 rootfs"
+
       - name: 上传镜像（artifact）
         uses: actions/upload-artifact@v7
         with:
