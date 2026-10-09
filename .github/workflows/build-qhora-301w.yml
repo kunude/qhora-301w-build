@@ -35,6 +35,20 @@ on:
         description: "钉死 msd_lite 的 commit sha（留空 = 跟随上游 master HEAD）"
         required: false
         default: ""
+      # passwall2 没有"钉版本"的必要（组件配方和上游 main 是同步维护的），
+      # 但可以换分支或换源（自建镜像 / fork）。三个都留空就用下面的默认值。
+      passwall_ref:
+        description: "passwall 仓库的分支 / 标签（留空 = main）"
+        required: false
+        default: ""
+      passwall_app_repo:
+        description: "openwrt-passwall2 仓库地址（留空 = Openwrt-Passwall 官方）"
+        required: false
+        default: ""
+      passwall_pkgs_repo:
+        description: "openwrt-passwall-packages 仓库地址（留空 = Openwrt-Passwall 官方）"
+        required: false
+        default: ""
   push:
     branches: [main]
     paths:
@@ -157,6 +171,11 @@ jobs:
           # 求值为空字符串，所以那两个触发方式天然就是"跟随最新"。
           DDNS_GO_VERSION: ${{ github.event.inputs.ddns_go_version }}
           MSD_LITE_SHA: ${{ github.event.inputs.msd_lite_sha }}
+          # passwall2 + 17 个组件：浅克隆这三个仓库后落位到 feed 里。
+          # 全部留空 = 用 extra-packages.sh 里的默认值（Openwrt-Passwall 官方 main）。
+          PW_REF: ${{ github.event.inputs.passwall_ref }}
+          PW_APP_REPO: ${{ github.event.inputs.passwall_app_repo }}
+          PW_PKGS_REPO: ${{ github.event.inputs.passwall_pkgs_repo }}
         run: bash "$BUILDER_DIR/scripts/prepare-build.sh"
 
       # 日志要仓库 admin 权限才能从 API 下载，所以把它回放到控制台，
@@ -379,9 +398,21 @@ jobs:
           out="openwrt/bin/targets/${TARGET}/${SUBTARGET}"
 
           # 用户显式要求打开的功能包；缺任何一个都说明这份固件不含该功能。
+          #
+          # passwall2 那一组单独列全：它的依赖组件是通过 Kconfig 的 select 拉进来的，
+          # 而 select 失败是**静默**的（package/feeds 里少了配方，符号就被丢掉）。
+          # 不点名的话，"镜像里没有 xray-core"要等两小时编完才发现。
+          #
+          # dnsmasq-full 是"nftables 透明代理那支真的生效了"的凭证（默认镜像是
+          # dnsmasq，被 dnsmasq-full 挤掉）。kmod-nft-* 是 TPROXY 的内核侧前提。
           WANT="msd_lite luci-app-msd_lite luci-i18n-msd_lite-zh-cn \
                 ddns-go luci-app-ddns-go luci-i18n-ddns-go-zh-cn \
-                wireguard-tools luci-proto-wireguard kmod-wireguard"
+                wireguard-tools luci-proto-wireguard kmod-wireguard \
+                luci-app-passwall2 luci-i18n-passwall2-zh-cn \
+                xray-core sing-box chinadns-ng geoview tcping \
+                v2ray-geoip v2ray-geosite shadowsocksr-libev-ssr-local \
+                simple-obfs-client v2ray-plugin haproxy lyaml \
+                dnsmasq-full kmod-nft-tproxy kmod-nft-socket"
 
           # ── ① 先搞清楚这个分支用的是 apk 还是 opkg ─────────────────
           # 新版 OpenWrt 默认 CONFIG_USE_APK=y，包文件是 <name>-<version>.apk；

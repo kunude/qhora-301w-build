@@ -6,6 +6,8 @@
 #      · ddns-go / msd_lite 用本仓库自带配方（packages/net/*，直接引上游源码），
 #        版本由 resolve-versions.sh 在构建时解析注入
 #      · luci-app-ddns-go / luci-app-msd_lite 是纯前端，从 ImmortalWrt 稀疏检出
+#      · luci-app-passwall2 + 17 个依赖组件取自 Openwrt-Passwall 组织的仓库，
+#        直接用上游当前 main（这些配方与上游版本同步维护，不需要我们注入版本）
 #   2. 把 configs/common.config + configs/qhora_301w.config 拼成 .config，跑 make defconfig
 #   3. 校验 defconfig 没有静默丢弃符号（Kconfig 在依赖不满足时会无声地去掉选项）
 #   4. 关闭 NSS feed 的整体打包（feeds.conf 里声明了，但我们只要 .config 里显式选的包）
@@ -180,14 +182,20 @@ log "安装全部 feed"
 log "feeds install 完成，package/feeds/ 下有："
 ls -1 package/feeds/ 2>/dev/null | sed 's/^/    /' | tee -a "$LOG_FILE" >&3 || true
 
-# 确认那 4 个引入的包真的被 install 认领了（索引没重建的话这一步会漏）。
+# 确认这些引入的包真的被 install 认领了（索引没重建的话这一步会漏）。
 for p in ddns-go msd_lite; do
   [[ -e "package/feeds/packages/$p" ]] \
     || die "package/feeds/packages/$p 不存在，引入的包没有被 feeds install 接管"
 done
-for p in luci-app-ddns-go luci-app-msd_lite; do
+for p in luci-app-ddns-go luci-app-msd_lite luci-app-passwall2; do
   [[ -e "package/feeds/luci/$p" ]] \
     || die "package/feeds/luci/$p 不存在，引入的包没有被 feeds install 接管"
+done
+# passwall 的依赖组件是个会变的集合（上游加组件时 extra-packages.sh 自动带上），
+# 所以这里只抽查几个**稳定必需**的，剩下的交给 .config 符号校验和产物校验。
+for p in xray-core sing-box chinadns-ng v2ray-geodata geoview tcping; do
+  [[ -e "package/feeds/packages/$p" ]] \
+    || die "package/feeds/packages/$p 不存在，passwall 组件没有被 feeds install 接管"
 done
 
 # 没有这个 feed，ATH11K_NSS_SUPPORT 会因依赖不满足而无法在 menuconfig 里选中。

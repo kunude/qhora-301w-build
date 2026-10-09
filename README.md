@@ -26,7 +26,7 @@
 │   └── msd_lite/                            #   同上
 ├── scripts/
 │   ├── prepare-build.sh                     # 组装 .config、跑 defconfig、校验、叠加覆盖文件
-│   ├── extra-packages.sh                    # 把自带配方和 ImmortalWrt 前端包放进 feed 目录树
+│   ├── extra-packages.sh                    # 把自带配方 / ImmortalWrt 前端 / passwall2 放进 feed 目录树
 │   ├── resolve-versions.sh                  # 构建时解析上游最新版本，注入到上面两个配方
 │   └── push-to-github.sh                    # 本地一键推送脚本
 ├── files/etc/uci-defaults/99-qhora-301w     # 首次启动的设置（主机名、启用服务）
@@ -38,7 +38,7 @@
 [Qualcommax_NSS_Builder](https://github.com/JuliusBairaktaris/Qualcommax_NSS_Builder)
 的 `devices/common/config` 与 `devices/ipq807x-1g/config` —— 那是这套 NSS 栈
 **唯一被持续验证过**的配置组合，所以基本保持原样，只做了两处针对性改动（见下），
-外加在文件末尾追加了 ddns-go / msd_lite / WireGuard 三组独立的功能包（见第五节）。
+外加在文件末尾追加了 ddns-go / msd_lite / WireGuard / passwall2 四组独立的功能包（见第五节）。
 
 ---
 
@@ -200,6 +200,7 @@ uci set nss.general.enabled='0'; uci commit nss; reboot
 | **ddns-go** | 开机自启 | Web 界面 `http://<路由器IP>:9876`，在里面添加 DDNS 记录。数据在 `/etc/ddns-go/config.yaml` |
 | **msd_lite** | 开机自启 | 客户端按 `http://<路由器IP>:7088/udp/<组播地址>:<端口>` 取流。**接收组播的网卡需要在 `服务 → msd_lite` 里选**（见下） |
 | **WireGuard** | 仅装好 | 没有常驻服务，到 `网络 → 接口` 新建一个 `wg` 协议接口即可，内核模块会自动加载 |
+| **passwall2** | 装好，未启用 | `服务 → Pass Wall 2` 里加节点/订阅后手动起。界面、`xray-core`、`sing-box` 等组件都在固件里；缺的组件可在页面里「组件更新」在线拉（见第五节） |
 
 LuCI 界面默认就是简体中文（`CONFIG_LUCI_LANG_zh_Hans=y`，见第六节）。
 
@@ -210,6 +211,8 @@ LuCI 界面默认就是简体中文（`CONFIG_LUCI_LANG_zh_Hans=y`，见第六�
 /etc/init.d/msd_lite status
 ls /etc/rc.d/ | grep -E 'ddns-go|msd_lite'   # 有 S99 开头的链接说明开机自启已生效
 wg show                                      # 建好 wg 接口后可用
+/etc/init.d/passwall2 status                 # 配好节点后才有意义
+xray version; sing-box version               # 确认核心二进制在固件里
 ```
 
 **关于 msd_lite 的组播网卡（`network` 项）**：出厂留空。它填的是"从哪张网卡收组播"，
@@ -226,6 +229,8 @@ wg show                                      # 建好 wg 接口后可用
 | 多加一个软件包 | 在 `configs/common.config` 末尾加 `CONFIG_PACKAGE_xxx=y` |
 | 加一个**官方 feed 没有**的包 | 在 `packages/<分类>/<包>/` 放一份自带配方，`extra-packages.sh` 会自动落位；再到 `common.config` 加符号（见下） |
 | 只加一个 luci 前端页面 | 在 `scripts/extra-packages.sh` 的 `LUCI_PATHS` 里加路径，再到 `common.config` 加符号 |
+| 开关 passwall2 的某个组件 | 改 `common.config` 里 `CONFIG_PACKAGE_luci-app-passwall2_*` 那几行（例如把 `INCLUDE_Shadowsocks_Rust_Client` 改成 `=y` 就是把 ss-rust 编进固件） |
+| 换 passwall 的仓库 / 分支 | 改 `extra-packages.sh` 顶部的 `PW_APP_REPO` / `PW_PKGS_REPO` / `PW_REF` 默认值（也可以用同名环境变量在 CI 里覆盖） |
 | 钉死 ddns-go / msd_lite 的版本 | `Run workflow` 时填 `ddns_go_version` / `msd_lite_sha`，或改 `packages/net/*/Makefile` 里的兜底值 |
 | 开关某个内核选项 | `common.config` 加 `CONFIG_KERNEL_xxx=y` |
 | 换编译分支 | 工作流 `Run workflow` 时填 `upstream_ref`，或改 YAML 里 `UPSTREAM_REF` 的默认值 |
@@ -242,20 +247,26 @@ wg show                                      # 建好 wg 接口后可用
 
 ### 关于 extra-packages.sh
 
-`ddns-go` 和 `msd_lite` 在 OpenWrt 官方 `packages` feed 里**不存在**（实测
-`net/ddns-go`、`net/msd_lite` 都是 404）。这里没有把整个 ImmortalWrt feed 加进
-`feeds.conf` —— 那个 feed 是官方 feed 的分支，有成百上千个同名包
-（`luci-app-firewall`、`aria2`……），两份同名包会互相打架，而这个 NSS 构建对
-luci/packages 的版本组合相当敏感。
+`extra-packages.sh` 负责把所有"官方 feed 里没有、或者官方那份不该用"的包塞进
+feed 目录树。为什么不干脆往 `feeds.conf` 里加第三方 feed（那样最省事）？因为加整个
+feed 会把成百上千个同名包一起带进来 —— ImmortalWrt 的 packages/luci 就是官方 feed
+的分支，`luci-app-firewall`、`aria2`…… 都在里面 —— 两份同名包互相打架，而这个
+NSS 构建对 luci/packages 的版本组合相当敏感。（唯一的例外是下面第③类，理由写在那里。）
 
-脚本把 4 个目录放进对应的 feed 目录树，但这 4 个目录来自**两个不同的地方**：
+脚本把包放进对应的 feed 目录树，来源分**三类**：
 
-| 放进哪 | 来自哪 | 为什么 |
+- **① 自带配方** —— `packages/<分类>/<包>/`，用 `find` 扫（新增目录自动生效）
+- **② ImmortalWrt 纯前端** —— 脚本里 `LUCI_PATHS` 数组列出的路径
+- **③ passwall2** —— 从 Openwrt-Passwall 的两个仓库浅克隆
+
+| 放进哪 | 来自哪（第几类） | 为什么 |
 |---|---|---|
-| `feeds/packages/net/ddns-go` | **本仓库** `packages/net/ddns-go/` | 带二进制，要跟上游版本 |
-| `feeds/packages/net/msd_lite` | **本仓库** `packages/net/msd_lite/` | 同上 |
-| `feeds/luci/applications/luci-app-ddns-go` | ImmortalWrt 稀疏检出 | 纯前端页面，没有独立的"上游源码仓库" |
-| `feeds/luci/applications/luci-app-msd_lite` | ImmortalWrt 稀疏检出 | 同上 |
+| `feeds/packages/net/ddns-go` | 本仓库 `packages/net/ddns-go/`（①） | 带二进制，要跟上游版本 |
+| `feeds/packages/net/msd_lite` | 本仓库 `packages/net/msd_lite/`（①） | 同上 |
+| `feeds/luci/applications/luci-app-ddns-go` | ImmortalWrt 稀疏检出（②） | 纯前端页面，没有独立的"上游源码仓库" |
+| `feeds/luci/applications/luci-app-msd_lite` | ImmortalWrt 稀疏检出（②） | 同上 |
+| `feeds/luci/applications/luci-app-passwall2` | Openwrt-Passwall 浅克隆（③） | passwall2 的界面 + 运行脚本 |
+| `feeds/packages/net/<组件>` × 17 | Openwrt-Passwall 浅克隆（③） | 组件的配方与上游版本同步维护，直接用上游 main |
 
 **为什么前者不抄 ImmortalWrt 的配方。** ImmortalWrt 那份把版本**写死**了
 （`PKG_VERSION:=6.17.6` 配一个对应的 `PKG_HASH`），上游发了新版得等它 bump 才跟得上
@@ -304,6 +315,63 @@ luci 应用是 `include ../../luci.mk`，`ddns-go` 是
 （同为 GPL-2.0）。它们只负责 UCI 解析和 procd 拉起，**与包本身的版本无关**；所以
 `resolve-versions.sh` 只管版本/hash，不会去动 `files/`。代价是：ImmortalWrt 若改了
 这些 init 脚本，需要手工同步过来。
+
+### passwall2（项目 + 依赖组件）
+
+⚠️ **仓库搬家了**：passwall 项目已经不在个人账号 `xiaorouji` 下（那里现在返回 404），
+迁到了 **`Openwrt-Passwall`** 组织。三份仓库各司其职：
+
+| 仓库 | 内容 | 本仓库用不用 |
+|---|---|---|
+| `openwrt-passwall2` | 只有 `luci-app-passwall2`（界面 + 运行脚本） | **用** |
+| `openwrt-passwall-packages` | 17 个依赖组件的配方 | **用** |
+| `openwrt-passwall` | 只有 v1 的 `luci-app-passwall` | 不用 |
+
+**为什么不自己写配方（像 ddns-go 那样直接引上游源码）。** 这 17 个组件的配方和上游
+版本是**同步维护**的：bump 版本时 `PKG_VERSION` / `PKG_HASH` / 编译标签是一起改的，
+拆开抄反而容易对不上。而且它们没有"滞后"问题（不像 ImmortalWrt 抄 ddns-go 会慢半拍），
+所以每次构建取一次上游 `main` 就是当时最新的，**不需要** `resolve-versions.sh` 注入。
+
+**组件清单不写死。** `extra-packages.sh` 遍历 `openwrt-passwall-packages` 顶层所有含
+`Makefile` 的目录，上游加新组件会自动被带上，不用改脚本（这条是实测过的）。
+
+⚠️ **有 4 个组件与官方 feed 同名**：`microsocks` / `sing-box` / `v2ray-geodata` /
+`xray-core`。落位时是本仓库这份**覆盖**官方那份（`place()` 先 `rm -rf` 再 `cp -a`）。
+passwall 上游 CI 是让 passwall feed 排在 `feeds.conf` 最前面来取胜，效果一样。
+其余 13 个官方 feed 里没有（实测 `openwrt/packages` 的 `net/`、`lang/` 下均为 404）。
+
+⚠️ **`shadowsocks-rust` / `shadow-tls` 会拖进 Rust 工具链。** 它们的配方写着
+`PKG_BUILD_DEPENDS:=rust/host`，编它们等于把 Rust + LLVM 从源码编一遍（构建时间显著
+增长、磁盘压力大）—— passwall 官方 CI 为此专门去 patch
+`feeds/packages/lang/rust/Makefile`。所以 `common.config` 里两个
+`INCLUDE_Shadowsocks_Rust_*` 都是 `n`。真要用 ss-rust，在 LuCI 的「组件更新」里在线
+拉预编译二进制即可（passwall2 自带这个入口，见 `root/usr/share/passwall2/app.sh` 的
+`ss-rust` 分支）。想编进固件就把那两行改成 `y`。
+
+**透明代理走 nftables 那支。** 这份配置用的是 `firewall4`，所以开
+`..._Nftables_Transparent_Proxy=y`、关 `..._Iptables_Transparent_Proxy`。前者会
+`select` 一串依赖：`chinadns-ng`、`dnsmasq-full`、`dnsmasq_full_nftset`、`nftables`、
+`kmod-nft-socket`、`kmod-nft-tproxy`、`kmod-nft-nat`。
+
+> **选中 `dnsmasq-full` 会把镜像里默认的 `dnsmasq` 挤掉 —— 但不需要手写
+> `CONFIG_PACKAGE_dnsmasq=n`。** `scripts/package-metadata.pl` 的
+> `add_implicit_provides_conflicts()` 会给默认变体补一条冲突，再由
+> `mconf_conflicts()` 生成 `depends on m || (PACKAGE_dnsmasq-full != y)`，
+> kconfig 自己就会取消选择。
+
+**本轮取到的版本会发成公开注解**（作业日志要登录才能看，注解不用）：
+
+```
+::notice:: passwall2 项目版本：luci-app-passwall2=26.10.1-2（取自 …openwrt-passwall2.git@main）
+::notice:: passwall 组件版本（引自上游 main）：chinadns-ng=2025.08.09  …  xray-core=26.9.30
+```
+
+这条注解同时是"上游最近一次更新有没有被这轮构建吃到"的凭证 —— 和 ddns-go 那条一样，
+都是**不看作业日志也能核对**的公开信息。
+
+取版本字段时按 `PKG_VERSION` → `PKG_SOURCE_DATE` → 第一个 `*_VER`（有的组件用
+`GEOIP_VER` 之类，配方里根本没有 `PKG_VERSION`）依次回退，都取不到就显示 `-` ——
+如实反映"这份配方没有可直接读的版本号"，不编造。
 
 ### 版本是"跟上游最新"还是"钉死"
 
@@ -454,7 +522,7 @@ make defconfig
    `luci.mk` 生成的 i18n 包都带 `HIDDEN:=1`，没有 prompt，
    `.config` 里的值会被 kconfig 直接忽略。原因见第八节陷阱②。
 
-在上面三条之外，追加了三组功能包（`ddns-go` / `msd_lite` / `WireGuard`，见第五节）：
+在上面三条之外，追加了四组功能包（`ddns-go` / `msd_lite` / `WireGuard` / `passwall2`，见第五节）：
 
 4. **`ddns-go` / `msd_lite` 改为自带配方**（`packages/net/`），直接引用上游源码
    （`jeessy2/ddns-go`、`rozhuk-im/msd_lite`），版本/ref 由
@@ -462,6 +530,13 @@ make defconfig
    两者取源方式不同：`ddns-go` 用 codeload 压缩包，`msd_lite` **必须**用 git 源
    （它依赖 git 子模块 `src/liblcb`，压缩包里没有）。只有两个 luci 前端页面仍从
    ImmortalWrt 稀疏检出。
+
+5. **`passwall2` 连组件一起引入**（`packages/net/` × 17 + `luci/` × 1），全部来自
+   `Openwrt-Passwall` 组织的浅克隆 —— **不抄配方、不改版本**，每次构建取当时的上游
+   `main`。组件清单不写死（遍历上游顶层目录），上游加新组件会自动带上。带同名冲突的
+   4 个组件（`xray-core` / `sing-box` / `v2ray-geodata` / `microsocks`）在落位时**覆盖**
+   官方 feed 那份；`shadowsocks-rust` / `shadow-tls` 因为会拖进 Rust 工具链而**不编**
+   （开关关着，需要时在 LuCI 里在线拉）。详见第五节。
 
 另外，工作流本身也加了一条能力：**编译失败可远程诊断**（make 输出落盘 + 失败时把
 失败包名和真实报错行发成公开注解，见第八节）。
@@ -477,9 +552,9 @@ make defconfig
 git clone -b nss-edma-rework https://github.com/JuliusBairaktaris/openwrt-nss-edma openwrt
 cd openwrt
 
-# 下面这一步会自己做完全部准备工作：追加 nss feed、落位自带配方 + 两个 luci 前端、
-# 解析 ddns-go/msd_lite 的上游最新版本、跑 feeds update/install、拼 .config、
-# 跑 defconfig、校验符号、叠加 files/。
+# 下面这一步会自己做完全部准备工作：追加 nss feed、落位自带配方 + 两个 luci 前端
+# + passwall2 及其 17 个组件、解析 ddns-go/msd_lite 的上游最新版本、
+# 跑 feeds update/install、拼 .config、跑 defconfig、校验符号、叠加 files/。
 export GH_TOKEN=<你的 GitHub token>   # 可选，但建议给：避免撞未认证 API 限额
 OPENWRT_DIR="$PWD" BUILDER_DIR="../qhora-301w-build" bash ../qhora-301w-build/scripts/prepare-build.sh
 
@@ -493,6 +568,11 @@ DDNS_GO_VERSION=6.17.7 MSD_LITE_SHA=fa68e131343fb58c67ad77b2d26f2cb7c49a2c95 \
   OPENWRT_DIR="$PWD" BUILDER_DIR="../qhora-301w-build" \
   bash ../qhora-301w-build/scripts/prepare-build.sh
 ```
+
+passwall2 没有"钉版本"的开关（组件和上游 `main` 是同步维护的），但可以换源/换分支：
+`PW_REF`（默认 `main`）、`PW_APP_REPO`、`PW_PKGS_REPO` 三个环境变量都能覆盖，
+工作流里对应 `passwall_ref` / `passwall_app_repo` / `passwall_pkgs_repo` 三个输入
+（见第五节）。
 
 Ubuntu 24.04/26.04 上需要：
 `bzip2 g++ gawk gcc git glibc-source libncurses-dev make curl`，
@@ -530,6 +610,11 @@ Ubuntu 24.04/26.04 上需要：
 | `package/feeds/... 不存在` | 放进 feed 的包没被 `feeds install` 接管 | 检查 `feeds update -i` 那一步 |
 | `ddns-go / msd_lite 解析上游最新版本失败` **（warning）** | 查 GitHub API 或算 hash 失败 | **不影响构建**，那两个包会用配方里的兜底值；想确认编的是哪个版本，看同批的 notice |
 | `本轮固件里的上游包版本：…` **（notice）** | 这轮实际编进去的版本 | 核对是否是预期版本；不是就用 `ddns_go_version` / `msd_lite_sha` 钉死 |
+| `passwall2 项目版本：luci-app-passwall2=…` **（notice）** | 这轮取到的 passwall2 界面版本 | 和上游 release 对照；不对就看 `passwall_ref` / `passwall_app_repo` |
+| `passwall 组件版本（引自上游 …）` **（notice）** | 17 个组件各自的 `PKG_VERSION` | 想确认某个组件（如 `xray-core`）这轮编的是哪版，看这条 |
+| `克隆 … 失败（分支 …）` **（error）** | passwall 仓库浅克隆失败 | 检查 `passwall_ref` 分支是否存在、`passwall_*_repo` 地址、网络 |
+| `上游没有 …/Makefile（结构可能变了）` **（error）** | 上游仓库顶层结构变了 | 改 `extra-packages.sh` 里对应 `place()` 的 `src_rel` |
+| `passwall 组件 <名> 没落位` **（error）** | 关键组件在上游找不到了 | 看 `passwall_pkgs_repo` 的 `passwall_ref` 分支里是否还有它 |
 | `并行编译失败（make 退出码 N）` **（warning）** | `make -j` 挂了，正在用 `-j1 V=s` 重跑 | 不用管；只有下面那条 error 才说明真失败 |
 | `编译失败的包::<包路径>` **（error）** | 这个包没编过（OpenWrt 会打印 `ERROR: package/… failed to build.`） | 到「回放编译日志」里搜这个包名 |
 | `编译报错行（尾部 8 条）` **（error）** | 从日志里挑出的真实报错行 | 通常一眼能看出原因（缺头文件、CMake 找不到文件、未定义引用……） |
@@ -608,6 +693,17 @@ CONFIG_LUCI_LANG_zh_Hans=y
 **上游改名/迁移了。**
 改 `env.UPSTREAM_REPOSITORY` / `UPSTREAM_REF` / `NSS_FEED` 三个地方即可。
 `ddns-go` / `msd_lite` 的源码地址在 `packages/net/*/Makefile` 里，各自独立。
+passwall2 的两个仓库地址是 `extra-packages.sh` 的 `PW_APP_REPO` / `PW_PKGS_REPO`
+（工作流里对应 `passwall_app_repo` / `passwall_pkgs_repo` 输入）——
+这个项目刚从个人账号 `xiaorouji` 搬到 `Openwrt-Passwall` 组织，所以这类迁移**已经**
+发生过一次；再遇到时改这两个变量即可，脚本其他地方不用动。
+
+**passwall2 编进去之后构建变慢了？**
+正常。17 个组件里有 Go 项目（`xray-core` / `sing-box` / `geoview` 等，走
+`lang/golang` 那套，自带 toolchain 编译），还有 `haproxy` 这种 C 大件，比不编它们
+肯定要久。真正会拖垮构建的是 `shadowsocks-rust` / `shadow-tls` —— 它们要编一整套
+Rust + LLVM，所以配置里已经关掉（见第五节），别随手打开。
+如果因此撞上 6 小时超时，重跑一次通常能过（`dl` 缓存和 ccache 会复用）。
 
 ---
 
