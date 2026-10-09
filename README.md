@@ -191,6 +191,8 @@ uci set nss.general.enabled='0'; uci commit nss; reboot
 | **msd_lite** | 开机自启 | 客户端按 `http://<路由器IP>:7088/udp/<组播地址>:<端口>` 取流。**接收组播的网卡需要在 `服务 → msd_lite` 里选**（见下） |
 | **WireGuard** | 仅装好 | 没有常驻服务，到 `网络 → 接口` 新建一个 `wg` 协议接口即可，内核模块会自动加载 |
 
+LuCI 界面默认就是简体中文（`CONFIG_LUCI_LANG_zh_Hans=y`，见第六节）。
+
 想验证服务真的起来了：
 
 ```sh
@@ -279,7 +281,7 @@ make defconfig
 
 ## 六、相对上游配方做的改动
 
-只有两处基调改动，其余保持原样：
+三处基调改动，其余保持原样：
 
 1. **打开了 initramfs**（`CONFIG_TARGET_ROOTFS_INITRAMFS=y`）。
    上游为了多机型共用镜像关掉了它——因为 Asus RT-AX89X 的 recovery trx 把内核
@@ -289,7 +291,12 @@ make defconfig
 2. **把设备/子目标固定到 QHora-301W**，并把上游按内存容量分组的
    `devices/ipq807x-1g` 配置合并进 `configs/qhora_301w.config`。
 
-在上面两条之外，追加了三组功能包（`ddns-go` / `msd_lite` / `WireGuard`，见第五节），
+3. **打开了 LuCI 简体中文**（`CONFIG_LUCI_LANG_zh_Hans=y`）。
+   注意只能用这个开关，不能写 `CONFIG_PACKAGE_luci-i18n-…=y` ——
+   `luci.mk` 生成的 i18n 包都带 `HIDDEN:=1`，没有 prompt，
+   `.config` 里的值会被 kconfig 直接忽略。原因见第八节陷阱②。
+
+在上面三条之外，追加了三组功能包（`ddns-go` / `msd_lite` / `WireGuard`，见第五节），
 以及配套的 `scripts/extra-packages.sh`。这三组是**独立追加**的，删掉它们不影响
 NSS 卸载栈本身。
 
@@ -331,14 +338,53 @@ Ubuntu 24.04/26.04 上需要：
 | 注解内容 | 含义 | 怎么处理 |
 |---|---|---|
 | `prepare-build.sh 在第 N 行失败` + `失败命令：…` | 该命令返回非零 | 看注解随附的日志尾部 |
-| `defconfig 丢弃了 N 个配置文件请求的符号` | Kconfig 依赖没满足，选项被静默丢弃 | 注解会列出符号名，多半是引入的包没装好 |
+| `defconfig 丢弃了 N 个配置请求的符号` | Kconfig 依赖没满足，选项被静默丢弃 | 后面几条注解会逐个列出符号名 |
+| `defconfig 丢弃符号：CONFIG_PACKAGE_xxx=y` | 具体是哪个选项被丢了 | 日志里有该符号的 kconfig 定义，看它的 `bool`/`default`/`depends on` |
 | `package/feeds/... 不存在` | 放进 feed 的包没被 `feeds install` 接管 | 检查 `feeds update -i` 那一步 |
 
-⚠️ **不要在 `prepare-build.sh` 里手写「我认为重要的符号」清单来做校验。**
+### 诊断代码里有三个必须遵守的约束
+
+改 `prepare-build.sh` 的诊断部分之前先看这三条，否则会写出「看起来能报错、
+实际什么都看不到」的代码：
+
+1. **注解必须写 `>&3`，不能写 fd1/fd2。** 脚本会把 fd1/fd2 重定向到日志文件，
+   而 bash 对普通文件是**块缓冲**的：脚本 `exit` 时缓冲区里最后几 KB 根本没落盘，
+   而 `_dump_log_tail` 是用 `tail` 去读那个文件的。写 fd1/fd2 的报错信息恰好就是
+   「看不到」的原因。（写日志用 `tee`，`tee` 不做用户态缓冲。）
+2. **注解有数量上限，超出的会被 GitHub 丢掉。** 所以 `die` 把日志尾部先发、
+   最要紧的那几条（具体符号名）**最后**发。
+3. **多行证据写日志，不要塞进注解。** `_dump_symbol_def` 会把符号在
+   `tmp/.config-package.in` 里的定义抄进日志（有没有 prompt、default 是什么、
+   depends on 什么），几十行内容塞注解会把配额吃光。
+
+### 两个已知的「符号被静默丢弃」陷阱
+
+**① 不要手写「我认为重要的符号」清单来做校验。**
 `DEVICE_PACKAGES` 带入的包（例如 `ipq-wifi-qnap_301w`）**不会**以
 `CONFIG_PACKAGE_*` 的形式出现在 `.config` 里 —— `image.mk` 是用
 `CONFIG_TARGET_DEVICE_PACKAGES_*` 传字符串的。写进清单必然误报、把构建整个卡死。
 现在的做法是「配置里写了什么，就断言什么」。
+
+**② LuCI 的语言包不能用 `CONFIG_PACKAGE_luci-i18n-…=y` 打开。**
+`luci.mk` 生成的每个 `luci-i18n-<包>-<语言>` 包都带 `HIDDEN:=1`，
+`scripts/package-metadata.pl` 于是把它写成：
+
+```
+config PACKAGE_luci-i18n-xxx-zh-cn
+	bool                      ← 注意：没有标题，是个空 prompt
+	default LUCI_LANG_zh_Hans||(ALL&&m)
+```
+
+而 `scripts/config/symbol.c` 规定：**只有 `sym->visible != no` 时才会采用
+`.config` 里的用户值**，否则一律回落到 `default`。没有 prompt 的包在普通构建里
+`default` 不成立，于是这一行写了也白写。正确做法是打开语言开关本身：
+
+```
+CONFIG_LUCI_LANG_zh_Hans=y
+```
+
+它是 luci-base 在 `Config.in` 里带标题的正常 `tristate`，能被 `.config` 赋值；
+它 `=y` 之后上面那个 `default` 成立，所有 luci 包的简体中文翻译会一起被打开。
 
 ## 九、常见问题
 
@@ -347,8 +393,9 @@ Ubuntu 24.04/26.04 上需要：
 直接重跑一次即可 —— `dl` 源码包缓存和 ccache 都会复用，第二次快很多。
 
 **`defconfig 丢弃了配置文件请求的符号`。**
-说明某条依赖没满足，通常是因为 NSS feed 没拉到位、引入的包没装好，或者上游
-rebase 后改了符号名。看注解里列出的符号名，对照上游最新代码修正 `configs/`。
+说明某条依赖没满足，或者那个符号根本没有 prompt（见第八节陷阱②）。
+注解里会逐个列出被丢的符号名，日志里有它们在 kconfig 里的定义，
+对照着修 `configs/` 即可。
 
 **artifact 里没有 sysupgrade 镜像。**
 工作流在"收集并校验产物"那步就会 `exit 1` 报出来，不会静默给你一个空包。

@@ -22,24 +22,66 @@ set -Eeuo pipefail
 #   · 全部输出同时落盘到 $LOG_FILE（供回放）
 #   · 失败时把「出错行号 + 出错命令 + 日志尾部」输出成 ::error::，
 #     那会变成 check-run annotation —— 公开可读，远程就能定位。
+#
+# 两个必须绕开的坑：
+#   1) 不能拿 fd1/fd2 当"留给注解"的通道。fd1/fd2 被重定向到日志文件后，
+#      bash 对普通文件是块缓冲的，脚本 exit 时缓冲区里最后几 KB 根本没落盘，
+#      而 _dump_log_tail 是用 tail 去读那个文件的 —— 翻了半天看不到关键行，
+#      就是这个原因。所以原始终端另存成 fd3，注解一律写 >&3，
+#      而写日志用 tee（tee 自己不做用户态缓冲，立刻落盘）。
+#   2) GitHub 对每个 step 的注解数量有上限，超出的会被丢掉。所以日志尾部只截
+#      少量行，并且把最重要的那句放在最后输出。
 LOG_FILE="${LOG_FILE:-${GITHUB_WORKSPACE:-${RUNNER_TEMP:-/tmp}}/prepare-build.log}"
 : >"$LOG_FILE" 2>/dev/null || LOG_FILE=/tmp/prepare-build.log
-exec 3>&1 4>&2            # 保留原始 stdout/stderr，失败时切回来发注解
-exec >>"$LOG_FILE" 2>&1   # 之后的输出全部进日志
+exec 3>&1 4>&2            # 原始终端另存为 fd3；之后 fd1/fd2 全部进日志
+exec >>"$LOG_FILE" 2>&1
 
+# 一条注解 = 原始 stdout → Actions 日志流 → check-run annotation。
+ann() { printf '%s\n' "$*" >&3; }
+
+# 把日志最后 n 行发成注解。空行跳过：GitHub 会去重，空行只是白占配额。
 _dump_log_tail() {
-  local n="${1:-25}"
+  local n="${1:-6}"
   tail -n "$n" "$LOG_FILE" 2>/dev/null | while IFS= read -r l; do
-    printf '::error::[log] %s\n' "$l"
+    case "$l" in *[![:space:]]*) ;; *) continue ;; esac
+    ann "::error::[log] $l"
   done
+}
+
+# 打印某个符号在生成出来的 kconfig 里的定义。这是定位"为什么被丢弃"的
+# 直接证据（有没有 prompt、default 是什么、depends on 什么），只写日志，
+# 因为它有几十行，塞成注解会把注解配额吃光。
+#
+# 传进来的名字要去掉 CONFIG_ 前缀：.config 里叫 CONFIG_PACKAGE_foo，
+# 而生成的 kconfig 里那个符号叫 PACKAGE_foo。包在 tmp/.config-package.in，
+# target 选项在 tmp/.config-target.in，所以几个都找一遍。
+_dump_symbol_def() {
+  local sym="$1" f hit=0
+  for f in tmp/.config-package.in tmp/.config-target.in tmp/.config.in; do
+    [[ -f "$f" ]] || continue
+    grep -qE "^[[:space:]]*config[[:space:]]+${sym}[[:space:]]*$" "$f" || continue
+    hit=1
+    printf '\n----- kconfig 定义：%s（来自 %s）-----\n' "$sym" "$f"
+    awk -v sym="$sym" '
+      {
+        line = $0
+        sub(/^[ \t]+/, "", line)
+        sub(/[ \t]+$/, "", line)
+        if (line == "config " sym) { inblk = 1; print "  " line; next }
+        if (inblk && line ~ /^config /) exit
+        if (inblk && (line == "endmenu" || line == "endif" || line == "menu ")) exit
+        if (inblk) print "  " line
+      }
+    ' "$f" | head -40
+  done
+  ((hit)) || printf '\n（%s 不在任何生成的 kconfig 里，说明这个包根本没被扫描到）\n' "$sym"
 }
 
 _on_error() {
   local rc=$? line="$1" cmd="$2"
-  exec 1>&3 2>&4
-  printf '::error::prepare-build.sh 在第 %s 行失败（退出码 %s）\n' "$line" "$rc"
-  printf '::error::失败命令：%s\n' "$cmd"
-  _dump_log_tail 25
+  _dump_log_tail "${LOG_TAIL_LINES:-6}"
+  ann "::error::失败命令：${cmd}"
+  ann "::error::prepare-build.sh 在第 ${line} 行失败（退出码 ${rc}）"
   exit "$rc"
 }
 trap '_on_error "$LINENO" "$BASH_COMMAND"' ERR
@@ -51,11 +93,16 @@ NSS_FEED="${NSS_FEED:-src-git nss https://github.com/JuliusBairaktaris/nss-packa
 # log/warn 同时进日志和 CI 控制台，这样远程也能看到进度。
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*" | tee -a "$LOG_FILE" >&3; }
 warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*" | tee -a "$LOG_FILE" >&3; }
+# 除了第一条消息之外，后面每个参数都单独发一条注解放最后。
+# 注解有数量上限，超出的会被 GitHub 丢掉 —— 具体的符号名是最要紧的信息，
+# 所以它必须是最晚发出的那几条。
 die()  {
-  printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2
-  exec 1>&3 2>&4
-  printf '::error::%s\n' "$*"
-  _dump_log_tail 30
+  local msg="$1"; shift
+  printf '\033[1;31m[x]\033[0m %s\n' "$msg" | tee -a "$LOG_FILE" >&3
+  _dump_log_tail "${LOG_TAIL_LINES:-6}"
+  ann "::error::$msg"
+  local x
+  for x in "$@"; do ann "::error::  $x"; done
   exit 1
 }
 
@@ -148,8 +195,15 @@ done < <(
     grep -vE '=n$'
 )
 if ((${#dropped[@]})); then
-  printf '  %s\n' "${dropped[@]}" >&2
-  die "defconfig 丢弃了 ${#dropped[@]} 个配置文件请求的符号（通常是依赖未满足），不要使用这个 .config"
+  # 先把证据留全：每个被丢弃的符号，把它在生成的 kconfig 里的定义抄进日志，
+  # 这样"为什么会被丢"（没有 prompt？default 不成立？depends 没满足？）
+  # 不用靠猜。
+  for s in "${dropped[@]}"; do
+    sym="${s%%=*}"; _dump_symbol_def "${sym#CONFIG_}"
+  done
+  # 符号名交给 die 逐个发注解（它会把它们放在最后，不会被注解上限截掉）。
+  die "defconfig 丢弃了 ${#dropped[@]} 个配置请求的符号，详见上面的注解与日志" \
+      "${dropped[@]}"
 fi
 log "配置文件请求的符号全部保留"
 
