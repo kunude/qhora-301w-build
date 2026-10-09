@@ -254,6 +254,19 @@ jobs:
           compgen -G "$out/*${DEVICE}*squashfs-sysupgrade.bin" >/dev/null ||
             { echo "::error::$out 下没有 ${DEVICE} 的 sysupgrade 镜像"; exit 1; }
 
+          # 把产物清单也发成注解：check-run annotations 是公开可读的，
+          # 而作业日志和 artifact 内容都必须登录才能看 —— 这样远程（包括无人值守
+          # 的自动化脚本）也能核对到底编出了哪些镜像、各多大。
+          # 整段包在 if 里，避免 set -e 把「grep 没匹配到」当成失败。
+          if listing=$(cd "$out" && ls -lh . 2>/dev/null |
+                         grep -E "${DEVICE}|sha256sums|config\.buildinfo|profiles\.json" |
+                         awk '{print $5"  "$9}'); then
+            while IFS= read -r line; do
+              [ -n "$line" ] || continue
+              echo "::notice title=QHora-301W 产物::$line"
+            done <<<"$listing"
+          fi
+
           {
             echo "## QHora-301W 构建产物"
             echo
