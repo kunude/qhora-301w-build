@@ -2,7 +2,7 @@
 #
 # 为 QNAP QHora-301W 准备 OpenWrt 构建环境。
 #
-#   1. 追加 NSS feed，更新并安装全部 feed
+#   1. 追加 NSS feed，更新 feed；从 ImmortalWrt 引入官方 feed 没有的包；安装全部 feed
 #   2. 把 configs/common.config + configs/qhora_301w.config 拼成 .config，跑 make defconfig
 #   3. 校验 defconfig 没有静默丢弃符号（Kconfig 在依赖不满足时会无声地去掉选项）
 #   4. 关闭 NSS feed 的整体打包（feeds.conf 里声明了，但我们只要 .config 里显式选的包）
@@ -47,6 +47,14 @@ CRITICAL_SYMBOLS=(
   'CONFIG_NSS_FIRMWARE_VERSION_12_5=y'
   'CONFIG_PACKAGE_ipq-wifi-qnap_301w=y'
   'CONFIG_CCACHE=y'
+  # 用户明确要求启用的三项。不放进来的话，一旦引入失败，
+  # defconfig 会静默丢掉它们、编出一个"看起来正常但少了功能"的固件。
+  'CONFIG_PACKAGE_ddns-go=y'
+  'CONFIG_PACKAGE_luci-app-ddns-go=y'
+  'CONFIG_PACKAGE_msd_lite=y'
+  'CONFIG_PACKAGE_luci-app-msd_lite=y'
+  'CONFIG_PACKAGE_kmod-wireguard=y'
+  'CONFIG_PACKAGE_luci-proto-wireguard=y'
 )
 
 for f in "${CONFIGS[@]}"; do
@@ -67,8 +75,29 @@ cd "$OPENWRT_DIR"
 
 log "更新全部 feed"
 ./scripts/feeds update -a
+
+# 官方 feed 里没有 ddns-go / msd_lite，从 ImmortalWrt feed 抠出来放进 feed 目录树。
+# 必须在 install 之前、update 之后：update 负责把 feeds/ 目录建出来，
+# install 读的是索引文件，看不到中途塞进去的包。
+log "引入官方 feed 之外的包"
+OPENWRT_DIR="$OPENWRT_DIR" bash "$BUILDER_DIR/scripts/extra-packages.sh"
+
+# 重建索引。-i 只重扫目录、不执行 git pull，所以不会碰刚拷进去的文件。
+log "重建 feed 索引（不拉取仓库）"
+./scripts/feeds update -i -a
+
 log "安装全部 feed"
 ./scripts/feeds install -a
+
+# 确认那 4 个引入的包真的被 install 认领了（索引没重建的话这一步会漏）。
+for p in ddns-go msd_lite; do
+  [[ -e "package/feeds/packages/$p" ]] \
+    || die "package/feeds/packages/$p 不存在，引入的包没有被 feeds install 接管"
+done
+for p in luci-app-ddns-go luci-app-msd_lite; do
+  [[ -e "package/feeds/luci/$p" ]] \
+    || die "package/feeds/luci/$p 不存在，引入的包没有被 feeds install 接管"
+done
 
 # 没有这个 feed，ATH11K_NSS_SUPPORT 会因依赖不满足而无法在 menuconfig 里选中。
 [[ -d "$OPENWRT_DIR/feeds/nss" ]] || die "NSS feed 没有就位（feeds/nss 不存在），检查上面的 feeds 步骤"

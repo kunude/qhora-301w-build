@@ -2,12 +2,43 @@
 #
 # QHora-301W 首次启动执行一次，执行成功后 OpenWrt 会自动删除本脚本。
 #
-# 只做最小改动：改主机名，并把 Wi-Fi 已知状态写进说明。
+# 只做最小改动：改主机名；把 ddns-go / msd_lite 从"装了但没开"变成"开机自启"。
 # 无线默认关闭且没有密钥，需要自己到「网络 -> 无线」开起来并设置密码。
 
+# ── 主机名 ──────────────────────────────────────────────────
 uci -q batch <<EOF
 set system.@system[0].hostname='QHora-301W'
 commit system
 EOF
+
+# ── ddns-go ─────────────────────────────────────────────────
+# 这个包出厂是 enabled='0'，而 init 脚本的 start_service() 里还有一道
+# `[ "$enabled" -eq "1" ] || return 1`。所以两件事都要做：
+#   1) 打开 uci 里的开关（否则服务即使被 enable 也不会起）
+#   2) enable init 脚本（建立 /etc/rc.d/S99ddns-go 链接）
+# 起来之后 Web 界面在 http://<路由器IP>:9876，DDNS 记录在界面里配。
+if [ -f /etc/config/ddns-go ]; then
+	uci -q batch <<EOF
+set ddns-go.config.enabled='1'
+commit ddns-go
+EOF
+	/etc/init.d/ddns-go enable
+fi
+
+# ── msd_lite ────────────────────────────────────────────────
+# 同样是出厂 enabled='0'，需要显式打开。
+# 这里只改 enabled；接收组播的网卡（uci 的 network 项）保持出厂的空值，
+# 因为它取决于 IPTV 组播源在你的网络里的位置，不适合替你猜。
+if [ -f /etc/config/msd_lite ]; then
+	uci -q batch <<EOF
+set msd_lite.@instance[0].enabled='1'
+commit msd_lite
+EOF
+	/etc/init.d/msd_lite enable
+fi
+
+# ── WireGuard ───────────────────────────────────────────────
+# 协议本身没有常驻服务，kmod 由 AutoProbe 在建立 wg 接口时自动加载，
+# 这里没有需要启用的东西。隧道请到「网络 -> 接口」新建 wg 接口。
 
 exit 0

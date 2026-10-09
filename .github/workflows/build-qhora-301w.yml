@@ -99,9 +99,10 @@ jobs:
           set -euo pipefail
           # OpenWrt 自建 flex/bison 等 host 工具，所以宿主机只需要最小集合。
           # 这个列表与上游 Qualcommax_NSS_Builder 的 CI 保持一致，是验证过的组合。
+          # 不需要 rsync —— prepare-build.sh 叠加覆盖文件用的是 cp -a。
           sudo apt-get update || true
           sudo apt-get install -y \
-            bzip2 g++ gawk gcc git glibc-source libncurses-dev make rsync
+            bzip2 g++ gawk gcc git glibc-source libncurses-dev make
 
       # ── 拉取源码 ──────────────────────────────────────────────
       # 注意：nss-edma-rework 分支和 edma-nss feed 上游会定期 rebase，
@@ -120,7 +121,7 @@ jobs:
           path: builder
 
       # ── 组装构建环境 ──────────────────────────────────────────
-      - name: 准备构建环境（feeds + .config + 覆盖文件）
+      - name: 准备构建环境（feeds + 第三方包 + .config + 覆盖文件）
         run: bash "$BUILDER_DIR/scripts/prepare-build.sh"
 
       # ── 可复现构建 ────────────────────────────────────────────

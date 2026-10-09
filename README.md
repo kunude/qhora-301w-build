@@ -19,10 +19,13 @@
 .
 ├── .github/workflows/build-qhora-301w.yml   # 编译工作流（入口）
 ├── configs/
-│   ├── common.config                        # NSS 卸载栈 + 通用选项
+│   ├── common.config                        # NSS 卸载栈 + 通用选项 + 附加功能包
 │   └── qhora_301w.config                    # 机型：target/子目标/设备/内存档位
-├── scripts/prepare-build.sh                 # 组装 .config、跑 defconfig、校验、叠加覆盖文件
-├── files/etc/uci-defaults/99-qhora-301w     # 首次启动的设置（主机名）
+├── scripts/
+│   ├── prepare-build.sh                     # 组装 .config、跑 defconfig、校验、叠加覆盖文件
+│   ├── extra-packages.sh                    # 引入官方 feed 没有的包（ddns-go / msd_lite）
+│   └── push-to-github.sh                    # 本地一键推送脚本
+├── files/etc/uci-defaults/99-qhora-301w     # 首次启动的设置（主机名、启用服务）
 ├── .gitattributes / .gitignore
 └── README.md
 ```
@@ -30,7 +33,8 @@
 `configs/` 里的内容取自上游作者自己维护的
 [Qualcommax_NSS_Builder](https://github.com/JuliusBairaktaris/Qualcommax_NSS_Builder)
 的 `devices/common/config` 与 `devices/ipq807x-1g/config` —— 那是这套 NSS 栈
-**唯一被持续验证过**的配置组合，所以基本保持原样，只做了两处针对性改动（见下）。
+**唯一被持续验证过**的配置组合，所以基本保持原样，只做了两处针对性改动（见下），
+外加在文件末尾追加了 ddns-go / msd_lite / WireGuard 三组独立的功能包（见第五节）。
 
 ---
 
@@ -179,6 +183,28 @@ uci set nss.general.enabled='0'; uci commit nss; reboot
 
 **Wi-Fi 默认是关闭的，且没有密码。** 用网线连上后到 `网络 → 无线` 自己开射频并设密钥。
 
+### 已启用的附加服务
+
+| 服务 | 状态 | 怎么用 |
+|---|---|---|
+| **ddns-go** | 开机自启 | Web 界面 `http://<路由器IP>:9876`，在里面添加 DDNS 记录。数据在 `/etc/ddns-go/config.yaml` |
+| **msd_lite** | 开机自启 | 客户端按 `http://<路由器IP>:7088/udp/<组播地址>:<端口>` 取流。**接收组播的网卡需要在 `服务 → msd_lite` 里选**（见下） |
+| **WireGuard** | 仅装好 | 没有常驻服务，到 `网络 → 接口` 新建一个 `wg` 协议接口即可，内核模块会自动加载 |
+
+想验证服务真的起来了：
+
+```sh
+/etc/init.d/ddns-go status
+/etc/init.d/msd_lite status
+ls /etc/rc.d/ | grep -E 'ddns-go|msd_lite'   # 有 S99 开头的链接说明开机自启已生效
+wg show                                      # 建好 wg 接口后可用
+```
+
+**关于 msd_lite 的组播网卡（`network` 项）**：出厂留空。它填的是"从哪张网卡收组播"，
+取决于你的 IPTV 拓扑 —— 组播源在 ISP 侧（WAN 进来）还是 LAN 侧（另一台设备发出）。
+填错的表现是客户端连得上 7088 端口但拉不到流。填了之后 init 脚本会注册接口触发器，
+对应接口 up/down 时自动重启服务。
+
 ---
 
 ## 五、改配置
@@ -186,13 +212,41 @@ uci set nss.general.enabled='0'; uci commit nss; reboot
 | 想改什么 | 改哪 |
 |---|---|
 | 多加一个软件包 | 在 `configs/common.config` 末尾加 `CONFIG_PACKAGE_xxx=y` |
+| 加一个**官方 feed 没有**的包 | 在 `scripts/extra-packages.sh` 的 `PKG_PATHS` / `LUCI_PATHS` 里加路径，再到 `common.config` 加符号 |
 | 开关某个内核选项 | 同上，`CONFIG_KERNEL_xxx=y` |
 | 换编译分支 | 工作流 `Run workflow` 时填 `upstream_ref`，或改 YAML 里 `UPSTREAM_REF` 的默认值 |
 | 用自己 fork 的源码 | 改 YAML `env.UPSTREAM_REPOSITORY` |
-| 系统默认配置（主机名、IP、无线） | 往 `files/` 里按路径放文件，会原样叠加进镜像 |
+| 系统默认配置（主机名、IP、无线、服务开关） | 往 `files/` 里按路径放文件，会原样叠加进镜像；首次启动脚本在 `files/etc/uci-defaults/` |
 | 同时编多个机型 | 在 `configs/qhora_301w.config` 再加 `CONFIG_TARGET_DEVICE_qualcommax_ipq807x_DEVICE_xxx=y`，注意 RTL 相关的高危项见下 |
 
 改完 `.config` 的选项要**推送到仓库再跑**，否则不会生效。
+
+### 关于 extra-packages.sh
+
+`ddns-go` 和 `msd_lite` 在 OpenWrt 官方 `packages` feed 里**不存在**，只有 ImmortalWrt
+的 feed 在维护。这里没有把整个 ImmortalWrt feed 加进 `feeds.conf` —— 那个 feed 是官方
+feed 的分支，有成百上千个同名包（`luci-app-firewall`、`aria2`……），两份同名包会互相
+打架，而这个 NSS 构建对 luci/packages 的版本组合相当敏感。
+
+所以改成用 git 稀疏检出，只把这 4 个目录抠出来，放进对应 feed 的目录树：
+
+```
+feeds/packages/net/ddns-go
+feeds/packages/net/msd_lite
+feeds/luci/applications/luci-app-ddns-go
+feeds/luci/applications/luci-app-msd_lite
+```
+
+**为什么必须放进 feed 目录而不是 `package/`**：这些 Makefile 用的是相对路径 ——
+luci 应用是 `include ../../luci.mk`，`ddns-go` 是
+`include ../../lang/golang/golang-package.mk`。只有放在 `<feed根>/<二级目录>/<包>/`
+这个位置才能解析得到，放进 `package/` 会直接报找不到 luci.mk。
+
+**调用顺序不能变**：`feeds update -a` → `extra-packages.sh` → `feeds update -i -a` → `feeds install -a`。
+`-i` 表示只重建索引、不执行 `git pull`（否则会碰到刚拷进去的文件），而 `install`
+读的是 `feeds/<name>.index`，不重建索引就看不到新包。`prepare-build.sh` 里已经按这个
+顺序串好了，并在 install 之后检查 `package/feeds/...` 是否真的存在 —— 索引没生效的话
+会立刻失败，而不是默默编出一个缺功能的固件。
 
 ### 两个高危坑（改配置前务必看）
 
@@ -212,7 +266,10 @@ uci set nss.general.enabled='0'; uci commit nss; reboot
 ```sh
 git fetch origin && git reset --hard origin/nss-edma-rework
 rm -rf feeds/nss package/feeds/nss
-./scripts/feeds update -a && ./scripts/feeds install -a
+./scripts/feeds update -a
+# 官方 feed 里没有 ddns-go / msd_lite，这一步会把它们放回 feed 目录树
+OPENWRT_DIR="$PWD" /path/to/qhora-301w-build/scripts/extra-packages.sh
+./scripts/feeds update -i -a && ./scripts/feeds install -a
 make defconfig
 ```
 
@@ -222,7 +279,7 @@ make defconfig
 
 ## 六、相对上游配方做的改动
 
-只有两处，其余保持原样：
+只有两处基调改动，其余保持原样：
 
 1. **打开了 initramfs**（`CONFIG_TARGET_ROOTFS_INITRAMFS=y`）。
    上游为了多机型共用镜像关掉了它——因为 Asus RT-AX89X 的 recovery trx 把内核
@@ -232,6 +289,10 @@ make defconfig
 2. **把设备/子目标固定到 QHora-301W**，并把上游按内存容量分组的
    `devices/ipq807x-1g` 配置合并进 `configs/qhora_301w.config`。
 
+在上面两条之外，追加了三组功能包（`ddns-go` / `msd_lite` / `WireGuard`，见第五节），
+以及配套的 `scripts/extra-packages.sh`。这三组是**独立追加**的，删掉它们不影响
+NSS 卸载栈本身。
+
 ---
 
 ## 七、本地编译（不用 CI）
@@ -239,18 +300,19 @@ make defconfig
 ```sh
 git clone -b nss-edma-rework https://github.com/JuliusBairaktaris/openwrt-nss-edma openwrt
 cd openwrt
-cp feeds.conf.default feeds.conf
-echo "src-git nss https://github.com/JuliusBairaktaris/nss-packages.git;edma-nss" >> feeds.conf
-./scripts/feeds update -a && ./scripts/feeds install -a
 
+# 下面这一步会自己做完全部准备工作：追加 nss feed、引入 ddns-go/msd_lite、
+# 跑 feeds update/install、拼 .config、跑 defconfig、校验符号、叠加 files/。
 OPENWRT_DIR="$PWD" BUILDER_DIR="../qhora-301w-build" bash ../qhora-301w-build/scripts/prepare-build.sh
 
 make -j"$(nproc)"
 ```
 
 Ubuntu 24.04/26.04 上需要：
-`bzip2 g++ gawk gcc git glibc-source libncurses-dev make rsync`，
+`bzip2 g++ gawk gcc git glibc-source libncurses-dev make`，
 磁盘留 **35GB** 以上。全量编译（含 LTO）在 4 核机器上要几个小时。
+
+（脚本里的文件叠加用的是 `cp -a` 而不是 `rsync`，所以**不需要**装 rsync。）
 
 ---
 
