@@ -13,9 +13,15 @@
 #              再读压缩包里 go.mod 的 module 行 —— 上游升到 v7 时 GO_PKG 要跟着变
 #   msd_lite : GET /repos/rozhuk-im/msd_lite/commits/master 取 sha 与日期
 #              （上游一个 tag 都没有，只能跟 master 的 HEAD）
-# 两个都用 codeload 拉下压缩包、本地算 sha256 当作 PKG_HASH，顺带把包装进
-# $OPENWRT_DIR/dl/ 让后面的 make download 复用 —— 也就顺带证明了
-# 「我们算出来的 hash」就是「构建时会校验的那个 hash」。
+#
+# 两个包的取源方式**不一样**，别照抄：
+#   · ddns-go 是 codeload 压缩包 —— 这里拉下来算 sha256 当 PKG_HASH，顺带把包装进
+#     $OPENWRT_DIR/dl/ 让后面的 make download 复用，也就顺带证明了
+#     「我们算出来的 hash」就是「构建时会校验的那个 hash」。
+#   · msd_lite 是 **git 源** —— 因为它的 CMakeLists 无条件 include 一个 git 子模块
+#     （src/liblcb），而 GitHub 压缩包不含子模块内容，用压缩包必然编不过（run 8 实测）。
+#     git 源由 OpenWrt 自己 clone+打包，我们只注入 ref 和日期，不下载、不算 hash。
+#     详见 packages/net/msd_lite/Makefile 头部。
 #
 # ── 失败时为什么**不**中断构建 ──────────────────────────────────
 # 配方里写了兜底版本（当前可用的值）。GitHub API 抖动、限流、网络抽风都不该
@@ -183,13 +189,23 @@ resolve_ddns_go() {
 }
 
 # ── msd_lite ────────────────────────────────────────────────────
+# 注意：msd_lite 用的是 **git 源**（不是 codeload 压缩包），所以我们不需要下载
+# 任何东西、也算不出「构建时会校验的那个 hash」—— git 源走 rawgit 打包，
+# 校验交给 git 自己。这里只注入 ref（sha）和日期，剩下的 download.mk 会自动推导：
+#   PKG_VERSION := <日期>~<短sha>、PKG_SOURCE_SUBDIR、PKG_BUILD_DIR
+#
+# 为什么不能用压缩包：msd_lite 依赖 git 子模块 src/liblcb，而 GitHub 的
+# /archive/<sha>.tar.gz 不含子模块内容 → cmake 报
+# "include could not find requested file: src/liblcb/CMakeLists.txt"。
+# 详见 packages/net/msd_lite/Makefile 头部的完整说明。
 resolve_msd_lite() {
-  local sha date ver url file hash topdir json
+  local sha date ver json
 
   if [[ -n "$MSD_LITE_SHA" ]]; then
     sha="$MSD_LITE_SHA"
-    log "msd_lite：使用指定 sha ${sha:0:12}…（不查 API）"
+    log "msd_lite：使用指定 sha ${sha:0:12}…（不查 API 拿 sha，但仍需查日期）"
     date=""
+    # 日期要用来拼版本号，所以钉 sha 时也得查一次这个 commit。
     json=$(gh_json "https://api.github.com/repos/rozhuk-im/msd_lite/commits/$sha" 2>/dev/null) || json=""
     if [[ -n "$json" ]]; then
       date=$(json_field "$json" date) || date=""
@@ -204,28 +220,22 @@ resolve_msd_lite() {
     date="${date%%T*}"
     log "msd_lite：master HEAD = ${sha:0:12}…  (${date:-日期未知})"
   fi
-  [[ -n "$sha" ]] || return 1
+
+  # 必须是完整的 40 位小写十六进制 sha：download.mk 要拿它当 SOURCE_VERSION 用，
+  # 形状不对的话 git checkout 会在很后面才失败，不如在这里拦住回落兜底值。
+  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { warn "sha 形状不对（应为 40 位十六进制）：$sha"; return 1; }
 
   # apk 的版本号必须以数字开头，裸 sha 会被判非法；日期拿不到就用 0 垫。
   [[ -n "$date" ]] || date="0000-00-00"
-  ver="${date//-/.}~${sha:0:7}"
+  # version_abbrev 默认是 8（rawgit 里也 git config core.abbrev 8），
+  # 这里按同样规则复算一遍，只为把「即将生效的版本号」显示出来。
+  ver="${date//-/.}~${sha:0:8}"
 
-  file="msd_lite-${ver}.tar.gz"
-  url="https://codeload.github.com/rozhuk-im/msd_lite/tar.gz/${sha}"
+  inject "$MSD_MAKE" PKG_SOURCE_VERSION "$sha"  || return 1
+  inject "$MSD_MAKE" PKG_SOURCE_DATE    "$date" || return 1
 
-  hash=$(fetch_and_hash "$url" "$file") || return 1
-  [[ ${#hash} -eq 64 ]] || { warn "hash 长度异常（${#hash}）：$hash"; return 1; }
-  # codeload 用 sha 作 ref 时顶层目录就是 msd_lite-<完整 sha>，
-  # 与配方里显式指定的 PKG_BUILD_DIR($(BUILD_DIR)/msd_lite-$(MSD_LITE_REF)) 对应。
-  topdir=$(check_topdir "$file" "msd_lite-${sha}/") || return 1
-
-  inject "$MSD_MAKE" MSD_LITE_REF "$sha"  || return 1
-  inject "$MSD_MAKE" PKG_VERSION  "$ver"  || return 1
-  inject "$MSD_MAKE" PKG_HASH     "$hash" || return 1
-
-  printf '  msd_lite version=%s\n' "$ver"
-  printf '           hash=%s\n' "$hash"
-  printf '           ref=%s  压缩包=%s（顶层目录 %s）\n' "$sha" "$file" "$topdir"
+  printf '  msd_lite date=%s  ref=%s\n' "$date" "$sha"
+  printf '           推导版本=%s（git 源：不下载压缩包、本地不算 hash）\n' "$ver"
   ann "::notice title=msd_lite 跟随上游最新版::${ver}  ref=${sha:0:12}"
 }
 
@@ -260,18 +270,35 @@ else
   warn "找不到 $MSD_MAKE，跳过 msd_lite（extra-packages.sh 没先跑？）"
 fi
 
+# 取某个配方「即将生效的版本号」。
+# ddns-go 直接写 PKG_VERSION；msd_lite 是 git 源、没有 PKG_VERSION 行，
+# 版本由 download.mk 从 PKG_SOURCE_DATE + PKG_SOURCE_VERSION 推导，
+# 这里按同一条规则复算一遍（口径：日期点号化 + 8 位短 sha）。
+pkg_version_of() {
+  local mk="$1" name ver date srcv
+  name=$(sed -n 's/^PKG_NAME:=//p' "$mk" | sed -n '1p')
+  ver=$(sed -n 's/^PKG_VERSION:=//p' "$mk" | sed -n '1p')
+  if [[ -z "$ver" ]]; then
+    date=$(sed -n 's/^PKG_SOURCE_DATE:=//p' "$mk" | sed -n '1p')
+    srcv=$(sed -n 's/^PKG_SOURCE_VERSION:=//p' "$mk" | sed -n '1p')
+    ver="${date//-/.}~${srcv:0:8}"
+  fi
+  printf '%s=%s' "$name" "$ver"
+}
+
 # 把最终生效的值打进日志与注解 —— 这是"这轮到底编了哪个版本"的唯一凭证。
 # 作业日志要登录才能看，注解不用，所以两边都发。
 printf '\n最终生效的包版本：\n'
 for mk in "$DDNS_MAKE" "$MSD_MAKE"; do
   [[ -f "$mk" ]] || continue
-  grep -E '^(PKG_NAME|PKG_VERSION|PKG_HASH|GO_PKG|MSD_LITE_REF):=' "$mk" | sed 's/^/  /'
+  grep -E '^(PKG_NAME|PKG_VERSION|PKG_HASH|GO_PKG|PKG_SOURCE_DATE|PKG_SOURCE_VERSION|PKG_SOURCE_PROTO):=' \
+    "$mk" | sed 's/^/  /'
 done
 
 summary=""
 for mk in "$DDNS_MAKE" "$MSD_MAKE"; do
   [[ -f "$mk" ]] || continue
-  summary="${summary}$(sed -n 's/^PKG_NAME:=//p' "$mk" | sed -n '1p')=$(sed -n 's/^PKG_VERSION:=//p' "$mk" | sed -n '1p')  "
+  summary="${summary}$(pkg_version_of "$mk")  "
 done
 ann "::notice title=本轮固件里的上游包版本::${summary}（ddns-go ${ddns_state}；msd_lite ${msd_state}）"
 

@@ -1,29 +1,51 @@
 #
 # msd_lite —— 本仓库自带的包配方，PKG_SOURCE 直接指向上游源码仓库
 #
+# ══ 为什么必须是 git 源，绝不能换成 codeload 压缩包 ═══════════════
+# msd_lite 依赖一个 **git 子模块** src/liblcb
+# （.gitmodules 里写着 https://github.com/rozhuk-im/liblcb.git），
+# 而 CMakeLists.txt 第 245 行是**无条件**的：
+#     include(src/liblcb/CMakeLists.txt)
+#
+# GitHub 的 /archive/<sha>.tar.gz（也就是 codeload 压缩包）**不包含子模块内容**：
+# 解出来 src/liblcb/ 是个空目录，cmake 直接报
+#     include could not find requested file: src/liblcb/CMakeLists.txt
+# OpenWrt 自己的 scripts/dl_github_archive.py 第 223 行也写着这一点。
+#
+# 用 PKG_SOURCE_PROTO:=git 时 include/download.mk 的行为（已逐行核对）：
+#   · 第 26 行 dl_method_git：URL 匹配 github.com/* → 走 github_archive
+#   · github_archive（第 218 行）调用 dl_github_archive.py
+#   · 该脚本 __init__ 里立刻 _init_hasher()，hash 不是 64/32 字符就直接抛错
+#     "Requires sha256sum for verification"（第 305-313 行）；
+#     即使 hash 合法，它检测到子模块也会抛
+#     "Fetching submodules is not yet supported"（第 247、270 行）
+#   · github_archive 的结尾是 `... || ( $(call DownloadMethod/rawgit) )`
+#   · 于是回落到 rawgit —— 它 clone 之后会执行
+#     `git submodule update --init --recursive`（download.mk 第 255 行），
+#     子模块内容这才进得来
+# 这就是 ImmortalWrt 那份配方（同样是 git 源）能编过、
+# 而"自己下 codeload 压缩包"会编不过的真正原因 —— 实测被 run 8 挂掉验证过。
+#
+# PKG_MIRROR_HASH 写 skip 是**故意**的：让 dl_github_archive.py 在初始化那步就
+# 失败，从而不依赖"子模块检测是否命中"，稳定走 rawgit。download.mk 第 182 行
+# 明确允许 MIRROR_HASH 取 skip。
+#
+# ══ PKG_VERSION / PKG_BUILD_DIR 都不用自己写 ═══════════════════════
+# download.mk 第 10-16 行：PKG_VERSION **未定义**时会自动推导
+#     PKG_VERSION := $(subst -,.,$(PKG_SOURCE_DATE))~$(version_abbrev ...)
+#                   → 2026.07.20~fa68e131
+#     PKG_SOURCE_SUBDIR ?= $(PKG_NAME)-$(PKG_VERSION)      → 克隆目录名
+#     PKG_SOURCE        ?= $(PKG_SOURCE_SUBDIR).tar.zst    → dl/ 里的文件名
+#     PKG_BUILD_DIR     ?= $(BUILD_DIR)/$(PKG_NAME)-$(PKG_VERSION)
+# 四者自动对齐，所以既不需要显式 PKG_BUILD_DIR，也不会再有
+# "压缩包顶层目录和 PKG_BUILD_DIR 对不上 → 找不到源码" 这类问题。
+#
+# 版本号形如 `2026.07.20~fa68e131` 是 OpenWrt 惯例：apk 要求版本号以数字开头，
+# 裸 sha（fa68e13… 以字母开头）会被判非法。
+#
 # ── 为什么用 commit sha 而不是版本号 ────────────────────────────
 # rozhuk-im/msd_lite 上游**一个 tag 都没有**（实测 /repos/rozhuk-im/msd_lite/tags
-# 返回 0 条），所以只能拿 commit sha 当 ref，根本没得选。
-# sha / 日期 / hash 都由 scripts/resolve-versions.sh 在构建时注入，
-# 下面写的是兜底值。
-#
-# ── 与 ddns-go 那份的唯一区别：PKG_BUILD_DIR 必须显式指定 ────────
-# codeload 用 sha 作 ref 时，压缩包顶层目录是 `msd_lite-<完整 sha>`；
-# 而 PKG_BUILD_DIR 的默认值是 `msd_lite-<PKG_VERSION>`。PKG_VERSION 为了能读
-# 写成了 2026.07.20~fa68e13，两者对不上 —— include/unpack.mk 是
-# tar -C $(PKG_BUILD_DIR)/..，解到 BUILD_DIR 下靠目录名对上，对不上就找不到源码。
-# 所以把 PKG_BUILD_DIR 显式改成 sha 形式。
-#
-# 必须在 include $(INCLUDE_DIR)/package.mk **之前**赋值：那里是
-# PKG_BUILD_DIR ?= ...，先赋值者生效。
-#
-# 顺带一个好处：版本标签（日期）变了也不会让 build_dir 跟着变，
-# 同一个 commit 重复构建能命中已有的 build_dir。
-#
-# ── PKG_VERSION 为什么是「日期~短sha」而不是裸 sha ──────────────
-# apk 的版本号要求以数字开头。裸 sha 以字母开头（比如 fa68e13…）会被判成
-# 非法版本。`2026.07.20~fa68e13` 这个形状是 OpenWrt 自己的惯例
-# （见 include/download.mk 第 13 行），ImmortalWrt 对同一个包也是这么写的。
+# 返回 0 条），所以只能拿 master 的 commit sha 当 ref，根本没得选。
 #
 # ── files/ 的来源 ───────────────────────────────────────────────
 # files/ 下三个文件取自 ImmortalWrt（GPL-2.0）。它们只负责 procd 拉起和
@@ -35,19 +57,18 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=msd_lite
-# ↓ 构建时注入；此处为兜底值
-PKG_VERSION:=2026.07.20~fa68e13
 PKG_RELEASE:=1
 
-# ↓ 构建时注入；此处为兜底值。上游 ref（commit sha）
-MSD_LITE_REF:=fa68e131343fb58c67ad77b2d26f2cb7c49a2c95
+# ↓ 这两个都由 scripts/resolve-versions.sh 在构建时注入；此处为兜底值
+#   PKG_VERSION 和 PKG_BUILD_DIR 都**不要**写：download.mk 会用上面这两个自动推导
+PKG_SOURCE_DATE:=2026-07-20
+PKG_SOURCE_VERSION:=fa68e131343fb58c67ad77b2d26f2cb7c49a2c95
 
-PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
-PKG_SOURCE_URL:=https://codeload.github.com/rozhuk-im/msd_lite/tar.gz/$(MSD_LITE_REF)?
-# ↓ 构建时注入（与上面的 MSD_LITE_REF 严格配对）；此处为兜底值
-PKG_HASH:=3452208a162ac3640745353918765fa26e7ef1c4f2d1c82683945344bed9f39d
-
-PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)-$(MSD_LITE_REF)
+PKG_SOURCE_PROTO:=git
+PKG_SOURCE_URL:=https://github.com/rozhuk-im/msd_lite.git
+# ↓ 故意写成 skip：让 github_archive 那条路在初始化校验 hash 时就失败，
+#   从而**确定性**地回落到会执行 `git submodule update` 的 rawgit（见文件头）
+PKG_MIRROR_HASH:=skip
 
 PKG_LICENSE:=BSD-2-Clause
 PKG_LICENSE_FILES:=LICENSE

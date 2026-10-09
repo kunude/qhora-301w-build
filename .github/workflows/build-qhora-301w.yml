@@ -255,13 +255,75 @@ jobs:
         env:
           CCACHE_COMPILERCHECK: content
           CCACHE_MAXSIZE: 5G
+          # 构建日志留给下面两步做回放和注解上报。
+          # 放 RUNNER_TEMP 而不是工作区，免得混进 artifact 或被 git 看到。
+          BUILD_LOG: ${{ runner.temp }}/build.log
         run: |
-          set -euo pipefail
-          if ! make -j"$(nproc)"; then
-            echo "::warning::并行编译失败，改用单线程 -j1 V=s 重跑以拿到完整报错"
-            make -j1 V=s
+          # 这里**故意不加 -e**：make 失败要自己接住，好决定是否单线程重跑，
+          # 并把完整日志留下来给后面两步上报。
+          set -uo pipefail
+          : >"$BUILD_LOG"
+
+          # 走 tee 之后 $? 是 tee 的退出码，make 自己的要用 PIPESTATUS[0] 取。
+          make -j"$(nproc)" 2>&1 | tee -a "$BUILD_LOG"
+          rc=${PIPESTATUS[0]}
+
+          if (( rc != 0 )); then
+            echo "::warning::并行编译失败（make 退出码 $rc），改用单线程 -j1 V=s 重跑以拿到完整报错"
+            make -j1 V=s 2>&1 | tee -a "$BUILD_LOG"
+            rc=${PIPESTATUS[0]}
           fi
-          staging_dir/host/bin/ccache -s || true
+
+          staging_dir/host/bin/ccache -s 2>&1 | tee -a "$BUILD_LOG" || true
+
+          if (( rc != 0 )); then
+            echo "编译失败：make 最终退出码 $rc。完整日志见下一步「回放编译日志」。"
+            exit "$rc"
+          fi
+          echo "编译通过"
+
+      # 编译**失败**的唯一远程可见通道是注解：作业日志要仓库 admin 权限才能从
+      # API 下载（公开仓库一样 403），而 ::error:: 会变成 check-run annotation，
+      # 那个是公开可读的。所以把"哪个包挂了 / 报错行"发成注解。
+      - name: 回放编译日志
+        if: always()
+        env:
+          BUILD_LOG: ${{ runner.temp }}/build.log
+        run: |
+          if [[ ! -s "$BUILD_LOG" ]]; then
+            echo "没有构建日志（可能编译步骤之前就失败了）"
+            exit 0
+          fi
+          echo "::group::构建日志共 $(wc -l <"$BUILD_LOG") 行，回放最后 250 行"
+          tail -n 250 "$BUILD_LOG"
+          echo "::endgroup::"
+
+      - name: 上报编译失败原因
+        if: failure()
+        env:
+          BUILD_LOG: ${{ runner.temp }}/build.log
+        run: |
+          [[ -s "$BUILD_LOG" ]] || exit 0
+
+          # OpenWrt 挂在某个包上时会打印固定格式： "ERROR: package/<路径> failed to build."
+          failed=$(grep -oE 'ERROR: package/[^ ]+ failed to build' "$BUILD_LOG" \
+                   | sed 's|^ERROR: package/||; s| failed to build$||' \
+                   | sort -u | tr '\n' ' ' || true)
+          # 最常见的几种真实报错行（尾部若干条，前面的多半是噪音）
+          hints=$(grep -nE 'Error [0-9]+$|error:|Error [0-9]+:|undefined reference|cannot find -l|No rule to make target|fatal error|CMake Error' \
+                  "$BUILD_LOG" | tail -n 8 || true)
+
+          if [[ -n "$failed" ]]; then
+            echo "::error title=编译失败的包::${failed}"
+          fi
+          if [[ -n "$hints" ]]; then
+            # 注解里的换行要写成 %0A，而 % 本身必须写成 %25（否则会被当转义前缀）
+            msg=$(printf '%s\n' "$hints" | sed 's/%/%25/g; s/\r//g' | awk '{printf "%s%%0A", $0}')
+            echo "::error title=编译报错行（尾部 8 条）::${msg}"
+          fi
+          if [[ -z "$failed$hints" ]]; then
+            echo "::error title=编译失败::没从日志里认出固定格式的报错，请看上一步的控制台回放"
+          fi
 
       # ── 收集产物 ──────────────────────────────────────────────
       - name: 收集并校验产物

@@ -263,6 +263,28 @@ luci/packages 的版本组合相当敏感。
 （`jeessy2/ddns-go`、`rozhuk-im/msd_lite`），版本号和 hash 由构建时的
 `resolve-versions.sh` 解析后注入，配方里写的只是**兜底值**（见下）。
 
+⚠️ **但这两个包的取源方式不一样，别照抄：**
+
+| | ddns-go | msd_lite |
+|---|---|---|
+| 取源方式 | codeload 压缩包（`PKG_SOURCE_URL` 指向 `tar.gz/v<版本>`） | **git 源**（`PKG_SOURCE_PROTO:=git`） |
+| 为什么 | 自包含，压缩包就够 | **它依赖 git 子模块 `src/liblcb`，压缩包里没有**（见下） |
+| `resolve-versions.sh` 注入 | `PKG_VERSION` / `PKG_HASH` / `GO_PKG` | `PKG_SOURCE_DATE` / `PKG_SOURCE_VERSION` |
+
+`msd_lite` 的 `CMakeLists.txt` 第 245 行是**无条件**的
+`include(src/liblcb/CMakeLists.txt)`，而 `liblcb` 是 `.gitmodules` 里的子模块
+（`https://github.com/rozhuk-im/liblcb.git`）。GitHub 的 `/archive/<sha>.tar.gz`
+**不打包子模块内容** —— 解出来 `src/liblcb/` 是空目录，cmake 直接报
+`include could not find requested file`。
+
+用 git 源时 `include/download.mk` 会自动处理这条路：GitHub URL 先走
+`github_archive`（`dl_github_archive.py`），该脚本**拒绝**带子模块的仓库
+（`Fetching submodules is not yet supported`），于是回落到 `rawgit` —— 它会
+`git clone` 后执行 `git submodule update --init --recursive`，子模块这才进得来。
+配方里 `PKG_MIRROR_HASH:=skip` 是**故意**的，目的是让 `github_archive` 在初始化校验
+hash 时就失败，从而**确定性**地走 `rawgit`，不依赖"子模块检测是否命中"。
+（这套机制是 run 8 挂掉之后查出来的 —— 当时图省事把 msd_lite 也换成了压缩包。）
+
 **为什么两个 luci-app 还从 ImmortalWrt 拿。** 它们只是页面（JS / ucode / 翻译），
 没有可指的源码仓库，抄一份进本仓库只会让上游的界面更新再也跟不进来。它们通过
 `LUCI_DEPENDS:=+ddns-go` / `+msd_lite` 依赖上面那两个包 —— 包名没变，照样接得上。
@@ -299,19 +321,21 @@ luci 应用是 `include ../../luci.mk`，`ddns-go` 是
    它会自动跳过预发布版和草稿），拉 codeload 压缩包算 sha256，再把
    `PKG_VERSION` / `PKG_HASH` 写回配方。顺带读压缩包里 `go.mod` 的 `module` 行
    注入 `GO_PKG` —— 上游哪天升到 v7（`.../ddns-go/v7`），这一步自动跟上，不用手改。
-2. `msd_lite`：上游**一个 tag 都没有**，只能查 `commits/master` 拿 sha 和日期。
-   版本号写成 `2026.07.20~fa68e13` 这个形状（日期~短 sha）—— 因为 apk 的版本号
-   必须以数字开头，裸 sha 会被判非法。
-3. 两个压缩包都下载进 `$OPENWRT_DIR/dl/`，让后面的 `make download` 直接复用 ——
-   也顺带证明了"我们算出来的 hash"就是"构建时会校验的那个 hash"。
+2. `msd_lite`：上游**一个 tag 都没有**，只能查 `commits/master` 拿 sha 和日期，
+   注入 `PKG_SOURCE_VERSION`（sha）+ `PKG_SOURCE_DATE`。它是 **git 源**，所以
+   `PKG_VERSION` / `PKG_SOURCE_SUBDIR` / `PKG_BUILD_DIR` 全部由 `download.mk`
+   从这两个值自动推导，配方里**不写**（详见上一节）。版本号形如
+   `2026.07.20~fa68e131` —— apk 要求版本号以数字开头，裸 sha 会被判非法。
+3. `ddns-go` 的压缩包会下载进 `$OPENWRT_DIR/dl/`，让后面的 `make download` 直接复用
+   —— 也就顺带证明了"我们算出来的 hash"就是"构建时会校验的那个 hash"。
+   `msd_lite` 是 git 源，不下载、本地不算 hash（由 OpenWrt 自己 clone + 打包）。
 
 > **关于 msd_lite 的日期可能和 ImmortalWrt 差一天。** 脚本取的是 commit 的
 > **UTC** 日期；ImmortalWrt 那份配方里的 `PKG_SOURCE_DATE` 是**手工维护**的，且按
 > 维护者本地时区（UTC+8）算。同一个 commit `fa68e131`（实际 `2026-07-20T20:24Z`）
-> 我们得出 `2026.07.20`，ImmortalWrt 写的是 `2026.07.21`。
+> 我们得出 `2026.07.20~fa68e131`，ImmortalWrt 编出来的是 `2026.07.21~fa68e131`。
 > 这**不是 bug**：版本号里真正标识修订的是那段短 sha，日期只是为了让版本号以数字开头
-> 并且大致单调。从旧机制编出来的固件换到新机制，`msd_lite` 的版本号会"看起来变旧"
-> 一个 patch —— 整镜像 sysupgrade 不比较包版本，所以实际无影响。
+> 并且大致单调。整镜像 sysupgrade 不比较包版本，所以"看起来变旧一个 patch"实际无影响。
 >
 > `ddns-go` 没有这个问题：它的版本号直接来自上游 tag（`6.17.7`），两边必然一致。
 
@@ -319,11 +343,13 @@ luci 应用是 `include ../../luci.mk`，`ddns-go` 是
 
 - **失败不中断构建。** API 抖动、限流、网络抽风都不该让一轮两小时的编译白跑。
   解析失败就发一条 `::warning::` 注解、沿用配方里的兜底值照常编。
-- **注入按包原子。** 版本、ref/`GO_PKG`、hash 是一组一起替换的，绝不会出现
+- **注入按包原子。** 一个包的版本、ref/`GO_PKG`、hash 是一组一起替换的，绝不会出现
   "新版本配旧 hash"这种半截状态 —— 那会让下载阶段的 hash 校验直接失败。
-- **压缩包顶层目录名会校验。** `include/unpack.mk` 解到 `BUILD_DIR` 下、靠目录名
-  对上 `PKG_BUILD_DIR`，命名规则一变就会在"解压完找不到源码"这种晦涩的地方炸；
+- **压缩包顶层目录名会校验**（只对 ddns-go）。`include/unpack.mk` 解到 `BUILD_DIR` 下、
+  靠目录名对上 `PKG_BUILD_DIR`，命名规则一变就会在"解压完找不到源码"这种晦涩的地方炸；
   所以先 `tar -tzf` 确认顶层目录，不符就回落兜底值。
+- **sha 形状会校验。** `msd_lite` 的 sha 必须是 40 位小写十六进制，否则 `git checkout`
+  会在很后面才失败，不如在这里拦住回落兜底值。
 - **两个包互相独立。** 一个解析失败不影响另一个（bash 在 `if` 条件位置会关掉 `-e`，
   函数内部靠显式 `return 1` 退出）。
 
@@ -331,7 +357,7 @@ luci 应用是 `include ../../luci.mk`，`ddns-go` 是
 发成公开注解：
 
 ```
-::notice:: 本轮固件里的上游包版本：ddns-go=6.17.7  msd_lite=2026.07.20~fa68e13
+::notice:: 本轮固件里的上游包版本：ddns-go=6.17.7  msd_lite=2026.07.20~fa68e131
            （ddns-go 已跟随上游最新版；msd_lite 已跟随上游最新版）
 ```
 
@@ -431,9 +457,14 @@ make defconfig
 在上面三条之外，追加了三组功能包（`ddns-go` / `msd_lite` / `WireGuard`，见第五节）：
 
 4. **`ddns-go` / `msd_lite` 改为自带配方**（`packages/net/`），直接引用上游源码
-   （`jeessy2/ddns-go`、`rozhuk-im/msd_lite`），版本/hash 由
+   （`jeessy2/ddns-go`、`rozhuk-im/msd_lite`），版本/ref 由
    `scripts/resolve-versions.sh` 在构建时解析注入 —— 不再等 ImmortalWrt bump。
-   只有两个 luci 前端页面仍从 ImmortalWrt 稀疏检出。
+   两者取源方式不同：`ddns-go` 用 codeload 压缩包，`msd_lite` **必须**用 git 源
+   （它依赖 git 子模块 `src/liblcb`，压缩包里没有）。只有两个 luci 前端页面仍从
+   ImmortalWrt 稀疏检出。
+
+另外，工作流本身也加了一条能力：**编译失败可远程诊断**（make 输出落盘 + 失败时把
+失败包名和真实报错行发成公开注解，见第八节）。
 
 这四组都是**独立追加**的，删掉它们不影响 NSS 卸载栈本身。
 `WireGuard` 走的是官方 feed 的原生包，不需要额外脚本。
@@ -473,13 +504,21 @@ Ubuntu 24.04/26.04 上需要：
 
 ## 八、排查构建失败
 
-工作流的 job 日志要仓库 admin 权限才能从 API 下载，所以 `scripts/prepare-build.sh`
-特意让失败**可远程诊断**：
+工作流的 job 日志要仓库 admin 权限才能从 API 下载，所以整个流程都特意让失败
+**可远程诊断**：
 
-- 全部输出落盘到 `$GITHUB_WORKSPACE/prepare-build.log`；
-- 失败时把「出错行号 + 出错命令 + 日志尾部」以 `::error::` 输出 —— 那会变成
+- `scripts/prepare-build.sh` 的输出落盘到 `$GITHUB_WORKSPACE/prepare-build.log`；
+  失败时把「出错行号 + 出错命令 + 日志尾部」以 `::error::` 输出 —— 那会变成
   check-run annotation，在 Actions 页面和公开 API 上都能直接看到；
-- 工作流里还有一步 `if: always()` 的「回放构建准备日志」，把日志尾部打到控制台。
+- 工作流里有一堆 `if: always()` 的「回放…日志」步骤，把日志尾部打到控制台；
+- **`make` 的输出也全程落盘**（`$RUNNER_TEMP/build.log`），失败时由
+  「回放编译日志」打到控制台、并由「上报编译失败原因」把
+  **失败的包名**和**真实报错行**发成 `::error::` 注解。
+
+> 为什么编译阶段也要做这一套：这一层的失败原因（比如某个包的
+> `CMake Error` / `undefined reference`）**只存在于 make 的输出里**，
+> 而作业日志公开侧拿不到 —— 不做这个的话，编译失败就只剩一句
+> `Process completed with exit code 2.`，等于抓瞎。
 
 典型报错：
 
@@ -491,6 +530,9 @@ Ubuntu 24.04/26.04 上需要：
 | `package/feeds/... 不存在` | 放进 feed 的包没被 `feeds install` 接管 | 检查 `feeds update -i` 那一步 |
 | `ddns-go / msd_lite 解析上游最新版本失败` **（warning）** | 查 GitHub API 或算 hash 失败 | **不影响构建**，那两个包会用配方里的兜底值；想确认编的是哪个版本，看同批的 notice |
 | `本轮固件里的上游包版本：…` **（notice）** | 这轮实际编进去的版本 | 核对是否是预期版本；不是就用 `ddns_go_version` / `msd_lite_sha` 钉死 |
+| `并行编译失败（make 退出码 N）` **（warning）** | `make -j` 挂了，正在用 `-j1 V=s` 重跑 | 不用管；只有下面那条 error 才说明真失败 |
+| `编译失败的包::<包路径>` **（error）** | 这个包没编过（OpenWrt 会打印 `ERROR: package/… failed to build.`） | 到「回放编译日志」里搜这个包名 |
+| `编译报错行（尾部 8 条）` **（error）** | 从日志里挑出的真实报错行 | 通常一眼能看出原因（缺头文件、CMake 找不到文件、未定义引用……） |
 
 ### 诊断代码里有三个必须遵守的约束
 
