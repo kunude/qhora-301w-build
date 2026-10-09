@@ -69,7 +69,7 @@ _dump_symbol_def() {
         sub(/[ \t]+$/, "", line)
         if (line == "config " sym) { inblk = 1; print "  " line; next }
         if (inblk && line ~ /^config /) exit
-        if (inblk && (line == "endmenu" || line == "endif" || line == "menu ")) exit
+        if (inblk && (line == "endmenu" || line == "endif" || line == "menu")) exit
         if (inblk) print "  " line
       }
     ' "$f" | head -40
