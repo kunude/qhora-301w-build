@@ -21,9 +21,13 @@
 ├── configs/
 │   ├── common.config                        # NSS 卸载栈 + 通用选项 + 附加功能包
 │   └── qhora_301w.config                    # 机型：target/子目标/设备/内存档位
+├── packages/net/                            # 本仓库自带的包配方（直接引用上游源码）
+│   ├── ddns-go/                             #   Makefile + files/（init、UCI 默认配置）
+│   └── msd_lite/                            #   同上
 ├── scripts/
 │   ├── prepare-build.sh                     # 组装 .config、跑 defconfig、校验、叠加覆盖文件
-│   ├── extra-packages.sh                    # 引入官方 feed 没有的包（ddns-go / msd_lite）
+│   ├── extra-packages.sh                    # 把自带配方和 ImmortalWrt 前端包放进 feed 目录树
+│   ├── resolve-versions.sh                  # 构建时解析上游最新版本，注入到上面两个配方
 │   └── push-to-github.sh                    # 本地一键推送脚本
 ├── files/etc/uci-defaults/99-qhora-301w     # 首次启动的设置（主机名、启用服务）
 ├── .gitattributes / .gitignore
@@ -79,8 +83,14 @@ git push -u origin main
 |---|---|
 | `upstream_ref` | 要编译的上游 ref，默认 `nss-edma-rework`。也可以填 tag 或 commit |
 | `release` | 勾上则编译成功后创建 Release 并把镜像挂上去；不勾就只出 Actions artifact |
+| `ddns_go_version` | 留空 = 跟随上游最新 release；填 `6.17.7` 这类版本号则钉死（见第五节） |
+| `msd_lite_sha` | 留空 = 跟随上游 `master` HEAD；填 commit sha 则钉死 |
+
+后两个输入只影响 `ddns-go` / `msd_lite` 这两个包。**平时留空即可** —— 留空就是
+"上游一发新版，下次构建自动编新版"。需要可复现的固件时才填。
 
 推送改动、或每周一 00:30（东八区）定时检查上游更新时也会自动触发（定时触发只出 artifact）。
+`push` / `schedule` 这两种触发方式没有输入框，两个值天然为空，所以走的也是"跟随上游最新"。
 
 ### 4. 取固件
 
@@ -214,30 +224,48 @@ wg show                                      # 建好 wg 接口后可用
 | 想改什么 | 改哪 |
 |---|---|
 | 多加一个软件包 | 在 `configs/common.config` 末尾加 `CONFIG_PACKAGE_xxx=y` |
-| 加一个**官方 feed 没有**的包 | 在 `scripts/extra-packages.sh` 的 `PKG_PATHS` / `LUCI_PATHS` 里加路径，再到 `common.config` 加符号 |
-| 开关某个内核选项 | 同上，`CONFIG_KERNEL_xxx=y` |
+| 加一个**官方 feed 没有**的包 | 在 `packages/<分类>/<包>/` 放一份自带配方，`extra-packages.sh` 会自动落位；再到 `common.config` 加符号（见下） |
+| 只加一个 luci 前端页面 | 在 `scripts/extra-packages.sh` 的 `LUCI_PATHS` 里加路径，再到 `common.config` 加符号 |
+| 钉死 ddns-go / msd_lite 的版本 | `Run workflow` 时填 `ddns_go_version` / `msd_lite_sha`，或改 `packages/net/*/Makefile` 里的兜底值 |
+| 开关某个内核选项 | `common.config` 加 `CONFIG_KERNEL_xxx=y` |
 | 换编译分支 | 工作流 `Run workflow` 时填 `upstream_ref`，或改 YAML 里 `UPSTREAM_REF` 的默认值 |
 | 用自己 fork 的源码 | 改 YAML `env.UPSTREAM_REPOSITORY` |
 | 系统默认配置（主机名、IP、无线、服务开关） | 往 `files/` 里按路径放文件，会原样叠加进镜像；首次启动脚本在 `files/etc/uci-defaults/` |
 | 同时编多个机型 | 在 `configs/qhora_301w.config` 再加 `CONFIG_TARGET_DEVICE_qualcommax_ipq807x_DEVICE_xxx=y`，注意 RTL 相关的高危项见下 |
 
+自带配方不用登记：`extra-packages.sh` 是 `find packages -name Makefile` 扫出来的，
+放进 `packages/net/<任意名字>/` 就会被落位到 `feeds/packages/net/<同名>/` ——
+但**二级目录名要跟包的性质对上**（`net/`、`utils/`……），因为配方里的
+`include ../../…` 依赖这个层级。
+
 改完 `.config` 的选项要**推送到仓库再跑**，否则不会生效。
 
 ### 关于 extra-packages.sh
 
-`ddns-go` 和 `msd_lite` 在 OpenWrt 官方 `packages` feed 里**不存在**，只有 ImmortalWrt
-的 feed 在维护。这里没有把整个 ImmortalWrt feed 加进 `feeds.conf` —— 那个 feed 是官方
-feed 的分支，有成百上千个同名包（`luci-app-firewall`、`aria2`……），两份同名包会互相
-打架，而这个 NSS 构建对 luci/packages 的版本组合相当敏感。
+`ddns-go` 和 `msd_lite` 在 OpenWrt 官方 `packages` feed 里**不存在**（实测
+`net/ddns-go`、`net/msd_lite` 都是 404）。这里没有把整个 ImmortalWrt feed 加进
+`feeds.conf` —— 那个 feed 是官方 feed 的分支，有成百上千个同名包
+（`luci-app-firewall`、`aria2`……），两份同名包会互相打架，而这个 NSS 构建对
+luci/packages 的版本组合相当敏感。
 
-所以改成用 git 稀疏检出，只把这 4 个目录抠出来，放进对应 feed 的目录树：
+脚本把 4 个目录放进对应的 feed 目录树，但这 4 个目录来自**两个不同的地方**：
 
-```
-feeds/packages/net/ddns-go
-feeds/packages/net/msd_lite
-feeds/luci/applications/luci-app-ddns-go
-feeds/luci/applications/luci-app-msd_lite
-```
+| 放进哪 | 来自哪 | 为什么 |
+|---|---|---|
+| `feeds/packages/net/ddns-go` | **本仓库** `packages/net/ddns-go/` | 带二进制，要跟上游版本 |
+| `feeds/packages/net/msd_lite` | **本仓库** `packages/net/msd_lite/` | 同上 |
+| `feeds/luci/applications/luci-app-ddns-go` | ImmortalWrt 稀疏检出 | 纯前端页面，没有独立的"上游源码仓库" |
+| `feeds/luci/applications/luci-app-msd_lite` | ImmortalWrt 稀疏检出 | 同上 |
+
+**为什么前者不抄 ImmortalWrt 的配方。** ImmortalWrt 那份把版本**写死**了
+（`PKG_VERSION:=6.17.6` 配一个对应的 `PKG_HASH`），上游发了新版得等它 bump 才跟得上
+—— 写这套东西的时候上游已经到 `6.17.7` 了。所以这两个包改成**直接引用上游源码仓库**
+（`jeessy2/ddns-go`、`rozhuk-im/msd_lite`），版本号和 hash 由构建时的
+`resolve-versions.sh` 解析后注入，配方里写的只是**兜底值**（见下）。
+
+**为什么两个 luci-app 还从 ImmortalWrt 拿。** 它们只是页面（JS / ucode / 翻译），
+没有可指的源码仓库，抄一份进本仓库只会让上游的界面更新再也跟不进来。它们通过
+`LUCI_DEPENDS:=+ddns-go` / `+msd_lite` 依赖上面那两个包 —— 包名没变，照样接得上。
 
 **为什么必须放进 feed 目录而不是 `package/`**：这些 Makefile 用的是相对路径 ——
 luci 应用是 `include ../../luci.mk`，`ddns-go` 是
@@ -249,6 +277,56 @@ luci 应用是 `include ../../luci.mk`，`ddns-go` 是
 读的是 `feeds/<name>.index`，不重建索引就看不到新包。`prepare-build.sh` 里已经按这个
 顺序串好了，并在 install 之后检查 `package/feeds/...` 是否真的存在 —— 索引没生效的话
 会立刻失败，而不是默默编出一个缺功能的固件。
+
+自带的配方文件（`files/ddns-go.init`、`files/msd_lite.config` 等）仍取自 ImmortalWrt
+（同为 GPL-2.0）。它们只负责 UCI 解析和 procd 拉起，**与包本身的版本无关**；所以
+`resolve-versions.sh` 只管版本/hash，不会去动 `files/`。代价是：ImmortalWrt 若改了
+这些 init 脚本，需要手工同步过来。
+
+### 版本是"跟上游最新"还是"钉死"
+
+这是**两层**，别混在一起：
+
+| 层 | 谁决定 | 什么时候变 |
+|---|---|---|
+| 配方本身（Makefile、init 脚本） | feed 的每次重新拉取 | 每次构建都是最新的（pin 的是上游 ref，不是某个 feed 快照） |
+| **包编出来的版本** | 配方里的 `PKG_VERSION` / `PKG_SOURCE_VERSION` | 由 `resolve-versions.sh` 在构建时改写 → 每次构建都是上游最新 |
+
+`scripts/resolve-versions.sh` 在 `extra-packages.sh` 之后、`feeds update -i` 之前跑，
+做三件事：
+
+1. `ddns-go`：查 `releases/latest` 拿 tag（用 `releases/latest` 而不是 `/tags`，
+   它会自动跳过预发布版和草稿），拉 codeload 压缩包算 sha256，再把
+   `PKG_VERSION` / `PKG_HASH` 写回配方。顺带读压缩包里 `go.mod` 的 `module` 行
+   注入 `GO_PKG` —— 上游哪天升到 v7（`.../ddns-go/v7`），这一步自动跟上，不用手改。
+2. `msd_lite`：上游**一个 tag 都没有**，只能查 `commits/master` 拿 sha 和日期。
+   版本号写成 `2026.07.20~fa68e13` 这个形状（日期~短 sha）—— 因为 apk 的版本号
+   必须以数字开头，裸 sha 会被判非法。
+3. 两个压缩包都下载进 `$OPENWRT_DIR/dl/`，让后面的 `make download` 直接复用 ——
+   也顺带证明了"我们算出来的 hash"就是"构建时会校验的那个 hash"。
+
+几个刻意的设计：
+
+- **失败不中断构建。** API 抖动、限流、网络抽风都不该让一轮两小时的编译白跑。
+  解析失败就发一条 `::warning::` 注解、沿用配方里的兜底值照常编。
+- **注入按包原子。** 版本、ref/`GO_PKG`、hash 是一组一起替换的，绝不会出现
+  "新版本配旧 hash"这种半截状态 —— 那会让下载阶段的 hash 校验直接失败。
+- **压缩包顶层目录名会校验。** `include/unpack.mk` 解到 `BUILD_DIR` 下、靠目录名
+  对上 `PKG_BUILD_DIR`，命名规则一变就会在"解压完找不到源码"这种晦涩的地方炸；
+  所以先 `tar -tzf` 确认顶层目录，不符就回落兜底值。
+- **两个包互相独立。** 一个解析失败不影响另一个（bash 在 `if` 条件位置会关掉 `-e`，
+  函数内部靠显式 `return 1` 退出）。
+
+**这轮到底编了哪个版本，看注解。** 作业日志要登录才能看，注解不用，所以脚本把结果
+发成公开注解：
+
+```
+::notice:: 本轮固件里的上游包版本：ddns-go=6.17.7  msd_lite=2026.07.20~fa68e13
+           （ddns-go 已跟随上游最新版；msd_lite 已跟随上游最新版）
+```
+
+要钉死某次构建的版本（比如复现一个固件），在 `Run workflow` 里填
+`ddns_go_version` / `msd_lite_sha`；本地跑时同名环境变量即可，填了就不查 API。
 
 ### 怎么确认某个包真的编进去了
 
@@ -270,6 +348,10 @@ luci 应用是 `include ../../luci.mk`，`ddns-go` 是
 apk  后端：<name>-<version>.apk          ← 本分支走这条
 opkg 后端：<name>_<version>_<arch>.ipk
 ```
+
+**想连版本一起核对**：`.manifest` 里每行是 `包名 - 版本`，版本号就是
+`resolve-versions.sh` 注入的那个（`PKG_VERSION`）；运行页的注解也会把它们列出来，
+两者对得上就说明"跟上游最新"确实生效了。
 
 **自己核对的最快办法**：下载运行页上的 artifact，解压后打开
 `openwrt-qualcommax-ipq807x*.manifest`（文件名由 `IMG_PREFIX` + profile 拼成，
@@ -300,13 +382,22 @@ opkg 后端：<name>_<version>_<arch>.ipk
 git fetch origin && git reset --hard origin/nss-edma-rework
 rm -rf feeds/nss package/feeds/nss
 ./scripts/feeds update -a
-# 官方 feed 里没有 ddns-go / msd_lite，这一步会把它们放回 feed 目录树
-OPENWRT_DIR="$PWD" /path/to/qhora-301w-build/scripts/extra-packages.sh
+# 官方 feed 里没有 ddns-go / msd_lite，这一步会把自带配方和 luci 前端放进 feed 目录树
+OPENWRT_DIR="$PWD" BUILDER_DIR=/path/to/qhora-301w-build \
+  /path/to/qhora-301w-build/scripts/extra-packages.sh
+# 再解析这两个包的上游最新版本，写回配方（不跑也行，那就会用配方里的兜底值）
+OPENWRT_DIR="$PWD" /path/to/qhora-301w-build/scripts/resolve-versions.sh
 ./scripts/feeds update -i -a && ./scripts/feeds install -a
 make defconfig
 ```
 
-工作流每次都是全新 checkout，所以不受影响。
+`resolve-versions.sh` 最好带上 `GH_TOKEN`（本地 `export GH_TOKEN=$(gh auth token)`
+之类）：不带也能跑，但 GitHub 未认证 API 限额只有 60 次/小时，容易被别处撞掉，
+那时脚本会回落成兜底值 —— 不报错，只是编的不是最新版。
+
+工作流每次都是全新 checkout，所以不受影响；上面这一串的 CI 版本就是
+`prepare-build.sh` 内部的顺序（`extra-packages.sh` → `resolve-versions.sh` →
+`feeds update -i -a` → `feeds install -a`）。
 
 ---
 
@@ -327,9 +418,15 @@ make defconfig
    `luci.mk` 生成的 i18n 包都带 `HIDDEN:=1`，没有 prompt，
    `.config` 里的值会被 kconfig 直接忽略。原因见第八节陷阱②。
 
-在上面三条之外，追加了三组功能包（`ddns-go` / `msd_lite` / `WireGuard`，见第五节），
-以及配套的 `scripts/extra-packages.sh`。这三组是**独立追加**的，删掉它们不影响
-NSS 卸载栈本身。
+在上面三条之外，追加了三组功能包（`ddns-go` / `msd_lite` / `WireGuard`，见第五节）：
+
+4. **`ddns-go` / `msd_lite` 改为自带配方**（`packages/net/`），直接引用上游源码
+   （`jeessy2/ddns-go`、`rozhuk-im/msd_lite`），版本/hash 由
+   `scripts/resolve-versions.sh` 在构建时解析注入 —— 不再等 ImmortalWrt bump。
+   只有两个 luci 前端页面仍从 ImmortalWrt 稀疏检出。
+
+这四组都是**独立追加**的，删掉它们不影响 NSS 卸载栈本身。
+`WireGuard` 走的是官方 feed 的原生包，不需要额外脚本。
 
 ---
 
@@ -339,15 +436,25 @@ NSS 卸载栈本身。
 git clone -b nss-edma-rework https://github.com/JuliusBairaktaris/openwrt-nss-edma openwrt
 cd openwrt
 
-# 下面这一步会自己做完全部准备工作：追加 nss feed、引入 ddns-go/msd_lite、
-# 跑 feeds update/install、拼 .config、跑 defconfig、校验符号、叠加 files/。
+# 下面这一步会自己做完全部准备工作：追加 nss feed、落位自带配方 + 两个 luci 前端、
+# 解析 ddns-go/msd_lite 的上游最新版本、跑 feeds update/install、拼 .config、
+# 跑 defconfig、校验符号、叠加 files/。
+export GH_TOKEN=<你的 GitHub token>   # 可选，但建议给：避免撞未认证 API 限额
 OPENWRT_DIR="$PWD" BUILDER_DIR="../qhora-301w-build" bash ../qhora-301w-build/scripts/prepare-build.sh
 
 make -j"$(nproc)"
 ```
 
+想编某个确定版本的 ddns-go / msd_lite，在 `prepare-build.sh` 前面加环境变量即可：
+
+```sh
+DDNS_GO_VERSION=6.17.7 MSD_LITE_SHA=fa68e131343fb58c67ad77b2d26f2cb7c49a2c95 \
+  OPENWRT_DIR="$PWD" BUILDER_DIR="../qhora-301w-build" \
+  bash ../qhora-301w-build/scripts/prepare-build.sh
+```
+
 Ubuntu 24.04/26.04 上需要：
-`bzip2 g++ gawk gcc git glibc-source libncurses-dev make`，
+`bzip2 g++ gawk gcc git glibc-source libncurses-dev make curl`，
 磁盘留 **35GB** 以上。全量编译（含 LTO）在 4 核机器上要几个小时。
 
 （脚本里的文件叠加用的是 `cp -a` 而不是 `rsync`，所以**不需要**装 rsync。）
@@ -372,6 +479,8 @@ Ubuntu 24.04/26.04 上需要：
 | `defconfig 丢弃了 N 个配置请求的符号` | Kconfig 依赖没满足，选项被静默丢弃 | 后面几条注解会逐个列出符号名 |
 | `defconfig 丢弃符号：CONFIG_PACKAGE_xxx=y` | 具体是哪个选项被丢了 | 日志里有该符号的 kconfig 定义，看它的 `bool`/`default`/`depends on` |
 | `package/feeds/... 不存在` | 放进 feed 的包没被 `feeds install` 接管 | 检查 `feeds update -i` 那一步 |
+| `ddns-go / msd_lite 解析上游最新版本失败` **（warning）** | 查 GitHub API 或算 hash 失败 | **不影响构建**，那两个包会用配方里的兜底值；想确认编的是哪个版本，看同批的 notice |
+| `本轮固件里的上游包版本：…` **（notice）** | 这轮实际编进去的版本 | 核对是否是预期版本；不是就用 `ddns_go_version` / `msd_lite_sha` 钉死 |
 
 ### 诊断代码里有三个必须遵守的约束
 
@@ -431,8 +540,22 @@ CONFIG_LUCI_LANG_zh_Hans=y
 **artifact 里没有 sysupgrade 镜像。**
 工作流在"收集并校验产物"那步就会 `exit 1` 报出来，不会静默给你一个空包。
 
+**ddns-go 上游发了新版，为什么固件里还是旧的？**
+按可能性排序：
+
+1. **这一轮解析失败了，回落成了配方兜底值。** 运行页会有一条 warning 注解
+   （`解析上游最新版本失败`）。点 `Re-run all jobs` 即可，多半是 API 抖动。
+2. **`ddns-go` 发的是预发布版。** 脚本查的是 `releases/latest`，它**不加**
+   预发布标签 —— 这是故意的，上游的 rc/beta 不该自动进固件。
+3. **ImmortalWrt 的 luci 前端没跟上。** 页面是 ImmortalWrt 那边维护的，
+   二进制是新的、页面是旧的，功能一般不受影响；等它更新或手工改 `LUCI_PATHS`。
+4. **本地增量编译时没重下源码。** `dl/` 里已有同名压缩包时不会重下，
+   而 `PKG_VERSION` 变了就会拉新的；确认办法是看运行页的
+   `本轮固件里的上游包版本` 注解。
+
 **上游改名/迁移了。**
 改 `env.UPSTREAM_REPOSITORY` / `UPSTREAM_REF` / `NSS_FEED` 三个地方即可。
+`ddns-go` / `msd_lite` 的源码地址在 `packages/net/*/Makefile` 里，各自独立。
 
 ---
 

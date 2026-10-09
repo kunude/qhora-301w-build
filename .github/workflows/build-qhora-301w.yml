@@ -25,11 +25,22 @@ on:
         description: "构建成功后创建 GitHub Release 并附带镜像"
         type: boolean
         default: false
+      # 下面两个留空就跟随上游最新版本（默认行为）。
+      # 想编某个确定版本、或者要可复现的固件时，在这里填死。
+      ddns_go_version:
+        description: "钉死 ddns-go 版本，如 6.17.7（留空 = 跟随上游最新 release）"
+        required: false
+        default: ""
+      msd_lite_sha:
+        description: "钉死 msd_lite 的 commit sha（留空 = 跟随上游 master HEAD）"
+        required: false
+        default: ""
   push:
     branches: [main]
     paths:
       - ".github/workflows/build-qhora-301w.yml"
       - "configs/**"
+      - "packages/**"
       - "scripts/**"
       - "files/**"
   schedule:
@@ -126,7 +137,10 @@ jobs:
       - name: 环境预检
         run: |
           set -euo pipefail
-          for c in perl make git gcc g++ gawk bzip2; do
+          # scripts/feeds 是 Perl 脚本、索引器要 make；
+          # resolve-versions.sh 还要 curl/tar/sha256sum 去解析上游版本并算 hash。
+          # 缺任何一项都会在后面以很晦涩的方式失败，所以先查一遍。
+          for c in perl make git gcc g++ gawk bzip2 curl tar sha256sum; do
             command -v "$c" >/dev/null 2>&1 ||
               { echo "::error::runner 上缺少必需工具：$c"; exit 1; }
           done
@@ -135,6 +149,14 @@ jobs:
           echo "必需工具齐备"
 
       - name: 准备构建环境（feeds + 第三方包 + .config + 覆盖文件）
+        env:
+          # 用来查 GitHub API 解析 ddns-go / msd_lite 的上游最新版本。
+          # 不给 token 也能跑，但未认证限额只有 60 次/小时，容易被别处撞掉。
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 留空 = 跟随上游最新版本（默认）。push / schedule 事件下这两个表达式
+          # 求值为空字符串，所以那两个触发方式天然就是"跟随最新"。
+          DDNS_GO_VERSION: ${{ github.event.inputs.ddns_go_version }}
+          MSD_LITE_SHA: ${{ github.event.inputs.msd_lite_sha }}
         run: bash "$BUILDER_DIR/scripts/prepare-build.sh"
 
       # 日志要仓库 admin 权限才能从 API 下载，所以把它回放到控制台，

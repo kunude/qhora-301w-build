@@ -2,17 +2,23 @@
 #
 # 为 QNAP QHora-301W 准备 OpenWrt 构建环境。
 #
-#   1. 追加 NSS feed，更新 feed；从 ImmortalWrt 引入官方 feed 没有的包；安装全部 feed
+#   1. 追加 NSS feed，更新 feed；引入官方 feed 没有的包；安装全部 feed
+#      · ddns-go / msd_lite 用本仓库自带配方（packages/net/*，直接引上游源码），
+#        版本由 resolve-versions.sh 在构建时解析注入
+#      · luci-app-ddns-go / luci-app-msd_lite 是纯前端，从 ImmortalWrt 稀疏检出
 #   2. 把 configs/common.config + configs/qhora_301w.config 拼成 .config，跑 make defconfig
 #   3. 校验 defconfig 没有静默丢弃符号（Kconfig 在依赖不满足时会无声地去掉选项）
 #   4. 关闭 NSS feed 的整体打包（feeds.conf 里声明了，但我们只要 .config 里显式选的包）
 #   5. 叠加 files/ 覆盖文件
 #
 # 必需的环境变量：
-#   OPENWRT_DIR   已检出的 OpenWrt 源码目录（必须是 git 工作区）
-#   BUILDER_DIR   本仓库的检出目录
+#   OPENWRT_DIR      已检出的 OpenWrt 源码目录（必须是 git 工作区）
+#   BUILDER_DIR      本仓库的检出目录
 # 可选：
-#   NSS_FEED      NSS feed 的 src-git 行，默认指向 edma-nss 分支
+#   NSS_FEED         NSS feed 的 src-git 行，默认指向 edma-nss 分支
+#   GH_TOKEN         查 GitHub API 用，避免未认证限额（Actions 里默认注入）
+#   DDNS_GO_VERSION  钉死 ddns-go 版本，例如 6.17.7（默认跟随上游最新 release）
+#   MSD_LITE_SHA     钉死 msd_lite 的 commit sha（默认跟随上游 master HEAD）
 #
 set -Eeuo pipefail
 
@@ -143,11 +149,26 @@ log "更新全部 feed（最耗时的一步）"
 log "feeds update 完成，feeds/ 下有："
 ls -1 feeds/ 2>/dev/null | sed 's/^/    /' | tee -a "$LOG_FILE" >&3 || true
 
-# 官方 feed 里没有 ddns-go / msd_lite，从 ImmortalWrt feed 抠出来放进 feed 目录树。
+# 官方 feed 里没有 ddns-go / msd_lite。
+#   · 这两个带二进制的包 → 本仓库自带配方（直接引上游源码，版本构建时解析）
+#   · 它们的 LuCI 前端 → 从 ImmortalWrt 稀疏检出（纯页面，没有可指的独立上游）
 # 必须在 install 之前、update 之后：update 负责把 feeds/ 目录建出来，
 # install 读的是索引文件，看不到中途塞进去的包。
 log "引入官方 feed 之外的包"
-OPENWRT_DIR="$OPENWRT_DIR" bash "$BUILDER_DIR/scripts/extra-packages.sh"
+OPENWRT_DIR="$OPENWRT_DIR" BUILDER_DIR="$BUILDER_DIR" \
+  bash "$BUILDER_DIR/scripts/extra-packages.sh"
+
+# 解析这两个包的上游最新版本，注入到刚落位的自带配方里 —— 这是「上游一发新版，
+# 下次构建就自动是新的」的实现处。失败不中断构建（配方里有兜底版本），
+# 只发 warning 注解，并把最终生效的版本发成 notice 注解（公开可读）。
+log "解析上游包最新版本（ddns-go / msd_lite）"
+if ! OPENWRT_DIR="$OPENWRT_DIR" \
+     GH_TOKEN="${GH_TOKEN:-}" \
+     DDNS_GO_VERSION="${DDNS_GO_VERSION:-}" \
+     MSD_LITE_SHA="${MSD_LITE_SHA:-}" \
+     bash "$BUILDER_DIR/scripts/resolve-versions.sh"; then
+  warn "版本解析脚本异常退出，两个包都沿用配方里的兜底值"
+fi
 
 # 重建索引。-i 只重扫目录、不执行 git pull，所以不会碰刚拷进去的文件。
 log "重建 feed 索引（不拉取仓库）"
