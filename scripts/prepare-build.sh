@@ -14,48 +14,61 @@
 # 可选：
 #   NSS_FEED      NSS feed 的 src-git 行，默认指向 edma-nss 分支
 #
-set -euo pipefail
+set -Eeuo pipefail
+
+# ── CI 可诊断性 ──────────────────────────────────────────────
+# 这个脚本跑在 GitHub Actions 上，而 job 日志要仓库 admin 权限才能下载，
+# 失败时远程完全看不到原因。所以：
+#   · 全部输出同时落盘到 $LOG_FILE（供回放）
+#   · 失败时把「出错行号 + 出错命令 + 日志尾部」输出成 ::error::，
+#     那会变成 check-run annotation —— 公开可读，远程就能定位。
+LOG_FILE="${LOG_FILE:-${GITHUB_WORKSPACE:-${RUNNER_TEMP:-/tmp}}/prepare-build.log}"
+: >"$LOG_FILE" 2>/dev/null || LOG_FILE=/tmp/prepare-build.log
+exec 3>&1 4>&2            # 保留原始 stdout/stderr，失败时切回来发注解
+exec >>"$LOG_FILE" 2>&1   # 之后的输出全部进日志
+
+_dump_log_tail() {
+  local n="${1:-25}"
+  tail -n "$n" "$LOG_FILE" 2>/dev/null | while IFS= read -r l; do
+    printf '::error::[log] %s\n' "$l"
+  done
+}
+
+_on_error() {
+  local rc=$? line="$1" cmd="$2"
+  exec 1>&3 2>&4
+  printf '::error::prepare-build.sh 在第 %s 行失败（退出码 %s）\n' "$line" "$rc"
+  printf '::error::失败命令：%s\n' "$cmd"
+  _dump_log_tail 25
+  exit "$rc"
+}
+trap '_on_error "$LINENO" "$BASH_COMMAND"' ERR
 
 OPENWRT_DIR="${OPENWRT_DIR:?OPENWRT_DIR 未设置}"
 BUILDER_DIR="${BUILDER_DIR:?BUILDER_DIR 未设置}"
 NSS_FEED="${NSS_FEED:-src-git nss https://github.com/JuliusBairaktaris/nss-packages.git;edma-nss}"
 
-log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
-warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*"; }
-die()  { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
+# log/warn 同时进日志和 CI 控制台，这样远程也能看到进度。
+log()  { printf '\033[1;34m==>\033[0m %s\n' "$*" | tee -a "$LOG_FILE" >&3; }
+warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*" | tee -a "$LOG_FILE" >&3; }
+die()  {
+  printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2
+  exec 1>&3 2>&4
+  printf '::error::%s\n' "$*"
+  _dump_log_tail 30
+  exit 1
+}
 
 CONFIGS=(
   "$BUILDER_DIR/configs/common.config"
   "$BUILDER_DIR/configs/qhora_301w.config"
 )
 
-# 缺任何一个关键符号就中止：这些符号被丢掉说明镜像不是我们想要的东西，
-# 早点失败比默默产出一个残废固件好。
-CRITICAL_SYMBOLS=(
-  'CONFIG_TARGET_qualcommax=y'
-  'CONFIG_TARGET_qualcommax_ipq807x=y'
-  'CONFIG_TARGET_DEVICE_qualcommax_ipq807x_DEVICE_qnap_301w=y'
-  'CONFIG_ATH11K_MEM_PROFILE_1G=y'
-  'CONFIG_NSS_MEM_PROFILE_HIGH=y'
-  'CONFIG_ATH11K_NSS_SUPPORT=y'
-  'CONFIG_PACKAGE_MAC80211_NSS_SUPPORT=y'
-  'CONFIG_PACKAGE_kmod-qca-nss-drv=y'
-  'CONFIG_PACKAGE_kmod-qca-nss-ecm=y'
-  'CONFIG_PACKAGE_kmod-qca-nss-drv-pppoe=y'
-  'CONFIG_PACKAGE_kmod-qca-nss-drv-qdisc=y'
-  'CONFIG_PACKAGE_nss-tools=y'
-  'CONFIG_NSS_FIRMWARE_VERSION_12_5=y'
-  'CONFIG_PACKAGE_ipq-wifi-qnap_301w=y'
-  'CONFIG_CCACHE=y'
-  # 用户明确要求启用的三项。不放进来的话，一旦引入失败，
-  # defconfig 会静默丢掉它们、编出一个"看起来正常但少了功能"的固件。
-  'CONFIG_PACKAGE_ddns-go=y'
-  'CONFIG_PACKAGE_luci-app-ddns-go=y'
-  'CONFIG_PACKAGE_msd_lite=y'
-  'CONFIG_PACKAGE_luci-app-msd_lite=y'
-  'CONFIG_PACKAGE_kmod-wireguard=y'
-  'CONFIG_PACKAGE_luci-proto-wireguard=y'
-)
+# 关于符号校验：不在这里维护一份"我认为重要的符号"清单。
+# 要断言什么，由 CONFIGS 里实际写了的符号决定（见下面的步骤 3）——
+# 清单式的写法会把 DEVICE_PACKAGES 带入的包（如 ipq-wifi-qnap_301w）
+# 也算进来，而那种包根本不会以 CONFIG_PACKAGE_* 的形式出现在 .config 里
+# （image.mk 用 CONFIG_TARGET_DEVICE_PACKAGES_* 传字符串），必然误报。
 
 for f in "${CONFIGS[@]}"; do
   [[ -f "$f" ]] || die "找不到配置文件：$f"
@@ -73,8 +86,15 @@ fi
 
 cd "$OPENWRT_DIR"
 
-log "更新全部 feed"
+# 把实际生效的 feed 配置打进日志：配置错误会让 feeds 在解析阶段直接 die。
+log "feeds.conf 实际内容："
+sed 's/^/    /' feeds.conf | tee -a "$LOG_FILE" >&3
+
+log "更新全部 feed（最耗时的一步）"
 ./scripts/feeds update -a
+
+log "feeds update 完成，feeds/ 下有："
+ls -1 feeds/ 2>/dev/null | sed 's/^/    /' | tee -a "$LOG_FILE" >&3 || true
 
 # 官方 feed 里没有 ddns-go / msd_lite，从 ImmortalWrt feed 抠出来放进 feed 目录树。
 # 必须在 install 之前、update 之后：update 负责把 feeds/ 目录建出来，
@@ -88,6 +108,9 @@ log "重建 feed 索引（不拉取仓库）"
 
 log "安装全部 feed"
 ./scripts/feeds install -a
+
+log "feeds install 完成，package/feeds/ 下有："
+ls -1 package/feeds/ 2>/dev/null | sed 's/^/    /' | tee -a "$LOG_FILE" >&3 || true
 
 # 确认那 4 个引入的包真的被 install 认领了（索引没重建的话这一步会漏）。
 for p in ddns-go msd_lite; do
@@ -105,20 +128,16 @@ done
 # ── 2. 组装 .config ──────────────────────────────────────────
 log "生成 .config：common.config + qhora_301w.config"
 cat "${CONFIGS[@]}" > .config
+log "make defconfig 开始（输入 $(wc -l < .config) 行）"
 make defconfig
+log "make defconfig 完成（输出 $(wc -l < .config) 行）"
 
 # ── 3. 校验符号 ──────────────────────────────────────────────
-log "校验关键符号是否保留"
-missing=()
-for sym in "${CRITICAL_SYMBOLS[@]}"; do
-  grep -qxF "$sym" .config || missing+=("$sym")
-done
-if ((${#missing[@]})); then
-  printf '  %s\n' "${missing[@]}" >&2
-  die "defconfig 丢弃了 ${#missing[@]} 个关键符号（通常是依赖未满足），不要使用这个 .config"
-fi
-
-# 其余符号只告警：工具链版本号这类可选项被丢掉不影响功能。
+# Kconfig 在依赖不满足时会**静默**丢掉选项。断言：配置文件里显式请求的每一个
+# =y 符号都必须出现在 .config 里 —— 少了就说明依赖链断了，编出来的镜像会缺
+# 功能，那比直接失败更糟。只断言 =y：请求 =n 的符号可能被别的包 select 回来，
+# 那属于正常情况，不算丢失。
+log "校验 defconfig 是否保留了配置文件请求的全部符号"
 dropped=()
 while IFS= read -r req; do
   grep -qxF "$req" .config || dropped+=("$req")
@@ -129,9 +148,10 @@ done < <(
     grep -vE '=n$'
 )
 if ((${#dropped[@]})); then
-  warn "以下 ${#dropped[@]} 个符号被 defconfig 丢弃（不影响构建，仅供留意）："
   printf '  %s\n' "${dropped[@]}" >&2
+  die "defconfig 丢弃了 ${#dropped[@]} 个配置文件请求的符号（通常是依赖未满足），不要使用这个 .config"
 fi
+log "配置文件请求的符号全部保留"
 
 # ── 4. 不要把整个自定义 feed 打进镜像 ───────────────────────
 feed_name="$(awk '{print $2}' <<<"$NSS_FEED")"

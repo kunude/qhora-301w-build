@@ -316,15 +316,39 @@ Ubuntu 24.04/26.04 上需要：
 
 ---
 
-## 八、常见问题
+## 八、排查构建失败
+
+工作流的 job 日志要仓库 admin 权限才能从 API 下载，所以 `scripts/prepare-build.sh`
+特意让失败**可远程诊断**：
+
+- 全部输出落盘到 `$GITHUB_WORKSPACE/prepare-build.log`；
+- 失败时把「出错行号 + 出错命令 + 日志尾部」以 `::error::` 输出 —— 那会变成
+  check-run annotation，在 Actions 页面和公开 API 上都能直接看到；
+- 工作流里还有一步 `if: always()` 的「回放构建准备日志」，把日志尾部打到控制台。
+
+典型报错：
+
+| 注解内容 | 含义 | 怎么处理 |
+|---|---|---|
+| `prepare-build.sh 在第 N 行失败` + `失败命令：…` | 该命令返回非零 | 看注解随附的日志尾部 |
+| `defconfig 丢弃了 N 个配置文件请求的符号` | Kconfig 依赖没满足，选项被静默丢弃 | 注解会列出符号名，多半是引入的包没装好 |
+| `package/feeds/... 不存在` | 放进 feed 的包没被 `feeds install` 接管 | 检查 `feeds update -i` 那一步 |
+
+⚠️ **不要在 `prepare-build.sh` 里手写「我认为重要的符号」清单来做校验。**
+`DEVICE_PACKAGES` 带入的包（例如 `ipq-wifi-qnap_301w`）**不会**以
+`CONFIG_PACKAGE_*` 的形式出现在 `.config` 里 —— `image.mk` 是用
+`CONFIG_TARGET_DEVICE_PACKAGES_*` 传字符串的。写进清单必然误报、把构建整个卡死。
+现在的做法是「配置里写了什么，就断言什么」。
+
+## 九、常见问题
 
 **构建超时（6 小时）。**
 首次运行没有 ccache，最慢；GitHub 托管 runner 单 job 上限就是 6 小时。
 直接重跑一次即可 —— `dl` 源码包缓存和 ccache 都会复用，第二次快很多。
 
-**`defconfig 丢弃了关键符号`。**
-说明某条依赖没满足，通常是因为 NSS feed 没拉到位，或者上游 rebase 后改了符号名。
-看报错里列出的符号名，对照上游最新代码修正 `configs/`。
+**`defconfig 丢弃了配置文件请求的符号`。**
+说明某条依赖没满足，通常是因为 NSS feed 没拉到位、引入的包没装好，或者上游
+rebase 后改了符号名。看注解里列出的符号名，对照上游最新代码修正 `configs/`。
 
 **artifact 里没有 sysupgrade 镜像。**
 工作流在"收集并校验产物"那步就会 `exit 1` 报出来，不会静默给你一个空包。
@@ -334,7 +358,7 @@ Ubuntu 24.04/26.04 上需要：
 
 ---
 
-## 九、致谢与许可
+## 十、致谢与许可
 
 编译配方与配置来自
 [JuliusBairaktaris/Qualcommax_NSS_Builder](https://github.com/JuliusBairaktaris/Qualcommax_NSS_Builder)（GPL-2.0）。

@@ -121,8 +121,35 @@ jobs:
           path: builder
 
       # ── 组装构建环境 ──────────────────────────────────────────
+      # 先确认 runner 上真有 feeds/make 依赖的工具：scripts/feeds 是 Perl 脚本、
+      # 索引器要 make，缺任何一项都会在后面以很晦涩的方式失败。
+      - name: 环境预检
+        run: |
+          set -euo pipefail
+          for c in perl make git gcc g++ gawk bzip2; do
+            command -v "$c" >/dev/null 2>&1 ||
+              { echo "::error::runner 上缺少必需工具：$c"; exit 1; }
+          done
+          perl -v | sed -n '2p'
+          make --version | head -1
+          echo "必需工具齐备"
+
       - name: 准备构建环境（feeds + 第三方包 + .config + 覆盖文件）
         run: bash "$BUILDER_DIR/scripts/prepare-build.sh"
+
+      # 日志要仓库 admin 权限才能从 API 下载，所以把它回放到控制台，
+      # 失败时这一步也会执行（always），日志一定看得到。
+      - name: 回放构建准备日志
+        if: always()
+        run: |
+          f="$GITHUB_WORKSPACE/prepare-build.log"
+          if [ -f "$f" ]; then
+            echo "::group::prepare-build.sh 日志（尾部 150 行）"
+            tail -n 150 "$f"
+            echo "::endgroup::"
+          else
+            echo "没有生成 prepare-build.log"
+          fi
 
       # ── 可复现构建 ────────────────────────────────────────────
       - name: 设置可复现构建环境变量
