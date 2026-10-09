@@ -258,8 +258,10 @@ jobs:
           # 而作业日志和 artifact 内容都必须登录才能看 —— 这样远程（包括无人值守
           # 的自动化脚本）也能核对到底编出了哪些镜像、各多大。
           # 整段包在 if 里，避免 set -e 把「grep 没匹配到」当成失败。
+          # 注意 grep 的模式里要有 .manifest：rootfs 清单的文件名是
+          # openwrt-<board>-<subtarget>[-profile].manifest，不一定含设备名。
           if listing=$(cd "$out" && ls -lh . 2>/dev/null |
-                         grep -E "${DEVICE}|sha256sums|config\.buildinfo|profiles\.json" |
+                         grep -E "${DEVICE}|sha256sums|config\.buildinfo|profiles\.json|\.manifest|\.bom\.cdx\.json" |
                          awk '{print $5"  "$9}'); then
             while IFS= read -r line; do
               [ -n "$line" ] || continue
@@ -271,7 +273,7 @@ jobs:
             echo "## QHora-301W 构建产物"
             echo
             echo '```'
-            (cd "$out" && ls -lh . | grep -E "${DEVICE}|sha256sums|config.buildinfo" || true)
+            (cd "$out" && ls -lh . | grep -E "${DEVICE}|sha256sums|config.buildinfo|profiles\.json|\.manifest" || true)
             echo '```'
             echo
             echo "- 上游：\`${UPSTREAM_REPOSITORY}@$(git -C openwrt rev-parse --short HEAD)\`"
@@ -283,8 +285,8 @@ jobs:
       # ── 校验功能包真的进了固件 ────────────────────────────────
       # 配置里写 CONFIG_PACKAGE_x=y 只证明"被选中"，不证明"编出来了"。
       # 这里从两个互相独立的角度核对：
-      #   ① 包有没有生成 .ipk —— 没生成就是压根没编译；
-      #   ② 包名有没有出现在设备 .manifest —— 那是最终 rootfs 的包清单。
+      #   ① 包有没有生成包文件（apk 后端是 .apk，opkg 后端是 .ipk）；
+      #   ② 包名有没有出现在 rootfs 的 .manifest —— 那是最终固件的包清单。
       # 结果用 ::notice:: 输出：注解是公开可读的，而作业日志和 artifact
       # 内容都要登录才能看，这样远程（含无人值守脚本）也能核对。
       - name: 校验功能包是否真的编进固件
@@ -297,30 +299,49 @@ jobs:
                 ddns-go luci-app-ddns-go luci-i18n-ddns-go-zh-cn \
                 wireguard-tools luci-proto-wireguard kmod-wireguard"
 
-          manifests=$(ls "$out"/*.manifest 2>/dev/null || true)
-          [[ -n "$manifests" ]] || echo "::warning::$out 下没有 .manifest，只能核对 .ipk"
+          # ── ① 先搞清楚这个分支用的是 apk 还是 opkg ─────────────────
+          # 新版 OpenWrt 默认 CONFIG_USE_APK=y，包文件是 <name>-<version>.apk；
+          # 只有 opkg 才是 <name>_<version>_<arch>.ipk。
+          # 见 include/package-pack.mk 第 305-309 行的 PACK_$(1) 定义。
+          # 写死 *.ipk 会让每个包都"找不到" —— 上一轮 9 个包全报
+          # "没有被编译"就是栽在这里：那是校验脚本的误报，不是包没编。
+          backend=$(grep -m1 -E '^CONFIG_USE_APK=' openwrt/.config 2>/dev/null || true)
+          apk_n=$(find openwrt/bin/packages -maxdepth 3 -name '*.apk' 2>/dev/null | wc -l || true)
+          ipk_n=$(find openwrt/bin/packages -maxdepth 3 -name '*.ipk' 2>/dev/null | wc -l || true)
+          echo "::notice title=包后端::${backend:-（.config 里没有 CONFIG_USE_APK，按默认 =y 走 apk）}；bin/packages 下 .apk=$apk_n 个 / .ipk=$ipk_n 个"
+
+          # ── ② rootfs 清单 ──────────────────────────────────────────
+          # 文件名由 $(IMG_PREFIX)$(PROFILE_SANITIZED) 拼成，未必含设备名，
+          # 所以用 find 找，不要按设备名去拼路径。
+          manifest=$(find "$out" -maxdepth 1 -name '*.manifest' -print -quit 2>/dev/null || true)
+          if [[ -n "$manifest" ]]; then
+            echo "::notice title=rootfs 清单::$(basename "$manifest") —— $(wc -l < "$manifest") 行"
+          else
+            echo "::warning::$out 下没有 .manifest，只能核对包文件"
+          fi
 
           bad=0
           for p in $WANT; do
-            # ① 构建产物：普通包在 bin/packages/<arch>/<feed>/，
-            #    内核模块可能落在 bin/targets/<t>/<s>/packages/。find 用 -quit
-            #    拿到第一个就停；找不到也返回 0，不会被 set -e 杀掉。
-            ipk=$(find openwrt/bin/packages openwrt/bin/targets \
-                    -name "${p}_*.ipk" -print -quit 2>/dev/null || true)
+            # ③ 包文件：apk 与 ipk 两种命名都找。用 -quit 拿到第一个就停；
+            #    找不到时 find 也返回 0，不会被 set -e 杀掉。
+            pkg=$(find openwrt/bin/packages openwrt/bin/targets \
+                    \( -name "${p}-*.apk" -o -name "${p}_*.ipk" \) \
+                    -print -quit 2>/dev/null || true)
 
-            # ② 最终 rootfs 清单（.manifest 每行形如 "msd_lite - 2023-..."）
-            inmanifest=""
-            for m in $manifests; do
-              if grep -qE "^${p} " "$m"; then inmanifest=$(basename "$m"); break; fi
-            done
+            # ④ 最终 rootfs 清单（每行形如 "msd_lite - 2023-..."）
+            hit=0
+            if [[ -n "$manifest" ]] && grep -qE "^${p}[[:space:]]" "$manifest"; then hit=1; fi
 
-            if [[ -z "$ipk" ]]; then
-              echo "::error::$p 没有生成 .ipk —— 它没有被编译"
+            if [[ -n "$pkg" && "$hit" -eq 1 ]]; then
+              echo "::notice title=功能包 OK::$p → $(basename "$pkg")，已在 rootfs 清单里"
+            elif [[ -n "$pkg" ]]; then
+              echo "::warning::$p 编出来了（$(basename "$pkg")）但不在 rootfs 清单里"
+            elif [[ "$hit" -eq 1 ]]; then
+              echo "::error::$p 在 rootfs 清单里，却找不到它的包文件"
               bad=$((bad + 1))
-            elif [[ -n "$inmanifest" ]]; then
-              echo "::notice title=功能包已编入::$p  ($(basename "$ipk"))  出现在 $inmanifest"
             else
-              echo "::warning::$p 编出来了（$(basename "$ipk")）但设备 manifest 里没有它"
+              echo "::error::$p 既没有包文件也不在 rootfs 清单里 —— 它没有被编译"
+              bad=$((bad + 1))
             fi
           done
 
@@ -328,15 +349,20 @@ jobs:
           echo "要求的功能包全部已编译并进入 rootfs"
 
       - name: 上传镜像（artifact）
+        # 用 always()：即使后面某一步（比如功能包校验）失败，产物也必须传上去。
+        # 否则一旦校验报错，连固件本身都拿不到了 —— run #6 就吃了这个亏：
+        # 校验误报 → 这一步被 skip → artifact 总数为 0。
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: openwrt-${{ env.DEVICE }}-${{ github.run_number }}
           path: |
             openwrt/bin/targets/qualcommax/ipq807x/*qnap_301w*
+            openwrt/bin/targets/qualcommax/ipq807x/*.manifest
             openwrt/bin/targets/qualcommax/ipq807x/sha256sums
             openwrt/bin/targets/qualcommax/ipq807x/config.buildinfo
             openwrt/bin/targets/qualcommax/ipq807x/profiles.json
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 30
 
       # ── 可选：发 Release ──────────────────────────────────────

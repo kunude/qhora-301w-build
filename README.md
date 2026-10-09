@@ -257,15 +257,24 @@ luci 应用是 `include ../../luci.mk`，`ddns-go` 是
 | 层次 | 由谁保证 | 失败时 |
 |---|---|---|
 | Kconfig 符号没被静默丢弃 | `prepare-build.sh` 断言配置里每个 `=y` 都原样出现在 `.config` | 构建在第 6 步失败，注解列出被丢的符号名 |
-| 包**被编译**（生成了 `.ipk`） | 工作流「校验功能包是否真的编进固件」 | 构建失败，注解点名是哪个包 |
-| 包**进了 rootfs** | 同上：在设备 `.manifest` 里查包名 | 降级为 warning（`.manifest` 格式变化时不会误杀构建） |
+| 包**被编译**（生成了包文件） | 工作流「校验功能包是否真的编进固件」 | 构建失败，注解点名是哪个包 |
+| 包**进了 rootfs** | 同上：在 rootfs `.manifest` 里查包名 | 降级为 warning（`.manifest` 格式变化时不会误杀构建） |
 
 前两层是硬性失败，第三层是告警 —— 因为 `.manifest` 的行格式（`名字 - 版本`）
 属于上游实现细节，不该拿它把整个构建卡死。
 
+⚠️ **包文件是按后端命名的，别写死扩展名。** 这个分支 `CONFIG_USE_APK`
+默认为 `y`（见 `include/package-pack.mk` 第 305-309 行）：
+
+```
+apk  后端：<name>-<version>.apk          ← 本分支走这条
+opkg 后端：<name>_<version>_<arch>.ipk
+```
+
 **自己核对的最快办法**：下载运行页上的 artifact，解压后打开
-`openwrt-qualcommax-ipq807x-qnap_301w.manifest`，那是最终 rootfs 的完整包清单，
-直接搜包名即可。运行页的 **Summary** 区块也有产物清单（`ls -lh` 输出）。
+`openwrt-qualcommax-ipq807x*.manifest`（文件名由 `IMG_PREFIX` + profile 拼成，
+**不一定含设备名**），那是最终 rootfs 的完整包清单，直接搜包名即可。
+运行页的 **Summary** 区块也有产物清单（`ls -lh` 输出）。
 
 > 注意：GitHub 对 artifact **内容**也要登录才能下载（公开仓库一样），
 > 作业级日志同理。所以工作流才把这些清单用 `::notice::` 发成注解 ——
