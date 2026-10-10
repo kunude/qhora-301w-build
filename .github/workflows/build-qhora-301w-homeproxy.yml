@@ -1,0 +1,554 @@
+name: Build QHora-301W (NSS EDMA, HomeProxy)
+
+# 从 JuliusBairaktaris/openwrt-nss-edma 的 nss-edma-rework 分支，为 QNAP QHora-301W
+# （qualcommax / ipq807x / qnap_301w）编译带 Qualcomm NSS 硬件卸载的 OpenWrt 固件。
+#
+# 本工作流 = 主线 build-qhora-301w.yml 的**代理栈替换版**：
+#   passwall2（luci-app-passwall2 + 17 个组件）  →  HomeProxy（luci-app-homeproxy）
+# 其余一切完全一致：同一个上游源码与 ref、同一个 target/subtarget/device、
+# 同一套 NSS 卸载配置、同样的 files/ 覆盖、同样的 ddns-go / msd_lite /
+# WireGuard / statistics / autocore、同样的可复现构建与产物校验流程。
+#
+# 实现方式是**配置层**的，没有 fork 出第二套构建逻辑：
+#   环境变量 PROXY_STACK=homeproxy 交给 scripts/prepare-build.sh 与
+#   scripts/extra-packages.sh，它们据此
+#     · 多拼一份 configs/homeproxy.config（覆盖层：把 passwall2 那组符号按掉，
+#       换成 homeproxy 那组 —— 见该文件头部对"为什么必须写 =n"的说明）
+#     · 从 immortalwrt/luci 稀疏检出 applications/luci-app-homeproxy
+#     · 从 immortalwrt/packages 取 net/sing-box（1.12.25）覆盖官方那份（1.14.0）
+#   两条分支都留在同一份脚本里，默认值 passwall2 —— 主线构建行为一字未改。
+#
+# 触发方式：
+#   · 手动：Actions -> 左侧本工作流 -> Run workflow（可勾选是否创建 Release）
+#   · 推送：本文件或 configs/homeproxy.config 有改动时
+#     （**故意不监听 scripts/ files/ packages/**：那两个目录一改，主线工作流
+#      也会触发，两条全量编译会互相排队几小时。要让 homeproxy 版跟着重编，
+#      手动 Run workflow 即可。）
+#
+# 产物（actions artifact，勾选 Release 时同时挂到 release）：
+#   openwrt-qualcommax-ipq807x-qnap_301w-squashfs-sysupgrade.bin   日常升级用
+#   openwrt-qualcommax-ipq807x-qnap_301w-initramfs-uImage.itb      首次安装用（U-Boot TFTP）
+#   openwrt-qualcommax-ipq807x-qnap_301w-squashfs-factory.bin      eMMC 整盘写入用
+#   sha256sums / config.buildinfo / profiles.json                  校验与构建溯源
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "要编译的 openwrt-nss-edma ref（分支 / 标签 / commit）"
+        required: true
+        default: nss-edma-rework
+      release:
+        description: "构建成功后创建 GitHub Release 并附带镜像"
+        type: boolean
+        default: false
+      # 下面两个留空就跟随上游最新版本（默认行为）。
+      # 想编某个确定版本、或者要可复现的固件时，在这里填死。
+      ddns_go_version:
+        description: "钉死 ddns-go 版本，如 6.17.7（留空 = 跟随上游最新 release）"
+        required: false
+        default: ""
+      msd_lite_sha:
+        description: "钉死 msd_lite 的 commit sha（留空 = 跟随上游 master HEAD）"
+        required: false
+        default: ""
+      # HomeProxy 的两半分别来自 ImmortalWrt 的 luci 与 packages 仓库。
+      # 三个都留空就用 scripts/extra-packages.sh 里的默认值（官方 master）。
+      imm_ref:
+        description: "ImmortalWrt 仓库的分支 / 标签（留空 = master）"
+        required: false
+        default: ""
+      imm_luci:
+        description: "immortalwrt/luci 仓库地址（留空 = 官方）"
+        required: false
+        default: ""
+      imm_pkgs:
+        description: "immortalwrt/packages 仓库地址（留空 = 官方；sing-box 1.12.x 从这里取）"
+        required: false
+        default: ""
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/build-qhora-301w-homeproxy.yml"
+      - "configs/homeproxy.config"
+
+# 不要并发跑两个全量编译，否则磁盘和 runner 都不够用。
+concurrency:
+  group: build-qhora-301w-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # ── 上游源码 ────────────────────────────────────────────────
+  # 如果你想用自己 fork 的源码，把这里改成 "你的用户名/openwrt-nss-edma" 即可。
+  UPSTREAM_REPOSITORY: JuliusBairaktaris/openwrt-nss-edma
+  # 用 github.event.inputs 而不是 inputs：两者在 workflow_dispatch 下等价，
+  # 但前者在 push / schedule 事件下也能安全求值（返回空）。
+  UPSTREAM_REF: ${{ github.event.inputs.upstream_ref || 'nss-edma-rework' }}
+  # NSS 驱动 / ECM / qdisc / 固件所在的独立 feed。
+  # 缺了它 ATH11K_NSS_SUPPORT 的依赖不满足，连 defconfig 都会失败。
+  NSS_FEED: "src-git nss https://github.com/JuliusBairaktaris/nss-packages.git;edma-nss"
+
+  # ── 目标机型 ────────────────────────────────────────────────
+  TARGET: qualcommax
+  SUBTARGET: ipq807x
+  DEVICE: qnap_301w
+  DEVICE_LABEL: QHora-301W
+  OPENWRT_DIR: ${{ github.workspace }}/openwrt
+  BUILDER_DIR: ${{ github.workspace }}/builder
+
+  # ── 代理栈 ──────────────────────────────────────────────────
+  # 与主线唯一的功能差异就在这里。脚本（prepare-build.sh / extra-packages.sh）
+  # 读到它之后：多拼一份 configs/homeproxy.config、从 immortalwrt/luci 取
+  # luci-app-homeproxy、从 immortalwrt/packages 取 sing-box 1.12.x 覆盖官方那份。
+  PROXY_STACK: homeproxy
+
+jobs:
+  build:
+    name: HomeProxy / ${{ github.event.inputs.upstream_ref || 'nss-edma-rework' }} -> QHora-301W
+    # 上游作者自己的 CI 就跑在 ubuntu-26.04 上，照抄可以避免踩环境坑。
+    # 如果这个 label 不可用，换成 ubuntu-24.04 也可以。
+    runs-on: ubuntu-26.04
+    # GitHub 托管 runner 单个 job 硬上限 6 小时，这里留 5 分钟收尾。
+    timeout-minutes: 355
+    permissions:
+      # 勾选 release 时需要有写权限。仓库设置里
+      # Settings -> Actions -> General -> Workflow permissions 需要允许读写。
+      contents: write
+
+    steps:
+      # ── 释放磁盘 ──────────────────────────────────────────────
+      # 全量编译（工具链 + 内核 + 全部软件包）大约需要 25-35GB，
+      # runner 根分区默认不够，先删掉用不到的预装 SDK。
+      - name: 释放磁盘空间
+        run: |
+          set -euo pipefail
+          df -h / | tail -1
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /usr/local/share/boost \
+            /opt/hostedtoolcache/CodeQL || true
+          sudo apt-get clean
+          df -h / | tail -1
+
+      # ── 系统依赖 ──────────────────────────────────────────────
+      - name: 安装构建依赖
+        run: |
+          set -euo pipefail
+          # OpenWrt 自建 flex/bison 等 host 工具，所以宿主机只需要最小集合。
+          # 这个列表与上游 Qualcommax_NSS_Builder 的 CI 保持一致，是验证过的组合。
+          # 不需要 rsync —— prepare-build.sh 叠加覆盖文件用的是 cp -a。
+          sudo apt-get update || true
+          sudo apt-get install -y \
+            bzip2 g++ gawk gcc git glibc-source libncurses-dev make
+
+      # ── 拉取源码 ──────────────────────────────────────────────
+      # 注意：nss-edma-rework 分支和 edma-nss feed 上游会定期 rebase，
+      # 所以每次都用远端最新状态，不做增量 pull。
+      - name: 检出 OpenWrt 源码（nss-edma-rework）
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.UPSTREAM_REPOSITORY }}
+          ref: ${{ env.UPSTREAM_REF }}
+          fetch-depth: 0
+          path: openwrt
+
+      - name: 检出本仓库（配置与脚本）
+        uses: actions/checkout@v7
+        with:
+          path: builder
+
+      # ── 组装构建环境 ──────────────────────────────────────────
+      # 先确认 runner 上真有 feeds/make 依赖的工具：scripts/feeds 是 Perl 脚本、
+      # 索引器要 make，缺任何一项都会在后面以很晦涩的方式失败。
+      - name: 环境预检
+        run: |
+          set -euo pipefail
+          # scripts/feeds 是 Perl 脚本、索引器要 make；
+          # resolve-versions.sh 还要 curl/tar/sha256sum 去解析上游版本并算 hash。
+          # 缺任何一项都会在后面以很晦涩的方式失败，所以先查一遍。
+          for c in perl make git gcc g++ gawk bzip2 curl tar sha256sum; do
+            command -v "$c" >/dev/null 2>&1 ||
+              { echo "::error::runner 上缺少必需工具：$c"; exit 1; }
+          done
+          perl -v | sed -n '2p'
+          make --version | head -1
+          echo "必需工具齐备"
+
+      - name: 准备构建环境（feeds + HomeProxy + .config + 覆盖文件）
+        env:
+          # 用来查 GitHub API 解析 ddns-go / msd_lite 的上游最新版本。
+          # 不给 token 也能跑，但未认证限额只有 60 次/小时，容易被别处撞掉。
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 留空 = 跟随上游最新版本（默认）。push / schedule 事件下这两个表达式
+          # 求值为空字符串，所以那两个触发方式天然就是"跟随最新"。
+          DDNS_GO_VERSION: ${{ github.event.inputs.ddns_go_version }}
+          MSD_LITE_SHA: ${{ github.event.inputs.msd_lite_sha }}
+          # HomeProxy 的两半都来自 ImmortalWrt：luci 提供 luci-app-homeproxy，
+          # packages 提供与它匹配的 sing-box（1.12.x，见 homeproxy.config 头部）。
+          # 全部留空 = 用 extra-packages.sh 里的默认值（ImmortalWrt 官方 master）。
+          # PROXY_STACK=homeproxy 在顶层 env 里，脚本据此切分支。
+          IMM_REF: ${{ github.event.inputs.imm_ref }}
+          IMM_LUCI: ${{ github.event.inputs.imm_luci }}
+          IMM_PKGS: ${{ github.event.inputs.imm_pkgs }}
+        run: bash "$BUILDER_DIR/scripts/prepare-build.sh"
+
+      # 日志要仓库 admin 权限才能从 API 下载，所以把它回放到控制台，
+      # 失败时这一步也会执行（always），日志一定看得到。
+      - name: 回放构建准备日志
+        if: always()
+        run: |
+          f="$GITHUB_WORKSPACE/prepare-build.log"
+          if [ -f "$f" ]; then
+            echo "::group::prepare-build.sh 日志（尾部 150 行）"
+            tail -n 150 "$f"
+            echo "::endgroup::"
+          else
+            echo "没有生成 prepare-build.log"
+          fi
+
+      # ── 可复现构建 ────────────────────────────────────────────
+      - name: 设置可复现构建环境变量
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+          git log -1 --format='  upstream commit : %H %ci%n  subject         : %s'
+          {
+            echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)"
+            echo "TZ=UTC"
+            echo "LC_ALL=C"
+            echo "KBUILD_BUILD_USER=builder"
+            echo "KBUILD_BUILD_HOST=github-actions"
+          } >>"$GITHUB_ENV"
+
+      # ── 下载源码包 ────────────────────────────────────────────
+      # 上游镜像偶尔抽风，重试三次。下载好的包在多次运行之间缓存复用。
+      - name: 恢复源码包缓存
+        uses: actions/cache/restore@v6
+        with:
+          path: openwrt/dl
+          # 带上 run_attempt：整个 run 重跑时不会撞上已存在的 key
+          key: dl-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: dl-
+
+      - name: 下载源码包
+        id: download
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+          mkdir -p dl
+          before=$(find dl -maxdepth 1 -type f | wc -l)
+          for attempt in 1 2 3; do
+            if make download -j"$(nproc)"; then break; fi
+            if [[ $attempt -ge 3 ]]; then echo "::error::源码包下载连续失败三次"; exit 1; fi
+            echo "::warning::第 $attempt 次下载失败，重试"
+            sleep 10
+          done
+          if [[ "$(find dl -maxdepth 1 -type f | wc -l)" -gt "$before" ]]; then
+            echo "grew=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "grew=false" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: 保存源码包缓存
+        if: steps.download.outputs.grew == 'true'
+        # 缓存只是加速手段，存不进去（配额满、key 冲突）不该让整个构建失败
+        continue-on-error: true
+        uses: actions/cache/save@v6
+        with:
+          path: openwrt/dl
+          key: dl-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # ── ccache ────────────────────────────────────────────────
+      # 缓存 key 里带上工具链目录树的哈希和 binutils/gcc/libc 的配置：
+      # 任何一项变了都从空缓存开始，避免命中错误的目标文件。
+      - name: 计算 ccache key
+        id: ccache
+        run: |
+          set -euo pipefail
+          tree=$(git -C openwrt rev-parse HEAD:toolchain)
+          sum=$({
+            echo "$tree"
+            grep -E '^CONFIG_(BINUTILS|GCC|LIBC|MUSL|GLIBC)_' openwrt/.config
+            gcc --version; as --version
+          } | sha256sum | cut -c1-16)
+          echo "prefix=ccache-qhora301w-$sum-" >>"$GITHUB_OUTPUT"
+
+      - name: 恢复 ccache
+        uses: actions/cache@v6
+        with:
+          path: openwrt/.ccache
+          key: ${{ steps.ccache.outputs.prefix }}${{ github.run_id }}
+          restore-keys: ${{ steps.ccache.outputs.prefix }}
+
+      # ── 编译 ──────────────────────────────────────────────────
+      # 首次运行没有缓存会慢很多；如果撞到 6 小时上限，直接重跑一次，
+      # ccache 和 dl 缓存都会复用。
+      - name: 编译
+        working-directory: openwrt
+        env:
+          CCACHE_COMPILERCHECK: content
+          CCACHE_MAXSIZE: 5G
+          # 构建日志留给下面两步做回放和注解上报。
+          # 放 RUNNER_TEMP 而不是工作区，免得混进 artifact 或被 git 看到。
+          BUILD_LOG: ${{ runner.temp }}/build.log
+        run: |
+          # 这里**故意不加 -e**：make 失败要自己接住，好决定是否单线程重跑，
+          # 并把完整日志留下来给后面两步上报。
+          set -uo pipefail
+          : >"$BUILD_LOG"
+
+          # 走 tee 之后 $? 是 tee 的退出码，make 自己的要用 PIPESTATUS[0] 取。
+          make -j"$(nproc)" 2>&1 | tee -a "$BUILD_LOG"
+          rc=${PIPESTATUS[0]}
+
+          if (( rc != 0 )); then
+            echo "::warning::并行编译失败（make 退出码 $rc），改用单线程 -j1 V=s 重跑以拿到完整报错"
+            make -j1 V=s 2>&1 | tee -a "$BUILD_LOG"
+            rc=${PIPESTATUS[0]}
+          fi
+
+          staging_dir/host/bin/ccache -s 2>&1 | tee -a "$BUILD_LOG" || true
+
+          if (( rc != 0 )); then
+            echo "编译失败：make 最终退出码 $rc。完整日志见下一步「回放编译日志」。"
+            exit "$rc"
+          fi
+          echo "编译通过"
+
+      # 编译**失败**的唯一远程可见通道是注解：作业日志要仓库 admin 权限才能从
+      # API 下载（公开仓库一样 403），而 ::error:: 会变成 check-run annotation，
+      # 那个是公开可读的。所以把"哪个包挂了 / 报错行"发成注解。
+      - name: 回放编译日志
+        if: always()
+        env:
+          BUILD_LOG: ${{ runner.temp }}/build.log
+        run: |
+          if [[ ! -s "$BUILD_LOG" ]]; then
+            echo "没有构建日志（可能编译步骤之前就失败了）"
+            exit 0
+          fi
+          echo "::group::构建日志共 $(wc -l <"$BUILD_LOG") 行，回放最后 250 行"
+          tail -n 250 "$BUILD_LOG"
+          echo "::endgroup::"
+
+      - name: 上报编译失败原因
+        if: failure()
+        env:
+          BUILD_LOG: ${{ runner.temp }}/build.log
+        run: |
+          [[ -s "$BUILD_LOG" ]] || exit 0
+
+          # OpenWrt 挂在某个包上时会打印固定格式： "ERROR: package/<路径> failed to build."
+          failed=$(grep -oE 'ERROR: package/[^ ]+ failed to build' "$BUILD_LOG" \
+                   | sed 's|^ERROR: package/||; s| failed to build$||' \
+                   | sort -u | tr '\n' ' ' || true)
+          # 最常见的几种真实报错行（尾部若干条，前面的多半是噪音）
+          hints=$(grep -nE 'Error [0-9]+$|error:|Error [0-9]+:|undefined reference|cannot find -l|No rule to make target|fatal error|CMake Error' \
+                  "$BUILD_LOG" | tail -n 8 || true)
+
+          if [[ -n "$failed" ]]; then
+            echo "::error title=编译失败的包::${failed}"
+          fi
+          if [[ -n "$hints" ]]; then
+            # 注解里的换行要写成 %0A，而 % 本身必须写成 %25（否则会被当转义前缀）
+            msg=$(printf '%s\n' "$hints" | sed 's/%/%25/g; s/\r//g' | awk '{printf "%s%%0A", $0}')
+            echo "::error title=编译报错行（尾部 8 条）::${msg}"
+          fi
+          if [[ -z "$failed$hints" ]]; then
+            echo "::error title=编译失败::没从日志里认出固定格式的报错，请看上一步的控制台回放"
+          fi
+
+      # ── 收集产物 ──────────────────────────────────────────────
+      - name: 收集并校验产物
+        run: |
+          set -euo pipefail
+          out="openwrt/bin/targets/${TARGET}/${SUBTARGET}"
+          [[ -d "$out" ]] || { echo "::error::输出目录不存在：$out"; exit 1; }
+
+          ls -lh "$out"
+
+          # 必须有 sysupgrade；没有就说明设备压根没编进去。
+          compgen -G "$out/*${DEVICE}*squashfs-sysupgrade.bin" >/dev/null ||
+            { echo "::error::$out 下没有 ${DEVICE} 的 sysupgrade 镜像"; exit 1; }
+
+          # 把产物清单也发成注解：check-run annotations 是公开可读的，
+          # 而作业日志和 artifact 内容都必须登录才能看 —— 这样远程（包括无人值守
+          # 的自动化脚本）也能核对到底编出了哪些镜像、各多大。
+          # 整段包在 if 里，避免 set -e 把「grep 没匹配到」当成失败。
+          # 注意 grep 的模式里要有 .manifest：rootfs 清单的文件名是
+          # openwrt-<board>-<subtarget>[-profile].manifest，不一定含设备名。
+          if listing=$(cd "$out" && ls -lh . 2>/dev/null |
+                         grep -E "${DEVICE}|sha256sums|config\.buildinfo|profiles\.json|\.manifest|\.bom\.cdx\.json" |
+                         awk '{print $5"  "$9}'); then
+            while IFS= read -r line; do
+              [ -n "$line" ] || continue
+              echo "::notice title=QHora-301W 产物::$line"
+            done <<<"$listing"
+          fi
+
+          {
+            echo "## QHora-301W 构建产物"
+            echo
+            echo '```'
+            (cd "$out" && ls -lh . | grep -E "${DEVICE}|sha256sums|config.buildinfo|profiles\.json|\.manifest" || true)
+            echo '```'
+            echo
+            echo "- 上游：\`${UPSTREAM_REPOSITORY}@$(git -C openwrt rev-parse --short HEAD)\`"
+            if [[ -f "$out/config.buildinfo" ]]; then
+              echo "- NSS 固件档位：\`$(grep -m1 '^CONFIG_NSS_FIRMWARE_VERSION' "$out/config.buildinfo" || true)\`"
+            fi
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      # ── 校验功能包真的进了固件 ────────────────────────────────
+      # 配置里写 CONFIG_PACKAGE_x=y 只证明"被选中"，不证明"编出来了"。
+      # 这里从两个互相独立的角度核对：
+      #   ① 包有没有生成包文件（apk 后端是 .apk，opkg 后端是 .ipk）；
+      #   ② 包名有没有出现在 rootfs 的 .manifest —— 那是最终固件的包清单。
+      # 结果用 ::notice:: 输出：注解是公开可读的，而作业日志和 artifact
+      # 内容都要登录才能看，这样远程（含无人值守脚本）也能核对。
+      - name: 校验功能包是否真的编进固件
+        run: |
+          set -euo pipefail
+          out="openwrt/bin/targets/${TARGET}/${SUBTARGET}"
+
+          # 用户显式要求打开的功能包；缺任何一个都说明这份固件不含该功能。
+          #
+          # HomeProxy 这一组单独列全：它的依赖是 Kconfig 的 select 拉进来的
+          # （上游 LUCI_DEPENDS: +sing-box +firewall4 +kmod-nft-tproxy
+          # +ucode-mod-digest），而 select 失败是**静默**的（package/feeds 里少了
+          # 配方，符号就被丢掉）。不点名的话，"镜像里缺组件"要等两小时编完才发现。
+          #
+          # sing-box 是代理核心，且**必须是 ImmortalWrt 那份 1.12.x**：
+          # 官方 feed 是 1.14.0，HomeProxy 生成的配置在 1.14 上
+          # `sing-box check` 直接 FATAL（1.13 起删除了 sniff /
+          # sniff_override_destination / set_system_proxy 等 inbound 字段），
+          # /etc/init.d/homeproxy 据此 return 1，服务起不来。
+          # prepare-build.sh 里另有一处对配方版本的显式断言。
+          # kmod-nft-tproxy 是透明代理（TPROXY）的内核侧前提。
+          #
+          # 这里**故意没有** passwall2 / chinadns-ng / xray-core / sslocal /
+          # dnsmasq-full / haproxy / lyaml：HomeProxy 的 DNS 走它自己生成的
+          # sing-box（监听 5330-5333），国内直连靠 nftables 的 china_ip4 集合
+          # 做内核快路径，不需要这些（也就不必把 Rust 工具链拉进构建）。
+          #
+          # statistics 三个：CPU/内存/温度图表（collectd-mod-thermal 不在
+          # luci-app-statistics 的默认依赖里，必须显式选）。
+          # autocore 是 ImmortalWrt 首页温度那一行背后的包，提供 /sbin/tempinfo
+          # 与 /sbin/cpuinfo（纯脚本，配方抄在本仓库 packages/emortal/autocore/）。
+          WANT="msd_lite luci-app-msd_lite luci-i18n-msd_lite-zh-cn \
+                ddns-go luci-app-ddns-go luci-i18n-ddns-go-zh-cn \
+                wireguard-tools luci-proto-wireguard kmod-wireguard \
+                luci-app-homeproxy luci-i18n-homeproxy-zh-cn \
+                sing-box kmod-nft-tproxy ucode-mod-digest \
+                luci-app-statistics luci-i18n-statistics-zh-cn \
+                collectd-mod-thermal rrdtool1 autocore"
+
+          # ── ① 先搞清楚这个分支用的是 apk 还是 opkg ─────────────────
+          # 新版 OpenWrt 默认 CONFIG_USE_APK=y，包文件是 <name>-<version>.apk；
+          # 只有 opkg 才是 <name>_<version>_<arch>.ipk。
+          # 见 include/package-pack.mk 第 305-309 行的 PACK_$(1) 定义。
+          # 写死 *.ipk 会让每个包都"找不到" —— 上一轮 9 个包全报
+          # "没有被编译"就是栽在这里：那是校验脚本的误报，不是包没编。
+          backend=$(grep -m1 -E '^CONFIG_USE_APK=' openwrt/.config 2>/dev/null || true)
+          apk_n=$(find openwrt/bin/packages -maxdepth 3 -name '*.apk' 2>/dev/null | wc -l || true)
+          ipk_n=$(find openwrt/bin/packages -maxdepth 3 -name '*.ipk' 2>/dev/null | wc -l || true)
+          echo "::notice title=包后端::${backend:-（.config 里没有 CONFIG_USE_APK，按默认 =y 走 apk）}；bin/packages 下 .apk=$apk_n 个 / .ipk=$ipk_n 个"
+
+          # ── ② rootfs 清单 ──────────────────────────────────────────
+          # 文件名由 $(IMG_PREFIX)$(PROFILE_SANITIZED) 拼成，未必含设备名，
+          # 所以用 find 找，不要按设备名去拼路径。
+          manifest=$(find "$out" -maxdepth 1 -name '*.manifest' -print -quit 2>/dev/null || true)
+          if [[ -n "$manifest" ]]; then
+            echo "::notice title=rootfs 清单::$(basename "$manifest") —— $(wc -l < "$manifest") 行"
+          else
+            echo "::warning::$out 下没有 .manifest，只能核对包文件"
+          fi
+
+          bad=0
+          for p in $WANT; do
+            # ③ 包文件：apk 与 ipk 两种命名都找。用 -quit 拿到第一个就停；
+            #    找不到时 find 也返回 0，不会被 set -e 杀掉。
+            pkg=$(find openwrt/bin/packages openwrt/bin/targets \
+                    \( -name "${p}-*.apk" -o -name "${p}_*.ipk" \) \
+                    -print -quit 2>/dev/null || true)
+
+            # ④ 最终 rootfs 清单（每行形如 "msd_lite - 2023-..."）
+            hit=0
+            if [[ -n "$manifest" ]] && grep -qE "^${p}[[:space:]]" "$manifest"; then hit=1; fi
+
+            if [[ -n "$pkg" && "$hit" -eq 1 ]]; then
+              echo "::notice title=功能包 OK::$p → $(basename "$pkg")，已在 rootfs 清单里"
+            elif [[ -n "$pkg" ]]; then
+              echo "::warning::$p 编出来了（$(basename "$pkg")）但不在 rootfs 清单里"
+            elif [[ "$hit" -eq 1 ]]; then
+              echo "::error::$p 在 rootfs 清单里，却找不到它的包文件"
+              bad=$((bad + 1))
+            else
+              echo "::error::$p 既没有包文件也不在 rootfs 清单里 —— 它没有被编译"
+              bad=$((bad + 1))
+            fi
+          done
+
+          [[ "$bad" -eq 0 ]] || { echo "::error::有 $bad 个要求的功能包没有被编译"; exit 1; }
+          echo "要求的功能包全部已编译并进入 rootfs"
+
+      - name: 上传镜像（artifact）
+        # 用 always()：即使后面某一步（比如功能包校验）失败，产物也必须传上去。
+        # 否则一旦校验报错，连固件本身都拿不到了 —— run #6 就吃了这个亏：
+        # 校验误报 → 这一步被 skip → artifact 总数为 0。
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: openwrt-${{ env.DEVICE }}-homeproxy-${{ github.run_number }}
+          path: |
+            openwrt/bin/targets/qualcommax/ipq807x/*qnap_301w*
+            openwrt/bin/targets/qualcommax/ipq807x/*.manifest
+            openwrt/bin/targets/qualcommax/ipq807x/sha256sums
+            openwrt/bin/targets/qualcommax/ipq807x/config.buildinfo
+            openwrt/bin/targets/qualcommax/ipq807x/profiles.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      # ── 可选：发 Release ──────────────────────────────────────
+      - name: 计算 Release 标签
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.release == 'true'
+        id: tag
+        run: echo "tag=qhora-301w-homeproxy-$(date -u +%Y%m%d)-${{ github.run_number }}" >>"$GITHUB_OUTPUT"
+
+      - name: 创建 Release
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.release == 'true'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: QHora-301W NSS EDMA (HomeProxy) ${{ steps.tag.outputs.tag }}
+          draft: false
+          prerelease: false
+          body: |
+            QNAP QHora-301W（qualcommax / ipq807x / qnap_301w）固件，
+            基于 `${{ env.UPSTREAM_REPOSITORY }}` 的 `${{ env.UPSTREAM_REF }}` 分支，
+            带 Qualcomm NSS 硬件卸载。
+
+            **代理栈 = HomeProxy**（`luci-app-homeproxy`，来自 ImmortalWrt），
+            不是主线那份的 passwall2。其余（NSS 卸载、ddns-go、msd_lite、
+            WireGuard、统计图表、autocore）与主线完全一致。
+
+            | 文件 | 用途 |
+            |---|---|
+            | `*-initramfs-uImage.itb` | **首次安装**：U-Boot 里用 TFTP 引导，再 sysupgrade |
+            | `*-squashfs-sysupgrade.bin` | 日常升级（已在跑 OpenWrt 时） |
+            | `*-squashfs-factory.bin` | eMMC 整盘写入 |
+
+            刷机前先用 `sha256sums` 校验。
+            NSS 卸载开机自启，`nss-status` 可查看运行状态；
+            想退回纯主机协议栈：`uci set nss.general.enabled='0'; uci commit nss; reboot`。
+
+            ⚠️ HomeProxy 与 passwall2 共用同一个 `/usr/bin/sing-box` 与同一套
+            nftables 透明代理，两者只能同时启用一个；切换时先停另一个。
+            本固件不含 passwall2，要同时保留两者需另行安装。
+          files: |
+            openwrt/bin/targets/qualcommax/ipq807x/*qnap_301w*

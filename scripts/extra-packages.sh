@@ -67,22 +67,43 @@
 # ── 环境变量 ────────────────────────────────────────────────────
 #   OPENWRT_DIR     OpenWrt 源码目录（必需）
 #   BUILDER_DIR     本仓库检出目录（必需）
+#   PROXY_STACK     代理栈：passwall2（默认）| homeproxy
 #   IMM_REF         ImmortalWrt 的分支，默认 master
 #   IMM_LUCI        immortalwrt/luci 仓库地址
+#   IMM_PKGS        immortalwrt/packages 仓库地址（homeproxy 版取 sing-box 用）
 #   PW_REF          passwall 三个仓库的分支，默认 main
 #   PW_APP_REPO     openwrt-passwall2 仓库地址
 #   PW_PKGS_REPO    openwrt-passwall-packages 仓库地址
+#
+# ── PROXY_STACK=homeproxy 时有什么不同（默认 passwall2，行为完全不变）──
+#   ② 段多稀疏检出一个目录：immortalwrt/luci 的 applications/luci-app-homeproxy。
+#      HomeProxy 是**单包自包含**的（主程序 + init + rpcd 后端 + LuCI 视图
+#      全在这一个包），所以引入它就只需要这一个目录，不像 passwall2 那样
+#      要拉一个"界面仓库 + 组件仓库"。
+#   ③ 段完全不跑（不引入 passwall 的两个仓库），改为从 immortalwrt/packages
+#      取 net/sing-box 落位到 feeds/packages/net/，**覆盖官方那份**。
+#      原因见 configs/homeproxy.config 头部：openwrt/packages 的 sing-box 是
+#      1.14.0，而 HomeProxy 生成的配置还在用 1.13 已删除的 inbound 字段，
+#      1.14 上 sing-box check 直接 FATAL、服务起不来；
+#      immortalwrt/packages 是 1.12.25，正是 ImmortalWrt 自己配 HomeProxy 用的版本。
 #
 # SPDX-License-Identifier: GPL-2.0-only
 set -euo pipefail
 
 OPENWRT_DIR="${OPENWRT_DIR:?OPENWRT_DIR 未设置}"
 BUILDER_DIR="${BUILDER_DIR:?BUILDER_DIR 未设置}"
+PROXY_STACK="${PROXY_STACK:-passwall2}"
 IMM_REF="${IMM_REF:-master}"
 IMM_LUCI="${IMM_LUCI:-https://github.com/immortalwrt/luci.git}"
+IMM_PKGS="${IMM_PKGS:-https://github.com/immortalwrt/packages.git}"
 PW_REF="${PW_REF:-main}"
 PW_APP_REPO="${PW_APP_REPO:-https://github.com/Openwrt-Passwall/openwrt-passwall2.git}"
 PW_PKGS_REPO="${PW_PKGS_REPO:-https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git}"
+
+case "$PROXY_STACK" in
+  passwall2|homeproxy) ;;
+  *) echo "不认识的 PROXY_STACK：$PROXY_STACK（只支持 passwall2 / homeproxy）" >&2; exit 1 ;;
+esac
 
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*"; }
@@ -145,6 +166,12 @@ log "自带配方落位完成，共 $own_count 个"
 # ══════════════════════════════════════════════════════════════
 LUCI_PATHS=(applications/luci-app-ddns-go applications/luci-app-msd_lite)
 
+# HomeProxy 也在这条路上：它同样没有独立的"上游源码仓库"可指，
+# 整包（主程序 + init + rpcd 后端 + 视图 + po）都躺在 immortalwrt/luci 里。
+if [[ "$PROXY_STACK" == "homeproxy" ]]; then
+  LUCI_PATHS+=(applications/luci-app-homeproxy)
+fi
+
 # 稀疏检出：只下载指定目录的 blob，仓库其余部分不落地。
 # immortalwrt/luci 很大，所以这里值得用稀疏；passwall 那两个仓库很小，
 # 用后面的 clone_shallow 就够，不必把稀疏那套脆弱性引进来。
@@ -170,53 +197,8 @@ sparse_clone "$IMM_LUCI" "$WORK/luci" "${LUCI_PATHS[@]}"
 for rel in "${LUCI_PATHS[@]}"; do place "$WORK/luci" feeds/luci "$rel" "$rel" "ImmortalWrt 前端"; done
 
 # ══════════════════════════════════════════════════════════════
-# ③ passwall2：项目仓库 + 依赖组件仓库
+# ③ 代理栈的核心组件
 # ══════════════════════════════════════════════════════════════
-# 简单浅克隆就够：openwrt-passwall2 ~0.5MB、openwrt-passwall-packages ~3MB。
-# 不用稀疏检出 —— 一是没必要，二是 sparse-checkout 在个别环境里会静默失败。
-clone_shallow() {
-  local repo="$1" dest="$2" label="$3"
-
-  log "浅克隆 $label（$PW_REF）"
-  rm -rf "$dest"
-  git clone -q --depth=1 --branch "$PW_REF" "$repo" "$dest" 2>/dev/null \
-    || die "克隆 $repo 失败（分支 $PW_REF）"
-  [[ -d "$dest/.git" ]] || die "$repo 克隆后没有 .git，检出不完整"
-}
-
-# ③-a 界面：openwrt-passwall2 的 <根>/luci-app-passwall2 → feeds/luci/applications/
-#     注意源在仓库根目录、目标要落到 applications/ 下，两边层级不同。
-clone_shallow "$PW_APP_REPO" "$WORK/passwall2" "openwrt-passwall2"
-place "$WORK/passwall2" feeds/luci luci-app-passwall2 applications/luci-app-passwall2 "passwall2"
-
-# ③-b 依赖组件：openwrt-passwall-packages 顶层每个含 Makefile 的目录都是一个包。
-# 清单**不写死** —— 上游加新组件时这里自动跟上，也不用改这个脚本。
-clone_shallow "$PW_PKGS_REPO" "$WORK/passwall-packages" "openwrt-passwall-packages"
-
-pw_rels=()
-while IFS= read -r dir; do
-  rel="$(basename "$dir")"
-  [[ "$rel" == .* ]] && continue          # 跳过 .github / .gitattributes 之类
-  [[ -f "$dir/Makefile" ]] || continue    # 只认带配方的目录
-  place "$WORK/passwall-packages" feeds/packages/net "$rel" "$rel" "passwall 组件"
-  pw_rels+=("$rel")
-done < <(find "$WORK/passwall-packages" -mindepth 1 -maxdepth 1 -type d -print | sort)
-
-((${#pw_rels[@]} > 0)) || die "openwrt-passwall-packages 里一个包都没找到，上游结构变了？"
-# 两个核心组件必须在 —— 缺了说明这份检出不对，早点失败比编到一半炸好。
-for must in xray-core sing-box chinadns-ng; do
-  [[ -f "feeds/packages/net/$must/Makefile" ]] \
-    || die "passwall 组件 $must 没落位，检查 $PW_PKGS_REPO 的 $PW_REF 分支"
-done
-log "passwall 组件落位完成，共 ${#pw_rels[@]} 个：${pw_rels[*]}"
-
-# ── 把这一轮引入的版本发成公开注解 ──────────────────────────────
-# 和 resolve-versions.sh 的思路一致：作业日志要登录才能看，注解不用。
-# 这些版本**不是**我们注入的，而是上游仓库当前 main 里的值 —— 所以这条注解
-# 同时是"上游最近一次更新有没有被这轮构建吃到"的凭证。
-# 不是所有组件都会被编进固件（只有 luci-app-passwall2 选中/依赖的那些），
-# 这里列的是"本仓库引入的配方版本"。
-#
 # 取版本字段时不能只认 PKG_VERSION：少数组件把版本放在别的变量里
 # （v2ray-geodata 用 GEOIP_VER，配方里根本没有 PKG_VERSION）。
 # 取不到就如实显示 "-"，不编造。
@@ -229,28 +211,117 @@ pkg_ver_of() {
   printf '%s' "$v"
 }
 
-app_ver="$(pkg_ver_of feeds/luci/applications/luci-app-passwall2/Makefile)"
-app_rel="$(sed -n 's/^PKG_RELEASE:=\s*//p' feeds/luci/applications/luci-app-passwall2/Makefile 2>/dev/null | head -n1)"
-ann "::notice title=passwall2 项目版本::luci-app-passwall2=${app_ver:-未知}${app_rel:+-${app_rel}}（取自 $PW_APP_REPO@$PW_REF）"
+# 版本注解统一发：作业日志要登录才能看，注解不用。
+# 这些版本**不是**我们注入的，而是上游仓库当前分支里的值 ——
+# 所以这条注解同时是"上游最近一次更新有没有被这轮构建吃到"的凭证。
 
-pw_summary=""
-for rel in "${pw_rels[@]}"; do
-  pw_summary="${pw_summary}${rel}=$(pkg_ver_of "feeds/packages/net/$rel/Makefile")  "
-done
-ann "::notice title=passwall 组件版本（引自上游 $PW_REF）::${pw_summary}"
+# 简单浅克隆就够：openwrt-passwall2 ~0.5MB、openwrt-passwall-packages ~3MB。
+# 不用稀疏检出 —— 一是没必要，二是 sparse-checkout 在个别环境里会静默失败。
+clone_shallow() {
+  local repo="$1" dest="$2" label="$3"
+
+  log "浅克隆 $label（$PW_REF）"
+  rm -rf "$dest"
+  git clone -q --depth=1 --branch "$PW_REF" "$repo" "$dest" 2>/dev/null \
+    || die "克隆 $repo 失败（分支 $PW_REF）"
+  [[ -d "$dest/.git" ]] || die "$repo 克隆后没有 .git，检出不完整"
+}
+
+if [[ "$PROXY_STACK" == "homeproxy" ]]; then
+  # ════════════════════════════════════════════════════════════
+  # ③-H 代理栈 = homeproxy：只要一个 sing-box 组件
+  # ════════════════════════════════════════════════════════════
+  # 不拉 passwall 那两个仓库 —— HomeProxy 不需要它们（分流、DNS、协议实现
+  # 全部由它自己生成的 sing-box 配置完成）。
+  #
+  # 但 sing-box 必须用 **ImmortalWrt** 那份配方（1.12.25）：
+  # openwrt/packages 与 openwrt-passwall-packages 都是 1.14.0，而 HomeProxy
+  # 生成的 client 配置里还写着 **1.13 已删除**的 inbound 字段
+  # （sniff / sniff_override_destination / set_system_proxy），
+  # 1.14 上 `sing-box check` 直接 FATAL: "legacy inbound fields are
+  # deprecated in 1.11.0 and removed in 1.13.0"，/etc/init.d/homeproxy
+  # 据此 return 1，服务永远起不来（在 192.168.2.1 上实测确认过）。
+  # ImmortalWrt 自己就是 sing-box 1.12.25 + homeproxy，上游验证过的组合。
+  log "代理栈 = homeproxy：取 ImmortalWrt 的 sing-box 配方（覆盖官方 1.14.0）"
+  sparse_clone "$IMM_PKGS" "$WORK/imm-packages" net/sing-box
+  place "$WORK/imm-packages" feeds/packages/net net/sing-box sing-box \
+    "ImmortalWrt sing-box（homeproxy 用）"
+
+  [[ -f feeds/packages/net/sing-box/Makefile ]] \
+    || die "immortalwrt/packages 的 net/sing-box 没落位，检查 $IMM_PKGS 的 $IMM_REF 分支"
+
+  sb_ver="$(pkg_ver_of feeds/packages/net/sing-box/Makefile)"
+  # sing-box 1.13 起删掉了 HomeProxy 仍在写的 inbound 字段，所以这里对
+  # "上游把配方升级了"给出显式警告 —— 那样编出来的固件里
+  # homeproxy 会在启动时被自己生成的配置卡死，而且是运行期才暴露。
+  case "$sb_ver" in
+    1.12.*) : ;;
+    *) warn "sing-box 配方版本是 $sb_ver，不是 1.12.x —— 请确认当前的 HomeProxy 生成器是否还兼容（1.13 起删除了 sniff / set_system_proxy 等 inbound 字段）" ;;
+  esac
+  luci_sha="$(git -C "$WORK/luci" rev-parse --short HEAD 2>/dev/null || echo '?')"
+  ann "::notice title=HomeProxy 版本::luci-app-homeproxy（取自 immortalwrt/luci@$IMM_REF，commit ${luci_sha}）"
+  ann "::notice title=sing-box 版本::sing-box=${sb_ver}（取自 immortalwrt/packages@$IMM_REF —— 1.12.x 才与 HomeProxy 的配置生成器匹配）"
+else
+  # ════════════════════════════════════════════════════════════
+  # ③-P 代理栈 = passwall2（默认）
+  # ════════════════════════════════════════════════════════════
+  # ③-a 界面：openwrt-passwall2 的 <根>/luci-app-passwall2 → feeds/luci/applications/
+  #     注意源在仓库根目录、目标要落到 applications/ 下，两边层级不同。
+  clone_shallow "$PW_APP_REPO" "$WORK/passwall2" "openwrt-passwall2"
+  place "$WORK/passwall2" feeds/luci luci-app-passwall2 applications/luci-app-passwall2 "passwall2"
+
+  # ③-b 依赖组件：openwrt-passwall-packages 顶层每个含 Makefile 的目录都是一个包。
+  # 清单**不写死** —— 上游加新组件时这里自动跟上，也不用改这个脚本。
+  clone_shallow "$PW_PKGS_REPO" "$WORK/passwall-packages" "openwrt-passwall-packages"
+
+  pw_rels=()
+  while IFS= read -r dir; do
+    rel="$(basename "$dir")"
+    [[ "$rel" == .* ]] && continue          # 跳过 .github / .gitattributes 之类
+    [[ -f "$dir/Makefile" ]] || continue    # 只认带配方的目录
+    place "$WORK/passwall-packages" feeds/packages/net "$rel" "$rel" "passwall 组件"
+    pw_rels+=("$rel")
+  done < <(find "$WORK/passwall-packages" -mindepth 1 -maxdepth 1 -type d -print | sort)
+
+  ((${#pw_rels[@]} > 0)) || die "openwrt-passwall-packages 里一个包都没找到，上游结构变了？"
+  # 两个核心组件必须在 —— 缺了说明这份检出不对，早点失败比编到一半炸好。
+  for must in xray-core sing-box chinadns-ng; do
+    [[ -f "feeds/packages/net/$must/Makefile" ]] \
+      || die "passwall 组件 $must 没落位，检查 $PW_PKGS_REPO 的 $PW_REF 分支"
+  done
+  log "passwall 组件落位完成，共 ${#pw_rels[@]} 个：${pw_rels[*]}"
+
+  # 不是所有组件都会被编进固件（只有 luci-app-passwall2 选中/依赖的那些），
+  # 这里列的是"本仓库引入的配方版本"。
+  app_ver="$(pkg_ver_of feeds/luci/applications/luci-app-passwall2/Makefile)"
+  app_rel="$(sed -n 's/^PKG_RELEASE:=\s*//p' feeds/luci/applications/luci-app-passwall2/Makefile 2>/dev/null | head -n1)"
+  ann "::notice title=passwall2 项目版本::luci-app-passwall2=${app_ver:-未知}${app_rel:+-${app_rel}}（取自 $PW_APP_REPO@$PW_REF）"
+
+  pw_summary=""
+  for rel in "${pw_rels[@]}"; do
+    pw_summary="${pw_summary}${rel}=$(pkg_ver_of "feeds/packages/net/$rel/Makefile")  "
+  done
+  ann "::notice title=passwall 组件版本（引自上游 $PW_REF）::${pw_summary}"
+fi
 
 # ══════════════════════════════════════════════════════════════
 # 前置依赖自检
 # ══════════════════════════════════════════════════════════════
 # ddns-go 是 Go 包，构建时要 include 官方 feed 的 golang 框架。
 # 它不在就说明 packages feed 不完整，早点失败比编到一半炸好。
+# （sing-box 同样是 Go 包，两个 profile 都要用到这个框架。）
 [[ -f feeds/packages/lang/golang/golang-package.mk ]] \
-  || die "缺少 feeds/packages/lang/golang/golang-package.mk，ddns-go / xray-core / sing-box 等 Go 包无法构建"
+  || die "缺少 feeds/packages/lang/golang/golang-package.mk，ddns-go / sing-box 等 Go 包无法构建"
 [[ -f feeds/luci/luci.mk ]] \
   || die "缺少 feeds/luci/luci.mk，luci-app-* 无法构建"
 
-log "引入完成："
+log "引入完成（PROXY_STACK=${PROXY_STACK}）："
 log "  · 自带配方        ddns-go / msd_lite / autocore"
-log "  · ImmortalWrt 前端 luci-app-{ddns-go,msd_lite}"
-log "  · passwall2       luci-app-passwall2 + ${#pw_rels[@]} 个依赖组件"
+if [[ "$PROXY_STACK" == "homeproxy" ]]; then
+  log "  · ImmortalWrt 前端 luci-app-{ddns-go,msd_lite,homeproxy}"
+  log "  · 代理核心        sing-box（ImmortalWrt 配方，覆盖官方那份）"
+else
+  log "  · ImmortalWrt 前端 luci-app-{ddns-go,msd_lite}"
+  log "  · passwall2       luci-app-passwall2 + ${#pw_rels[@]} 个依赖组件"
+fi
 warn "别忘了接着跑：./scripts/feeds update -i -a   # 重建索引，install 才看得到这些包"

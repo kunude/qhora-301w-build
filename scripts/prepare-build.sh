@@ -19,6 +19,10 @@
 # 可选：
 #   NSS_FEED         NSS feed 的 src-git 行，默认指向 edma-nss 分支
 #   GH_TOKEN         查 GitHub API 用，避免未认证限额（Actions 里默认注入）
+#   PROXY_STACK      代理栈：passwall2（默认）| homeproxy
+#                    homeproxy 时额外拼接 configs/homeproxy.config（覆盖层），
+#                    并把 feed 断言换成 homeproxy 那一组；默认值下本文件
+#                    的行为与以前完全一致。传给 extra-packages.sh 的是同一个变量。
 #   DDNS_GO_VERSION  钉死 ddns-go 版本，例如 6.17.7（默认跟随上游最新 release）
 #   MSD_LITE_SHA     钉死 msd_lite 的 commit sha（默认跟随上游 master HEAD）
 #
@@ -114,10 +118,21 @@ die()  {
   exit 1
 }
 
+# 代理栈 profile。决定拼哪几份 config、以及断言哪些包真的被 feed 接管。
+#   passwall2（默认）—— 与以前完全一致：common + 机型
+#   homeproxy         —— 再追加 configs/homeproxy.config 作为覆盖层
+#                        （它把 passwall2 那组符号用 =n 按掉，见该文件头部）
+PROXY_STACK="${PROXY_STACK:-passwall2}"
+
 CONFIGS=(
   "$BUILDER_DIR/configs/common.config"
   "$BUILDER_DIR/configs/qhora_301w.config"
 )
+case "$PROXY_STACK" in
+  passwall2) ;;
+  homeproxy) CONFIGS+=( "$BUILDER_DIR/configs/homeproxy.config" ) ;;
+  *) die "不认识的 PROXY_STACK：$PROXY_STACK（只支持 passwall2 / homeproxy）" ;;
+esac
 
 # 关于符号校验：不在这里维护一份"我认为重要的符号"清单。
 # 要断言什么，由 CONFIGS 里实际写了的符号决定（见下面的步骤 3）——
@@ -156,8 +171,8 @@ ls -1 feeds/ 2>/dev/null | sed 's/^/    /' | tee -a "$LOG_FILE" >&3 || true
 #   · 它们的 LuCI 前端 → 从 ImmortalWrt 稀疏检出（纯页面，没有可指的独立上游）
 # 必须在 install 之前、update 之后：update 负责把 feeds/ 目录建出来，
 # install 读的是索引文件，看不到中途塞进去的包。
-log "引入官方 feed 之外的包"
-OPENWRT_DIR="$OPENWRT_DIR" BUILDER_DIR="$BUILDER_DIR" \
+log "引入官方 feed 之外的包（PROXY_STACK=${PROXY_STACK}）"
+OPENWRT_DIR="$OPENWRT_DIR" BUILDER_DIR="$BUILDER_DIR" PROXY_STACK="$PROXY_STACK" \
   bash "$BUILDER_DIR/scripts/extra-packages.sh"
 
 # 解析这两个包的上游最新版本，注入到刚落位的自带配方里 —— 这是「上游一发新版，
@@ -187,22 +202,43 @@ for p in ddns-go msd_lite autocore; do
   [[ -e "package/feeds/packages/$p" ]] \
     || die "package/feeds/packages/$p 不存在，引入的包没有被 feeds install 接管"
 done
-for p in luci-app-ddns-go luci-app-msd_lite luci-app-passwall2; do
-  [[ -e "package/feeds/luci/$p" ]] \
-    || die "package/feeds/luci/$p 不存在，引入的包没有被 feeds install 接管"
-done
-# passwall 的依赖组件是个会变的集合（上游加组件时 extra-packages.sh 自动带上），
-# 所以这里只抽查几个**稳定必需**的，剩下的交给 .config 符号校验和产物校验。
-for p in xray-core sing-box chinadns-ng v2ray-geodata geoview tcping; do
-  [[ -e "package/feeds/packages/$p" ]] \
-    || die "package/feeds/packages/$p 不存在，passwall 组件没有被 feeds install 接管"
-done
+
+if [[ "$PROXY_STACK" == "homeproxy" ]]; then
+  # ── homeproxy 版 ──────────────────────────────────────────
+  # 代理前端只有一个包（homeproxy 是单包自包含的），代理核心只有一个
+  # sing-box —— 而且它必须是我们从 ImmortalWrt 覆盖过来的那份：
+  # 官方 feed 的是 1.14.0，HomeProxy 生成的配置会在 sing-box check 上
+  # 直接 FATAL，服务起不来（详见 configs/homeproxy.config 头部）。
+  for p in luci-app-ddns-go luci-app-msd_lite luci-app-homeproxy; do
+    [[ -e "package/feeds/luci/$p" ]] \
+      || die "package/feeds/luci/$p 不存在，引入的包没有被 feeds install 接管"
+  done
+  [[ -e "package/feeds/packages/sing-box" ]] \
+    || die "package/feeds/packages/sing-box 不存在，sing-box 没有被 feeds install 接管"
+  # 确认落位的确实是 ImmortalWrt 那份配方（1.12.x），不是官方 1.14.0。
+  sb_ver="$(sed -n 's/^PKG_VERSION:=\s*//p' package/feeds/packages/sing-box/Makefile 2>/dev/null | head -n1)"
+  case "$sb_ver" in
+    1.12.*) log "sing-box 配方版本确认：$sb_ver（ImmortalWrt 那份，与 HomeProxy 匹配）" ;;
+    *) warn "sing-box 配方版本是 ${sb_ver:-未知}，不是 1.12.x —— HomeProxy 可能无法启动（1.13 起删除了它仍在用的 inbound 字段）" ;;
+  esac
+else
+  for p in luci-app-ddns-go luci-app-msd_lite luci-app-passwall2; do
+    [[ -e "package/feeds/luci/$p" ]] \
+      || die "package/feeds/luci/$p 不存在，引入的包没有被 feeds install 接管"
+  done
+  # passwall 的依赖组件是个会变的集合（上游加组件时 extra-packages.sh 自动带上），
+  # 所以这里只抽查几个**稳定必需**的，剩下的交给 .config 符号校验和产物校验。
+  for p in xray-core sing-box chinadns-ng v2ray-geodata geoview tcping; do
+    [[ -e "package/feeds/packages/$p" ]] \
+      || die "package/feeds/packages/$p 不存在，passwall 组件没有被 feeds install 接管"
+  done
+fi
 
 # 没有这个 feed，ATH11K_NSS_SUPPORT 会因依赖不满足而无法在 menuconfig 里选中。
 [[ -d "$OPENWRT_DIR/feeds/nss" ]] || die "NSS feed 没有就位（feeds/nss 不存在），检查上面的 feeds 步骤"
 
 # ── 2. 组装 .config ──────────────────────────────────────────
-log "生成 .config：common.config + qhora_301w.config"
+log "生成 .config：$(for f in "${CONFIGS[@]}"; do printf '%s ' "${f##*/}"; done)"
 cat "${CONFIGS[@]}" > .config
 log "make defconfig 开始（输入 $(wc -l < .config) 行）"
 make defconfig
