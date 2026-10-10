@@ -1,0 +1,251 @@
+# ═══════════════════════════════════════════════════════════════════════════
+#  QHora-301W 出厂预置的 HomeProxy 配置（Custom routing 三分流）
+#  ─────────────────────────────────────────────────────────────────────────
+#  来源：本仓库 files-homeproxy/etc/config/homeproxy，由 prepare-build.sh
+#        在叠加 files/ 之后按变体叠加进固件（只有 PROXY_STACK=homeproxy 的
+#        固件会带它，passwall2 版不受影响）。
+#
+#  这份配置把 passwall2 那套「Reject / Direct / Proxy」三分流，等价搬到
+#  HomeProxy 的 Custom routing（自定义路由）上：
+#    · Reject ：广告域名      → action=reject（直接丢弃）
+#    · Direct ：国内 + Apple + 抖音 + 银行域名 + 国内 IP → 直连
+#    · Proxy  ：geolocation-!cn（境外）→ URLTest 代理组
+#    · 其余未命中 → routing.default_outbound
+#    · DNS    ：国内域名用 223.5.5.5 直连解析，其余用 8.8.8.8 的 DoH（经代理）
+#
+#  与 passwall2 版的字段对照（语义相同、结构不同）：
+#    passwall2                     HomeProxy custom
+#    ----------------------------  ------------------------------------------
+#    nodes type=_urltest           routing_node 'main' (node=urltest)
+#    shunt_rules Reject            ruleset 'ads' + routing_rule Reject(action=reject)
+#    shunt_rules Direct            ruleset ×7   + routing_rule Direct(outbound=direct-out)
+#    shunt_rules Proxy             ruleset 'noncn' + routing_rule Proxy(outbound=main)
+#    node 的 Reject/_blackhole     routing_rule 的 action='reject'
+#    default_node                  routing.default_outbound
+#    remote_dns_doh / detour        dns_server 'remote_dns' (https 8.8.8.8, outbound=main)
+#    直连 DNS                       dns_server 'direct_dns' (udp 223.5.5.5)
+#
+#  ❌ 没有配、需要你自己填的：节点本身（地址 / 端口 / 密码 / UUID / REALITY
+#     公钥等）。固件是公开仓库产物，凭据不写进来。
+#     下面 node_vless / node_ss 两个模板，填你实际用的那个即可
+#     （另一个留空没有关系，URLTest 组会自己跳过不可用的）。
+#
+#  ⚠️ default_outbound 故意留 'nil'（= 不启动服务）——
+#     /etc/init.d/homeproxy 的 start_service() 是这样判的：
+#         custom 模式 → 取 routing.default_outbound（缺省即 'nil'）
+#         非 custom  → 取 config.main_node
+#     取到 'nil' 时直接 `return 1`，不生成配置、不起 sing-box。
+#     节点还空着就启动的话，LAN 的解析与转发会被压到一条走不通的代理链上。
+#     填好节点后二选一启用：
+#       · 界面：LuCI「服务 → HomeProxy → 路由设置」→ Default outbound 选 Main
+#       · 命令：uci set homeproxy.routing.default_outbound='main'
+#               uci commit homeproxy && /etc/init.d/homeproxy restart
+#
+#  ⚠️ 三个实测踩过的坑：
+#     1) 列表型选项必须写 list，不能写成 option x 'a' 'b'（uci 解析器只认
+#        list 语法，单行多值会报 "Parse error: too many arguments"）。
+#     2) routing_rule 段的先后顺序 = 匹配优先级，Reject 必须排在最前。
+#     3) urltest_interval 要写「裸秒数」（生成器做的是 值 + 's'），
+#        写成 '3m' 会得到 '3ms'。
+# ═══════════════════════════════════════════════════════════════════════════
+
+config homeproxy 'config'
+	option routing_mode 'custom'
+	option proxy_mode 'redirect_tproxy'
+	option ipv6_support '0'
+	option log_level 'warn'
+
+config homeproxy 'routing'
+	# ↓ 填好节点后再改成 'main'（或直接在界面里把 Default outbound 选成 Main）
+	option default_outbound 'nil'
+	# 解析节点地址（域名）用的解析器；default-dns = WAN 下发的那台，走直连
+	option default_outbound_dns 'default-dns'
+	option sniff_override '1'
+	option bypass_cn_traffic '0'
+
+config homeproxy 'dns'
+	option dns_strategy 'prefer_ipv4'
+	# 未命中 dns_rule 的查询默认走这台（经代理的 DoH）
+	option default_server 'remote_dns'
+
+# ── 节点模板 ①：VLESS + REALITY（推荐，抗封锁最好）──────────────────────
+#    要填：address / uuid / tls_sni / tls_reality_public_key / tls_reality_short_id
+#    协议、传输、TLS、uTLS 指纹、vision 流控都已经设好，不用动。
+config node 'node_vless'
+	option label 'VLESS-REALITY'
+	option type 'vless'
+	# ↓↓↓ 服务端地址（域名或 IP，不带 https:// 和端口）↓↓↓
+	option address ''
+	option port '443'
+	# ↓↓↓ UUID ↓↓↓
+	option uuid ''
+	option vless_flow 'xtls-rprx-vision'
+	option tls '1'
+	# ↓↓↓ REALITY 伪装域名（SNI）↓↓↓
+	option tls_sni ''
+	option tls_reality '1'
+	# ↓↓↓ REALITY 公钥 / short id ↓↓↓
+	option tls_reality_public_key ''
+	option tls_reality_short_id ''
+	option tls_utls 'chrome'
+
+# ── 节点模板 ②：Shadowsocks ─────────────────────────────────────────────
+#    要填：address / port / password（加密方式按你的服务端改）
+config node 'node_ss'
+	option label 'Shadowsocks'
+	option type 'shadowsocks'
+	# ↓↓↓ 服务端地址 / 端口 / 密码 ↓↓↓
+	option address ''
+	option port '8388'
+	option shadowsocks_encrypt_method 'aes-256-gcm'
+	option password ''
+
+# ── 出站：URLTest 自动选路组 ────────────────────────────────────────────
+#  生成后的 tag 是 cfg-main-out，被 Proxy 规则和 DoH 下载 detour 引用。
+config routing_node 'main'
+	option label 'Main'
+	option enabled '1'
+	option node 'urltest'
+	list urltest_nodes 'node_vless'
+	list urltest_nodes 'node_ss'
+	option urltest_url 'https://www.google.com/generate_204'
+	option urltest_interval '180'
+	option urltest_tolerance '50'
+	option urltest_idle_timeout '1800'
+
+# ── 规则集（远程 .srs）─────────────────────────────────────────────────
+#  outbound=main ⇒ 生成 download_detour 指向代理组。
+#  raw.githubusercontent.com 直连不通，必须经代理下载，所以这里不能填 direct-out。
+config ruleset 'ads'
+	option label 'Ads'
+	option enabled '1'
+	option type 'remote'
+	option format 'binary'
+	option url 'https://raw.githubusercontent.com/SagerNet/sing-geosite/refs/heads/rule-set/geosite-category-ads-all.srs'
+	option outbound 'main'
+	option update_interval '1d'
+
+config ruleset 'cn'
+	option label 'CN'
+	option enabled '1'
+	option type 'remote'
+	option format 'binary'
+	option url 'https://raw.githubusercontent.com/SagerNet/sing-geosite/refs/heads/rule-set/geosite-cn.srs'
+	option outbound 'main'
+	option update_interval '1d'
+
+config ruleset 'apple'
+	option label 'Apple'
+	option enabled '1'
+	option type 'remote'
+	option format 'binary'
+	option url 'https://raw.githubusercontent.com/SagerNet/sing-geosite/refs/heads/rule-set/geosite-apple.srs'
+	option outbound 'main'
+	option update_interval '1d'
+
+config ruleset 'apple_cn'
+	option label 'AppleCN'
+	option enabled '1'
+	option type 'remote'
+	option format 'binary'
+	# %40 是 URL 编码的 @，别改成字面 @
+	option url 'https://raw.githubusercontent.com/SagerNet/sing-geosite/refs/heads/rule-set/geosite-apple%40cn.srs'
+	option outbound 'main'
+	option update_interval '1d'
+
+config ruleset 'apple_upd'
+	option label 'AppleUpdate'
+	option enabled '1'
+	option type 'remote'
+	option format 'binary'
+	option url 'https://raw.githubusercontent.com/SagerNet/sing-geosite/refs/heads/rule-set/geosite-apple-update.srs'
+	option outbound 'main'
+	option update_interval '1d'
+
+config ruleset 'bank_cn'
+	option label 'BankCN'
+	option enabled '1'
+	option type 'remote'
+	option format 'binary'
+	option url 'https://raw.githubusercontent.com/SagerNet/sing-geosite/refs/heads/rule-set/geosite-category-bank-cn.srs'
+	option outbound 'main'
+	option update_interval '1d'
+
+config ruleset 'douyin'
+	option label 'Douyin'
+	option enabled '1'
+	option type 'remote'
+	option format 'binary'
+	option url 'https://raw.githubusercontent.com/SagerNet/sing-geosite/refs/heads/rule-set/geosite-douyin.srs'
+	option outbound 'main'
+	option update_interval '1d'
+
+config ruleset 'noncn'
+	option label 'NonCN'
+	option enabled '1'
+	option type 'remote'
+	option format 'binary'
+	option url 'https://raw.githubusercontent.com/SagerNet/sing-geosite/refs/heads/rule-set/geosite-geolocation-!cn.srs'
+	option outbound 'main'
+	option update_interval '1d'
+
+config ruleset 'geoip_cn'
+	option label 'GeoIPCN'
+	option enabled '1'
+	option type 'remote'
+	option format 'binary'
+	option url 'https://raw.githubusercontent.com/SagerNet/sing-geoip/refs/heads/rule-set/geoip-cn.srs'
+	option outbound 'main'
+	option update_interval '1d'
+
+# ── 路由规则（段的先后顺序 = 匹配优先级，Reject 必须最先）──────────────
+
+config routing_rule 'Reject'
+	option label 'Reject'
+	option enabled '1'
+	option action 'reject'
+	list rule_set 'ads'
+
+config routing_rule 'Direct'
+	option label 'Direct'
+	option enabled '1'
+	option action 'route'
+	option outbound 'direct-out'
+	list rule_set 'cn'
+	list rule_set 'apple'
+	list rule_set 'apple_cn'
+	list rule_set 'apple_upd'
+	list rule_set 'bank_cn'
+	list rule_set 'douyin'
+	list rule_set 'geoip_cn'
+
+config routing_rule 'Proxy'
+	option label 'Proxy'
+	option enabled '1'
+	option action 'route'
+	option outbound 'main'
+	list rule_set 'noncn'
+
+# ── DNS ────────────────────────────────────────────────────────────────
+#  国内域名 → direct_dns（223.5.5.5，直连）；其余 → remote_dns（DoH，经代理）
+config dns_server 'remote_dns'
+	option label 'RemoteDoH'
+	option enabled '1'
+	option type 'https'
+	option server '8.8.8.8'
+	option path '/dns-query'
+	option outbound 'main'
+
+config dns_server 'direct_dns'
+	option label 'DirectUDP'
+	option enabled '1'
+	option type 'udp'
+	option server '223.5.5.5'
+	option outbound 'direct-out'
+
+config dns_rule 'cn_dns'
+	option label 'CNDNS'
+	option enabled '1'
+	option action 'route'
+	option server 'direct_dns'
+	list rule_set 'cn'

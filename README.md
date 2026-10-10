@@ -41,12 +41,14 @@
 │                                            #   上面那个 JS 读 /proc、/sys 的 rpcd 授权
 ├── files-passwall2/                         # 变体专属覆盖层：只叠进 passwall2 版固件
 │   └── etc/config/passwall2                 #   passwall2 出厂预置：分流/DNS/选路，节点留空
+├── files-homeproxy/                         # 变体专属覆盖层：只叠进 HomeProxy 版固件
+│   └── etc/config/homeproxy                 #   HomeProxy 出厂预置：custom 三分流/DNS，节点留空
 ├── .gitattributes / .gitignore
 └── README.md
 ```
 
-> 把 passwall2 的出厂配置放在 `files-passwall2/` 而不是 `files/`，是为了让它只出现在
-> passwall2 版固件里 —— HomeProxy 版不需要它。`prepare-build.sh` 会先叠 `files/`，
+> 出厂代理配置按变体分开放：passwall2 的在 `files-passwall2/`，HomeProxy 的在
+> `files-homeproxy/`，都只出现在对应变体的固件里。`prepare-build.sh` 会先叠 `files/`，
 > 再叠 `files-<PROXY_STACK>/`（对方目录不存在就跳过），后者同名文件覆盖前者。
 
 `configs/` 里的内容取自上游作者自己维护的
@@ -262,6 +264,43 @@ passwall2 版固件里带了一份完整的 `/etc/config/passwall2`
    ② 或者把 URLTest 节点的「节点添加方式」从 `manual` 改成 `batch`，用「选择分组」动态纳入
    （订阅更新后自动跟上，不用每次改成员列表）。
 
+### HomeProxy 出厂预置（仅 HomeProxy 版固件）
+
+HomeProxy 版固件带了一份 `/etc/config/homeproxy`（源文件 `files-homeproxy/etc/config/homeproxy`），
+把上面那套 passwall2 三分流**等价搬到了 HomeProxy 的 Custom routing（自定义路由）**上。
+HomeProxy 吃的是 sing-box 原生配置，和 passwall2 的 `shunt_rules` 结构完全不同，对应关系是：
+
+| passwall2 | HomeProxy custom |
+|---|---|
+| `nodes` 里 `_urltest` 组 | `routing_node 'main'`（`node=urltest`）→ 生成 `cfg-main-out` |
+| `shunt_rules 'Reject'` | `ruleset 'ads'` + `routing_rule 'Reject'`（**`action='reject'`**） |
+| `shunt_rules 'Direct'` | `ruleset` ×7 + `routing_rule 'Direct'`（`outbound='direct-out'`） |
+| `shunt_rules 'Proxy'` | `ruleset 'noncn'` + `routing_rule 'Proxy'`（`outbound='main'`） |
+| shunt 节点 `default_node` | `routing.default_outbound` |
+| `remote_dns_doh` + `remote_dns_detour=remote` | `dns_server 'remote_dns'`（https 8.8.8.8，`outbound='main'`） |
+| 直连 DNS | `dns_server 'direct_dns'`（udp 223.5.5.5）+ `dns_rule 'cn_dns'`（国内域名走它） |
+
+分流结果与 passwall2 版一致：**国内直连、境外走 URLTest 代理、广告域名丢弃**；DNS 也分域
+（国内用 223.5.5.5 直连解析，其余走 8.8.8.8 的 DoH 经代理）。同样**不含节点凭据**，
+留了 `node_vless`（VLESS+REALITY）、`node_ss`（Shadowsocks）两个模板。
+
+**启用方式**（比 passwall2 多一步）：自定义路由模式下 HomeProxy 的"开关"不是主节点下拉，
+而是 `routing.default_outbound` —— `/etc/init.d/homeproxy` 取到 `nil` 时直接 `return 1`
+不启动、不劫持 DNS，所以预置里它是 `nil`。填完节点后二选一：
+
+- 界面：`服务 → HomeProxy → 路由设置` → **Default outbound 选 `Main`** → 保存
+- 命令：`uci set homeproxy.routing.default_outbound='main' && uci commit homeproxy && /etc/init.d/homeproxy restart`
+
+三个实测踩过的坑：
+
+1. 列表型选项必须写 `list`，不能写 `option x 'a' 'b'`（uci 解析器会报 `too many arguments`）。
+2. `routing_rule` 段的**先后顺序就是匹配优先级**，Reject 必须排在最前。
+3. `urltest_interval` 要写裸秒数（生成器做的是 `值 + 's'`），写 `3m` 会得到 `3ms`。
+
+> HomeProxy 版固件里的 sing-box 是 **ImmortalWrt 源的 1.12.25**（见第五节）。
+> 这个版本是必须的：HomeProxy 生成的 inbound 用了 sing-box 1.13 已删除的字段，
+> 官方 packages 源上的 1.14.x 会让它 `check` 直接失败、服务起不来。
+
 ### 已启用的附加服务
 
 | 服务 | 状态 | 怎么用 |
@@ -270,6 +309,7 @@ passwall2 版固件里带了一份完整的 `/etc/config/passwall2`
 | **msd_lite** | 开机自启 | 客户端按 `http://<路由器IP>:7088/udp/<组播地址>:<端口>` 取流。**接收组播的网卡需要在 `服务 → msd_lite` 里选**（见下） |
 | **WireGuard** | 仅装好 | 没有常驻服务，到 `网络 → 接口` 新建一个 `wg` 协议接口即可，内核模块会自动加载 |
 | **passwall2** | 已预置分流，未启用 | 分流规则 / DNS / 转发 / URLTest 选路都已随固件预置好，**只剩节点凭据要填**（见上一节）。填完在 `服务 → Pass Wall 2` 打开总开关即可。核心只编了 **`sing-box`**（原生支持 SS/SSR/VMess/VLESS/Trojan/Hysteria2，`_shunt` 分流也由它实现），外带 **`sslocal`**（Shadowsocks-Rust 客户端，SS-Rust 类型节点靠它启动）；**没有** xray（见第五节，所以节点类型别选 Xray）。界面里缺的组件可在「组件更新」在线拉 |
+| **HomeProxy**（仅 HomeProxy 版） | 已预置 custom 三分流，未启用 | 与 passwall2 同源的三分流规则（Reject / Direct / Proxy）、URLTest 选路、分域 DNS（国内直连解析、其余 DoH 经代理）全部随固件预置，**只剩节点凭据要填**。填完把 `路由设置 → Default outbound` 选成 `Main` 即启用，详见上一节 |
 | **statistics** | 开机自启 | `状态 → 统计` 里有 CPU（每核占用）、**温度**、内存、接口流量、无线的曲线图。温度采集默认是开的（uci-defaults 打开了 thermal 插件），如果想调去 `统计 → 设置` |
 | **首页硬件区块** | 装好即生效 | `状态 → 总览` 页底部多出一块「CPU / 温度 / 内存」：CPU 占用率（带当前频率）、每个温度传感器（`cpu-thermal` / `nss-*-thermal` / `wifi-thermal` …）、内存用量。是本仓库自己写的 include（`files/www/luci-static/resources/view/status/include/95_qhora_hw.js`），**不依赖 collectd**，开机就有数 —— 和上面 collectd 那套曲线图是两回事（一个看当前值，一个看历史） |
 | **autocore** | 装好即生效 | 两个命令行脚本：`tempinfo`（输出 `CPU: 52.3°C, WiFi: 61.0°C`）和 `cpuinfo`（CPU 型号）。就是 ImmortalWrt 首页温度那一行背后用的东西，本仓库把它同源抄了进来（见第六节 7）。首页显示仍由上面那块自写区块负责，不依赖它 |
@@ -318,6 +358,7 @@ cat /sys/class/thermal/thermal_zone*/type    # 固件里有哪些温度传感器
 | 用自己 fork 的源码 | 改 YAML `env.UPSTREAM_REPOSITORY` |
 | 系统默认配置（主机名、**LAN 网段**、无线、服务开关） | 往 `files/` 里按路径放文件，会原样叠加进镜像；首次启动脚本在 `files/etc/uci-defaults/`。LAN 网段在 `files/etc/uci-defaults/99-qhora-301w` 里（现在是 `192.168.35.1/24`） |
 | 改 passwall2 的出厂预置（分流规则 / DNS / 节点模板） | `files-passwall2/etc/config/passwall2`（**改完记得把 `address` 之类留空**，别把凭据提交上去）；这个目录只叠进 passwall2 版固件 |
+| 改 HomeProxy 的出厂预置（custom 三分流 / DNS / 节点模板） | `files-homeproxy/etc/config/homeproxy`（同样**别把凭据提交上去**）；只叠进 HomeProxy 版固件。注意它 `routing.default_outbound` 默认是 `nil`，即预置但不启用 |
 | 同时编多个机型 | 在 `configs/qhora_301w.config` 再加 `CONFIG_TARGET_DEVICE_qualcommax_ipq807x_DEVICE_xxx=y`，注意 RTL 相关的高危项见下 |
 
 自带配方不用登记：`extra-packages.sh` 是 `find packages -name Makefile` 扫出来的，
