@@ -357,7 +357,33 @@ FATAL: legacy inbound fields are deprecated in 1.11.0 and removed in 1.13.0
 
 > 上游哪天把 `immortalwrt/packages` 的 sing-box 抬到 1.13+，构建会在这里明确失败。
 > 出路：① 把 `imm_ref` 钉到 sing-box 仍是 1.12.25 的那个提交；② 确认 HomeProxy 的配置
-> 生成器已兼容后，设 `singbox_expect` 显式放行。
+> 生成器已兼容后，设 `singbox_expect` 显式放行；③ 走下面的实验线。
+
+### 实验线：反过来 —— 留新版 sing-box、改 HomeProxy
+
+上面两条是**正式线**的做法（`SINGBOX_MODE=fixed`，sing-box 钉 1.12.25，HomeProxy 一字不动）。
+仓库里另有一条**实验线**，工作流 `build-qhora-301w-homeproxy-sb114.yml`，走的是反方向
+（`SINGBOX_MODE=latest`）：
+
+1. **不覆盖**官方配方，直接用 `openwrt/packages` 的 `net/sing-box`，把 `PKG_VERSION`
+   改成输入 `singbox_version`（默认 `1.14.3`），并用 codeload 的
+   `.../tar.gz/v<版本>` **现下现算** `PKG_HASH` 写回配方 —— 所以填一个不存在的版本号
+   会在准备阶段就明确失败；
+2. 构建期调 `scripts/patch-homeproxy-for-singbox113.py` 给 `generate_client.uc` 打补丁：
+   **删掉 inbound 上的 legacy 字段**，并按官方迁移方案在 `route.rules` 里补一条
+   `{ action: 'sniff' }`（上游其实早就留了注释占位，只是一直没启用）。
+
+补丁用 sing-box 官方二进制的 `check` 在**同一份等价配置**上验证过：
+
+| 组合 | 结果 |
+|---|---|
+| 1.14.3 + HomeProxy 原版 | ❌ FATAL（复现设备上的问题） |
+| 1.14.3 + 补丁版 | ✅ 通过 |
+| 1.12.25 + 补丁版 | ✅ 通过（**回归安全**：`action: 'sniff'` 自 1.11 起就可用） |
+
+实验线**只能手动触发**，产物单独打标签 `qhora-301w-homeproxy-sb114-*`，不会和正式线混。
+构建期还会核对两件事：编出来的 sing-box 版本是否等于输入值、以及打补丁后的
+`generate_client.uc` 是否真的无 legacy 字段（这是本线与正式线唯一的差别，失效就等于白测）。
 
 ### 另外还有个「必须有」：ucode 的 `math` 模块
 

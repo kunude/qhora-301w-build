@@ -177,6 +177,7 @@ ls -1 feeds/ 2>/dev/null | sed 's/^/    /' | tee -a "$LOG_FILE" >&3 || true
 # install 读的是索引文件，看不到中途塞进去的包。
 log "引入官方 feed 之外的包（PROXY_STACK=${PROXY_STACK}）"
 OPENWRT_DIR="$OPENWRT_DIR" BUILDER_DIR="$BUILDER_DIR" PROXY_STACK="$PROXY_STACK" \
+  SINGBOX_MODE="${SINGBOX_MODE:-fixed}" SINGBOX_VERSION="${SINGBOX_VERSION:-}" \
   bash "$BUILDER_DIR/scripts/extra-packages.sh"
 
 # 解析这两个包的上游最新版本，注入到刚落位的自带配方里 —— 这是「上游一发新版，
