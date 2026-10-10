@@ -742,8 +742,11 @@ CONFIG_LUCI_LANG_zh_Hans=y
 
 **首页那块温度是空的？**
 先 `cat /sys/class/thermal/thermal_zone*/type` 看内核暴露了哪些温度区 ——
-有哪个就显示哪个（`cpu-thermal` / `nss-*-thermal` / `wifi-thermal` 之类），
-另外 `hwmon` 里的传感器也会被收进来。无线温度要射频打开后才更新。
+有哪个就显示哪个。ipq8072（QHora-301W）在 `ipq8074.dtsi` 里定义的区包括
+`nss-top-thermal`、`nss0-thermal`、`nss1-thermal`、`wcss-phya0-thermal`、
+`wcss-phya1-thermal`、`wcss-phyb0-thermal`、`wcss-phyb1-thermal`
+（**`wcss-*` 就是无线子系统，也就是 WiFi 温度** —— 射频没开时读数不动是正常的）。
+`hwmon` 里的传感器也会被一并收进来。
 
 **「状态 → NSS Offload」为什么是英文？**
 这个页面不是 luci feed 里的应用，而是 NSS 分支主树 `package/nss/nss-tools` 附带的
