@@ -226,6 +226,17 @@ sshd -T | grep -Ei 'permitrootlogin|passwordauth|permitempty'   # 期望 yes / y
 之后的位置才能覆盖主配置；`sshd_config.d/` 里的文件权限太松（group/other 可写）
 会导致**整份配置被拒**，必须 `0600`。
 
+**设备是旧 build、此刻还没有 shell 怎么办**（鸡生蛋问题，三条路都不用拆机）：
+
+1. LuCI `系统 → 软件包` 装 `luci-app-ttyd` → `系统 → 终端`，在网页里跑上面的命令；
+2. **串口控制台**（USB-TTL，刷机本来就用）回车即进 shell —— 最快；
+3. failsafe 模式：`/lib/preinit/99_10_failsafe_sshd` 在 dropbear 缺席时会临时起 sshd，
+   其配置写死 `PermitRootLogin yes` + `PermitEmptyPasswords yes` ⇒ 可以**空密码**
+   `ssh root@192.168.1.1`（failsafe 网段是 `192.168.1.1`，不是 `192.168.35.1`）。
+
+注意：只设密码**不解决**旧 build 的问题 —— `PermitRootLogin prohibit-password`
+和密码是否存在无关，必须先放开这一项。
+
 安全性：`PermitRootLogin yes` 只把密码爆破面暴露给**能连上 LAN 的人**，和 LuCI 原本的
 暴露面一致。想更稳就走公钥 —— `prohibit-password` 本来就允许 root 用公钥登录，把
 `id_ed25519.pub` 追加到 `/root/.ssh/authorized_keys`（`chmod 700 /root/.ssh`、
