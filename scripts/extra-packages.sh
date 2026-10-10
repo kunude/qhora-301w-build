@@ -19,10 +19,35 @@
 # （实测 net/ddns-go 与 net/msd_lite 都是 404）。既然两边都不合适，
 # 就自己写配方直接引用上游源码。
 #
-# ── ② luci-app-ddns-go / luci-app-msd_lite（纯前端）→ ImmortalWrt ─
-# 它们只是页面（JS / ucode / 翻译），没有独立的"上游源码仓库"可指，抄一份到
-# 本仓库只会让上游的界面更新跟不进来。它们通过
-# LUCI_DEPENDS:=+ddns-go / +msd_lite 依赖上面那两个包，包名没变，照样接得上。
+# ── ② ImmortalWrt 的 luci 前端 → 稀疏检出 immortalwrt/luci ──────
+# 三类东西都在这个仓库里，都只有"抄上游"这一条路（没有独立的源码仓库可指，
+# 自己抄一份到本仓库只会让上游更新跟不进来）：
+#
+#   applications/luci-app-ddns-go / -msd_lite（+ homeproxy 版还有 -homeproxy）
+#     只是页面（JS / ucode / 翻译），靠 LUCI_DEPENDS:=+ddns-go / +msd_lite
+#     接上面 ① 里那两个包，包名没变，照样接得上。
+#
+#   modules/luci-base + modules/luci-mod-status ← 首页「CPU 占用率 / 温度」的来源
+#     官方 openwrt/luci 的首页（luci-mod-status 的 10_system.js）只有主机名、
+#     型号、内核、时间、运行时长、负载均值，**没有** CPU 占用率和温度；
+#     内存是标准 20_memory.js 给的。
+#     ImmortalWrt 那两行不是"多一个包"，而是三处配套改动：
+#       ① luci-base 的 rpcd ucode 插件（root/usr/share/rpcd/ucode/luci）
+#          比上游多出 getTempInfo / getCPUInfo / getCPUUsage / getCPUBench，
+#          分别 popen 执行 /sbin/tempinfo、/sbin/cpuinfo、`top -n1|awk …`、
+#          读 /etc/bench.log。（上游那份的 luci.c 与 immortalwrt 逐字节相同，
+#          这几个方法**不在** rpcd-mod-luci 里，只在 luci-base 的这个 ucode 里。）
+#       ② luci-mod-status 的 10_system.js 把这些值画进「系统」块 ——
+#          所以温度和 CPU 出现在页面**顶部**，内存仍由 20_memory.js 排第二块。
+#       ③ 两包各自的 acl.d/*.json 补上授权（luci-mod-status.json 里加了
+#          getCPUBench / getCPUUsage / getOnlineUsers）。
+#     /sbin/tempinfo、/sbin/cpuinfo 由 ① 段的 autocore 提供，两边正好凑齐。
+#     **必须成对替换**：只换 luci-mod-status 会调不到 ubus 方法（显示空），
+#     只换 luci-base 则没人画那两行。
+#     风险已核对：两个目录在两边的**文件清单与 Makefile 完全一致**
+#     （luci-base 各 136 个文件、零增删），ucode 插件的 import 也只有
+#     fs/uci/ubus 与 luci-base 自带的 luci.sys / luci.core / luci.version /
+#     luci.zoneinfo —— 同包发布，不会缺模块。
 #
 # ── ③ passwall2（项目 + 依赖组件）→ 上游自己的仓库 ───────────────
 # 注意仓库归属：passwall 项目已从个人账号 xiaorouji 迁到
@@ -170,9 +195,15 @@ done < <(find "$OWN_ROOT" -type f -name Makefile -print0 | sort -z)
 log "自带配方落位完成，共 $own_count 个"
 
 # ══════════════════════════════════════════════════════════════
-# ② ImmortalWrt 的纯前端包（只取 luci 那一半）
+# ② ImmortalWrt 的 luci 前端（只取 luci 那一半）
 # ══════════════════════════════════════════════════════════════
 LUCI_PATHS=(applications/luci-app-ddns-go applications/luci-app-msd_lite)
+
+# 首页「CPU 占用率 / 温度」两行。**必须成对替换**，理由见文件头 ②：
+#   只换 luci-mod-status → 调用 luci.getTempInfo 报 ACL/方法不存在，显示空；
+#   只换 luci-base       → 有数据但没人画那两行。
+# 与 PROXY_STACK 无关：autocore 两个 profile 都编、files/ 也共用，所以两边都换。
+LUCI_PATHS+=(modules/luci-base modules/luci-mod-status)
 
 # HomeProxy 也在这条路上：它同样没有独立的"上游源码仓库"可指，
 # 整包（主程序 + init + rpcd 后端 + 视图 + po）都躺在 immortalwrt/luci 里。
@@ -203,6 +234,20 @@ sparse_clone() {
 
 sparse_clone "$IMM_LUCI" "$WORK/luci" "${LUCI_PATHS[@]}"
 for rel in "${LUCI_PATHS[@]}"; do place "$WORK/luci" feeds/luci "$rel" "$rel" "ImmortalWrt 前端"; done
+
+# 硬断言：首页那两行（CPU 占用率 / 温度）完全依赖 luci-base 的 rpcd ucode 插件，
+# 上游哪天把方法挪走或改名，就**直接中断构建** —— 否则会悄悄编出一份首页
+# 既没有温度也没有 CPU 的固件（这台设备刷完才发现，排查成本很高）。
+HP_UCODE="feeds/luci/modules/luci-base/root/usr/share/rpcd/ucode/luci"
+[[ -f "$HP_UCODE" ]] || die "luci-base 的 rpcd ucode 插件没落位：$HP_UCODE"
+for m in getTempInfo getCPUInfo getCPUUsage; do
+  grep -q "$m" "$HP_UCODE" \
+    || die "luci-base ucode 里没有 $m（首页温度/CPU 就靠它）—— 检查 $IMM_LUCI@$IMM_REF 的 modules/luci-base"
+done
+HP_ACL="feeds/luci/modules/luci-mod-status/root/usr/share/rpcd/acl.d/luci-mod-status.json"
+grep -q "getCPUUsage" "$HP_ACL" \
+  || die "luci-mod-status 的 ACL 没授权 getCPUUsage，首页 CPU 占用率会是空的"
+log "  首页温度/CPU 已就位：getTempInfo / getCPUInfo / getCPUUsage（luci-base + luci-mod-status）"
 
 # ══════════════════════════════════════════════════════════════
 # ③ 代理栈的核心组件

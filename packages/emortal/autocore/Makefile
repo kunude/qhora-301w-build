@@ -8,12 +8,14 @@
 #   files/cpuinfo    被 ubus 方法 luci.getCPUInfo  执行，输出 CPU 型号
 # 外加一份 ACL（files/luci-mod-status-autocore.json），把这两个方法授权给 LuCI 前端。
 #
-# 注意：**只装这个包并不会让首页出现温度**。上面那两个 ubus 方法本身是
-# ImmortalWrt 往 luci-base 的 ucode 插件里加的补丁，官方 openwrt/luci 没有；
-# 本仓库的首页温度走自写的 files/www/.../status/include/95_qhora_hw.js 直读
-# sysfs，不依赖 ubus。这里编入 autocore 是为了拿到与 ImmortalWrt 同源的
-# /sbin/tempinfo、/sbin/cpuinfo（命令行可直接执行），并为将来接那套 ubus
-# 前端留出可能性。
+# 注意：**只装这个包并不会让首页出现温度**。首页那两行要三处凑齐：
+#   ① 本包           提供 /sbin/tempinfo、/sbin/cpuinfo（+ 授权 ACL）
+#   ② luci-base      的 rpcd ucode 插件提供 ubus 方法 luci.getTempInfo /
+#                    luci.getCPUInfo / luci.getCPUUsage（popen 上面那两个脚本）
+#   ③ luci-mod-status 的 10_system.js 把取到的值画进「状态 → 总览」的「系统」块
+# ② ③ 是 ImmortalWrt 相对官方 openwrt/luci 的差异，由 scripts/extra-packages.sh
+# 的 ② 段从 immortalwrt/luci 稀疏检出，与本包成对生效（缺任一环就显示不出来）。
+# 本仓库早期版本这里走的是自写的 95_qhora_hw.js 直读 sysfs，已改为上游原生方案。
 #
 # 纯脚本包：Build/Compile 为空、没有 PKG_SOURCE，既不下载也不编译任何东西。
 # 本仓库这份与上游 master 逐字节一致（2026-10-10 取的）；上游更新时按需

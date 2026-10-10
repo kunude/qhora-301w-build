@@ -464,8 +464,11 @@ jobs:
           #
           # statistics 三个：CPU/内存/温度图表（collectd-mod-thermal 不在
           # luci-app-statistics 的默认依赖里，必须显式选）。
-          # autocore 是 ImmortalWrt 首页温度那一行背后的包，提供 /sbin/tempinfo
-          # 与 /sbin/cpuinfo（纯脚本，配方抄在本仓库 packages/emortal/autocore/）。
+          # autocore 是首页「Temperature / CPU usage (%)」两行的数据源，提供
+          # /sbin/tempinfo 与 /sbin/cpuinfo（纯脚本，配方抄在本仓库
+          # packages/emortal/autocore/）。光有它不够：那两行还要 ImmortalWrt 版
+          # luci-base 的 rpcd ucode 插件 + luci-mod-status 的 10_system.js，
+          # 由 scripts/extra-packages.sh 的 ② 段一并稀疏检出（那边有硬断言）。
           # ucode-mod-math 是**必须**的：homeproxy 的 generate_client.uc 第 11 行
           # 写着 `import { isnan } from 'math'`，而上游 LUCI_DEPENDS 漏声明了这个模块。
           # 少了它，固件刷进去后 HomeProxy 起不来，报

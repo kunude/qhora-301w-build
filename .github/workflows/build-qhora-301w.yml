@@ -422,8 +422,11 @@ jobs:
           # shadowsocks-rust-sslocal = passwall2 的 SS-Rust 节点要 exec 的
           # /usr/bin/sslocal（缺它运行日志会报 sslocal not found）。
           # 这里**故意没有 xray-core** —— 本轮起不编 xray（见 configs/common.config）。
-          # autocore 是 ImmortalWrt 首页温度那一行背后的包，提供 /sbin/tempinfo
-          # 与 /sbin/cpuinfo（纯脚本，配方抄在本仓库 packages/emortal/autocore/）。
+          # autocore 是首页「Temperature / CPU usage (%)」两行的数据源，提供
+          # /sbin/tempinfo 与 /sbin/cpuinfo（纯脚本，配方抄在本仓库
+          # packages/emortal/autocore/）。光有它不够：那两行还要 ImmortalWrt 版
+          # luci-base 的 rpcd ucode 插件 + luci-mod-status 的 10_system.js，
+          # 由 scripts/extra-packages.sh 的 ② 段一并稀疏检出（那边有硬断言）。
           WANT="msd_lite luci-app-msd_lite luci-i18n-msd_lite-zh-cn \
                 ddns-go luci-app-ddns-go luci-i18n-ddns-go-zh-cn \
                 wireguard-tools luci-proto-wireguard kmod-wireguard \

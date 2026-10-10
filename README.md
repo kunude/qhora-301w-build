@@ -278,8 +278,8 @@ service id 与密钥）。自动更新失败时 `update_subscriptions.uc` 会跳
 | **WireGuard** | 仅装好 | 无常驻服务；到 `网络 → 接口` 新建一个 `wg` 协议接口即可 |
 | **passwall2 / HomeProxy** | 已预置，未启用 | 见上两节 |
 | **statistics** | 开机自启 | `状态 → 统计` 有 CPU / **温度** / 内存 / 接口流量 / 无线曲线。温度采集由 uci-defaults 默认打开 |
-| **首页硬件区块** | 装好即生效 | `状态 → 总览` 底部多出「CPU / 温度 / 内存」，**不依赖 collectd**，开机就有数（与统计页的历史曲线是两回事） |
-| **autocore** | 装好即生效 | `tempinfo`（`CPU: 52.3°C, WiFi: 61.0°C`）与 `cpuinfo` 两个脚本 |
+| **首页 CPU / 温度** | 装好即生效 | `状态 → 总览` 的「系统」块里**顶部**就有 `CPU usage (%)` 与 `Temperature`；内存由标准「内存」块紧随其后。走的是 ImmortalWrt 原生实现，**不依赖 collectd**（与统计页的历史曲线是两回事） |
+| **autocore** | 装好即生效 | 提供 `/sbin/tempinfo`（`CPU: 52.3°C, WiFi: 61.0°C`）与 `/sbin/cpuinfo` —— 上面那两行的数据源 |
 
 LuCI 默认简体中文。`状态 → NSS Offload` 那一页是英文 —— 它是 NSS 主树里的纯 JS 页面，
 不走 luci.mk，没有翻译文件，语言开关对它无效，这是上游现状。
@@ -405,10 +405,22 @@ HomeProxy 工作流的「校验功能包」清单里也点名核对它 —— �
 - **构建超时（6 小时）** —— 首次没有 ccache 最慢。直接重跑一次，`dl` 与 ccache 会复用。
 - **artifact 里没有 sysupgrade 镜像** —— 工作流在"收集并校验产物"那步就 `exit 1` 报出来，
   不会静默给你空包。
-- **首页硬件区块显示 `?`** —— rpcd 拒读：确认 `/usr/share/rpcd/acl.d/qhora-overview.json`
-  在固件里，然后退出重新登录 LuCI 让会话重取 ACL。
-- **首页温度某些项是空的** —— `cat /sys/class/thermal/thermal_zone*/type` 看内核暴露了哪些；
-  `wcss-*` 是 WiFi 子系统，射频没开时读数不动属正常。
+- **首页没有 `Temperature` / `CPU usage (%)` 这两行** —— 它们是**三处配套**的结果，
+  缺一环就整行不见（见第三节）：
+  1. `autocore` 提供 `/sbin/tempinfo`、`/sbin/cpuinfo`；
+  2. ImmortalWrt 版 `luci-base` 的 rpcd ucode 插件提供 ubus `luci.getTempInfo` /
+     `getCPUInfo` / `getCPUUsage`（官方 openwrt/luci **没有**这几个方法）；
+  3. ImmortalWrt 版 `luci-mod-status` 的 `10_system.js` 负责把它们画出来。
+  设备上按顺序自查：`/sbin/tempinfo` 有输出 → 数据源 OK，问题在 ②③；
+  `ubus -v list luci | grep getTempInfo` 有 → ② OK；再看 LuCI 里那一块有没有渲染（③）。
+  三条命令都给空 → 会话 ACL 没刷：`/etc/init.d/rpcd restart` 后**退出重新登录** LuCI。
+- **`/sbin/tempinfo` 这个文件不存在** —— 配方里它只对 `ipq% / mediatek% / qualcommax%`
+  目标安装，QHora 是 qualcommax ✓；真缺失说明刷的是更早的 build。
+- **温度只有 `CPU: xx°C`，没有 WiFi** —— `cat /sys/class/ieee80211/phy*/hwmon*/temp1_input`
+  看 WiFi 温区在不在；射频没开时读数本来就不动。
+- **首页那两行在页面最底部、或出现两块内存** —— 那是早期版本留下的自写 JS
+  （`/www/luci-static/resources/view/status/include/95_qhora_hw.js`）还在。
+  从 2026-10-10 起已改为上游原生方案并删除该文件，刷新 build 即恢复正确顺序。
 - **HomeProxy 起不来，日志报 `Unable to resolve path for module 'math'`** —— 缺 `ucode-mod-math`
   （见第五节）。早期 build 没带这个包；设备上 `apk add ucode-mod-math` 后重启 HomeProxy 即可。
 - **passwall2 日志报 `sslocal not found`** —— 节点类型是 `SS-Rust` 但固件里没有 `sslocal`。
