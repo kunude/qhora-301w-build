@@ -17,16 +17,19 @@
 
 ```
 .
-├── .github/workflows/build-qhora-301w.yml   # 编译工作流（入口）
+├── .github/workflows/
+│   ├── build-qhora-301w.yml                 # 编译工作流（主线：passwall2 版）
+│   └── build-qhora-301w-homeproxy.yml       # 同一套流水线的 HomeProxy 版（见第五节末）
 ├── configs/
 │   ├── common.config                        # NSS 卸载栈 + 通用选项 + 附加功能包
+│   ├── homeproxy.config                     # 覆盖层：把 passwall2 那组换成 HomeProxy
 │   └── qhora_301w.config                    # 机型：target/子目标/设备/内存档位
 ├── packages/net/                            # 本仓库自带的包配方（直接引用上游源码）
 │   ├── ddns-go/                             #   Makefile + files/（init、UCI 默认配置）
 │   └── msd_lite/                            #   同上
 ├── scripts/
 │   ├── prepare-build.sh                     # 组装 .config、跑 defconfig、校验、叠加覆盖文件
-│   ├── extra-packages.sh                    # 把自带配方 / ImmortalWrt 前端 / passwall2 放进 feed 目录树
+│   ├── extra-packages.sh                    # 把自带配方 / ImmortalWrt 前端 / 代理栈放进 feed 目录树
 │   ├── resolve-versions.sh                  # 构建时解析上游最新版本，注入到上面两个配方
 │   └── push-to-github.sh                    # 本地一键推送脚本
 ├── files/                                   # 原样叠加进固件的覆盖文件
@@ -407,6 +410,97 @@ SS / SSR / VMess / VLESS / Trojan / Hysteria2 / WireGuard，`_shunt` 分流也�
 取版本字段时按 `PKG_VERSION` → `PKG_SOURCE_DATE` → 第一个 `*_VER`（有的组件用
 `GEOIP_VER` 之类，配方里根本没有 `PKG_VERSION`）依次回退，都取不到就显示 `-` ——
 如实反映"这份配方没有可直接读的版本号"，不编造。
+
+### HomeProxy（并行的第二条构建线）
+
+除了上面那条 passwall2 主线，仓库里还有一条**并行的构建线**：只换代理栈，其余一切
+不变（NSS 卸载栈、ddns-go、msd_lite、WireGuard、statistics、autocore、`files/`
+覆盖、target / device 全都一样）。
+
+```
+.github/workflows/build-qhora-301w-homeproxy.yml
+configs/homeproxy.config
+```
+
+**它不是 fork 出来的第二套逻辑**，而是给同一份脚本加了个开关：环境变量
+`PROXY_STACK`（默认 `passwall2`）。工作流里设成 `homeproxy`，`prepare-build.sh` 与
+`extra-packages.sh` 就切到另一支 —— 主线那份的行为一字未改，两边的踩坑经验
+（日志缓冲、注解配额、符号校验、ccache key）也全都共用。
+
+| | 主线 | HomeProxy 版 |
+|---|---|---|
+| 代理前端 | `luci-app-passwall2`（来自 `Openwrt-Passwall/openwrt-passwall2`） | `luci-app-homeproxy`（来自 `immortalwrt/luci`） |
+| 依赖组件 | 17 个（chinadns-ng / geoview / tcping / v2ray-geodata / ss-rust …） | **没有**：上游 `LUCI_DEPENDS` 只有 `+sing-box +firewall4 +kmod-nft-tproxy +ucode-mod-digest` |
+| sing-box | passwall-packages 那份（1.14.x） | **`immortalwrt/packages` 那份（1.12.25）** |
+| DNS / 分流 | chinadns-ng + dnsmasq-full + nftset | HomeProxy 自带的 sing-box DNS（5330-5333）+ nftables 的 china_ip4 内核快路径 |
+| 构建时间 | 长（要拉 Rust 工具链编 `sslocal`） | 短（配方里没有 Rust 依赖） |
+
+HomeProxy 是**单包自包含**的：主程序（`/etc/init.d/homeproxy`、`/etc/homeproxy/scripts/*`）、
+rpcd 后端、LuCI 视图全在 `applications/luci-app-homeproxy` 这一个目录里，所以引入它
+只需从 `immortalwrt/luci` 稀疏检出一个目录 —— 而那个 feed 本仓库早就在拉
+（为了 `luci-app-ddns-go` / `luci-app-msd_lite`）。
+
+#### 为什么连 sing-box 版本一起换（这条最容易踩）
+
+HomeProxy 生成的 client 配置里**仍写着 sing-box 1.13 已删除的 inbound 字段**
+（`sniff` / `sniff_override_destination` / `set_system_proxy`）。在 1.14 上
+`sing-box check` 直接报
+
+```
+FATAL: legacy inbound fields are deprecated in 1.11.0 and removed in 1.13.0
+```
+
+而 `/etc/init.d/homeproxy` 会据此 `return 1` —— **服务永远起不来**。这不是推测：
+在参考机（192.168.2.1）上实测过，包齐全、`main_node` 也配了，就是起不来；
+把那几个字段摘掉后同一份配置 `check` 零输出通过，说明问题**只**在这一处字段代差。
+
+三处来源的实测版本：
+
+| 来源 | sing-box |
+|---|---|
+| `openwrt/packages` master `net/sing-box` | 1.14.0 |
+| `openwrt-passwall-packages`（主线用的） | 1.14.0 |
+| `immortalwrt/packages` master `net/sing-box` | **1.12.25** |
+
+所以 HomeProxy 版在 `extra-packages.sh` 里从 `immortalwrt/packages` 取 `net/sing-box`
+落位，**覆盖**官方那份 —— 这就是 ImmortalWrt 自己配 HomeProxy 用的组合。
+`prepare-build.sh` 里另有一处对配方版本的显式检查：上游哪天把这份配方升到 1.13+，
+构建会在「准备构建环境」阶段发一条 warning 注解（那种情况下 homeproxy 会在启动时
+被它自己生成的配置卡死，属于运行期才暴露的问题，越早提示越好）。
+
+#### 覆盖层为什么必须写 `CONFIG_X=n`
+
+`configs/homeproxy.config` 是拼在 `common.config` **之后**的覆盖层。它"关掉" passwall2
+的写法**不能**用惯常的 `# CONFIG_X is not set`：
+
+```bash
+# prepare-build.sh 按"配置里最后一个赋值"取值，且只断言不以 =n 结尾的行
+cat 所有 CONFIGS | grep -E '^CONFIG_[A-Za-z0-9_-]+=' \
+  | awk -F= '{ last[$1] = $0 } END { for (s in last) print last[s] }' \
+  | grep -vE '=n$'
+```
+
+`# CONFIG_X is not set` 以 `#` 开头，会被那条 `grep '^CONFIG_…='` 过滤掉 —— 于是
+`common.config` 里原本的 `=y` 仍然是"最后一个值"，照样进断言清单；而它在最终
+`.config` 里已经被 defconfig 关掉了，**符号校验必然失败**。写成 `CONFIG_X=n` 才
+既真正关掉、又不进断言清单。
+
+#### 触发方式
+
+```
+Actions -> Build QHora-301W (NSS EDMA, HomeProxy) -> Run workflow
+```
+
+推送 `configs/homeproxy.config` 或那份工作流文件本身也会触发。**故意不监听
+`scripts/` `files/` `packages/`** —— 那几个目录一改，主线工作流本来就会跑，
+两条全量编译一起排队要等好几个小时；要让它跟着重编，手动跑一次即可。
+
+⚠️ 两条线的 `concurrency` 用的是**各自独立的 group**，别改成共用：实测往主线那个
+group 里挤，新进来的 run 会被 GitHub 直接判 `cancelled`（创建 1 秒后就没了，
+一个 step 都跑不到）。
+
+⚠️ HomeProxy 与 passwall2 **共用同一个 `/usr/bin/sing-box` 和同一套 nftables 透明
+代理**，两者只能同时启用一个 —— 切换时先停另一个。本固件里本来就只有 HomeProxy。
 
 ### 版本是"跟上游最新"还是"钉死"
 
