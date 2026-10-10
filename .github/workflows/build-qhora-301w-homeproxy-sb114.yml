@@ -255,6 +255,9 @@ jobs:
           fi
 
       # ── 可复现构建 ────────────────────────────────────────────
+      # 注意：下面两个 KBUILD_BUILD_* 只对**非内核**组件生效。内核版本串里的
+      # user@host 由 include/kernel.mk 以 make 变量覆盖环境变量，必须写在
+      # configs/common.config 的 CONFIG_KERNEL_BUILD_USER / _DOMAIN 里。
       - name: 设置可复现构建环境变量
         working-directory: openwrt
         run: |
