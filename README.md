@@ -547,6 +547,16 @@ HomeProxy 工作流的「校验功能包」清单里也点名核对它 —— �
   `grep -c 'model name' /proc/cpuinfo` 返回 **0** 就是中招（修好后应 ≥1，那一格变成
   `ARMv8 Processor rev N (v8l) x 4`）。注意它显示的其实是 **CPU 型号**、不是架构名 ——
   x86 上那一格显示的是 `Intel(R) Celeron...`，arm32 上是 `ARMv7 Processor rev N`。
+- **注解报 `defconfig 丢弃了 N 个配置请求的符号`，且符号都是 NSS 相关的** —— 十有八九是
+  上游改了 feed 的包名或删了包。2026-10-10 就撞过一次：feed 提交 `qca-mcs: remove` 把
+  `kmod-qca-mcs` 整个删了，我们 `configs/common.config` 里那一行随即变成必然失败
+  （HomeProxy 线只丢这 1 个符号）。**权威对照物是上游自己的
+  `JuliusBairaktaris/Qualcommax_NSS_Builder`** —— 它的 `devices/common/config`
+  与 `devices/ipq807x-1g/config` 就是本仓库 `configs/` 的源头，上游改包名时这两个
+  文件会同步更新。逐符号 diff 一下就定位了：
+  `devices/ipq807x-1g/config` 我们只少那 31 个别的机型，其余全一致。
+- **同一次推送里两条线丢的符号不一样** —— 说明上游正在连推多个提交，两条线
+  check out 到了中间的不同状态。等上游推完重跑即可，不用改我们的代码。
 - **HomeProxy 起不来，日志报 `Unable to resolve path for module 'math'`** —— 缺 `ucode-mod-math`
   （见第五节）。早期 build 没带这个包；设备上 `apk add ucode-mod-math` 后重启 HomeProxy 即可。
 - **passwall2 日志报 `sslocal not found`** —— 节点类型是 `SS-Rust` 但固件里没有 `sslocal`。
