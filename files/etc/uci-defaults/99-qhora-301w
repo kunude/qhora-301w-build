@@ -2,14 +2,36 @@
 #
 # QHora-301W 首次启动执行一次，执行成功后 OpenWrt 会自动删除本脚本。
 #
-# 只做最小改动：改主机名；把 ddns-go / msd_lite 从"装了但没开"变成"开机自启"。
+# 做这几件事：改主机名；把 LAN 网段改成 192.168.35.0/24；
+# 把 ddns-go / msd_lite 从"装了但没开"变成"开机自启"。
 # 无线默认关闭且没有密钥，需要自己到「网络 -> 无线」开起来并设置密码。
+#
+# 执行时机：本脚本由 /etc/init.d/boot（START=10）在启动早期跑，
+# 而 network 是 START=20 —— 所以下面改的 LAN 地址在「网络起来之前」
+# 就已经写进 uci，首次开机直接就是 192.168.35.1，不需要再重启一次。
+# （已在实际设备上核对过两个 START 值。）
 
 # ── 主机名 ──────────────────────────────────────────────────
 uci -q batch <<EOF
 set system.@system[0].hostname='QHora-301W'
 commit system
 EOF
+
+# ── LAN 网段：192.168.35.0/24 ───────────────────────────────
+# 默认镜像是 192.168.1.1，这里换成 192.168.35.1。
+# 用 /24 的 CIDR 写法，不管出厂那份 network 里 ipaddr 写的是带前缀
+# 还是另配 netmask，都能得到同样的 /24。
+# DHCP 范围不用动：/etc/config/dhcp 里 lan 的 start=100 limit=150 是
+# 相对网段算的，自动就是 192.168.35.100-249。
+#
+# 加了 network.lan 存在性判断：万一某个固件里 LAN 段不叫 lan，
+# 宁可不改，也不要让 uci 凭空多出一个名叫 lan 的空接口。
+if uci -q get network.lan >/dev/null 2>&1; then
+	uci -q set network.lan.ipaddr='192.168.35.1/24'
+	uci -q commit network
+else
+	logger -t qhora-init "network.lan 不存在，跳过 LAN 网段设置"
+fi
 
 # ── ddns-go ─────────────────────────────────────────────────
 # 这个包出厂是 enabled='0'，而 init 脚本的 start_service() 里还有一道

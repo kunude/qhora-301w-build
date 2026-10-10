@@ -1,0 +1,231 @@
+# ═══════════════════════════════════════════════════════════════════════════
+#  QHora-301W 出厂预置的 passwall2 配置
+#  ─────────────────────────────────────────────────────────────────────────
+#  来源：本仓库 files-passwall2/etc/config/passwall2，由 prepare-build.sh
+#        在叠加 files/ 之后按变体叠加进固件（只有 passwall2 版固件会带它）。
+#
+#  为什么这份文件不会被覆盖：
+#  luci-app-passwall2 的 /etc/uci-defaults/luci-app-passwall2 里是这样写的 ——
+#        [ ! -s "/etc/config/passwall2" ] && cp -f /usr/share/passwall2/0_default_config /etc/config/passwall2
+#  只在本文件「为空」时才拷出厂默认，所以我们的预置会原样保留。
+#
+#  已经配好的（全部来自一台实际在跑的参考机，逐字段搬运）：
+#    · 分流规则  Direct（国内 + Apple + 抖音 + 银行走直连）
+#                Proxy（geolocation-!cn 走代理）
+#                Reject（广告类域名拦截）
+#    · DNS       DoH 远程解析 + UseIP 策略 + 域名 bootstrap，走代理解析
+#    · 转发       nftables TPROXY（prefer_nft=1）+ 全端口 1:65535
+#    · 选路       URLTest 组（按延迟自动选最快节点，3 分钟一测）
+#    · 接线       分流节点 shunt：Reject→黑洞  Direct→直连  Proxy→URLTest 组
+#
+#  ❌ 没有配、需要你自己填的：节点本身（地址 / 端口 / 密码 / UUID / REALITY
+#     公钥等）。因为固件是公开仓库产物，凭据不能写进来。
+#     下面 node_vless / node_ss 两个模板，只填你实际用的那一个即可。
+#
+#  ⚠️ enabled 故意是 0（不自动启动）——
+#     节点还空着的时候，passwall2 会把 dnsmasq 的解析劫持到一条走不通的
+#     代理链上，症状是「国内能上、国外网站全打不开」，很像断网。
+#     填好节点后到 LuCI「服务 → PassWall2」把主开关打开（或 uci set
+#     passwall2.@global[0].enabled='1' && uci commit passwall2）。
+#
+#  ⚠️ 节点类型别选 Xray：本固件**不编译 xray-core**（只编 sing-box）。
+#     所以要填 VLESS / Trojan 这类，类型请用 sing-box；SS 用 SS-Rust。
+# ═══════════════════════════════════════════════════════════════════════════
+
+config global
+	# ↓ 填好节点后再改成 '1'（或直接用界面上的总开关）
+	option enabled '0'
+	option localhost_proxy '1'
+	option client_proxy '1'
+	option socks_enabled '0'
+	option acl_enable '0'
+	option log_node '1'
+	option loglevel 'error'
+	option auto_lang 'zh_cn'
+
+	# 主节点：指向下面的分流节点
+	option node 'mainshunt'
+	option node_socks_port '1070'
+
+	# ── DNS ────────────────────────────────────────────────────────────
+	# 直连侧策略；协议留空 = Auto（跟随上游默认）
+	option direct_dns_query_strategy 'UseIP'
+	# 代理侧用 DoH 解析，且这条 DoH 走代理出去（remote_dns_detour=remote）
+	option remote_dns_protocol 'doh'
+	option remote_dns_doh 'https://8.8.8.8/dns-query'
+	option remote_dns_query_strategy 'UseIP'
+	option remote_dns_detour 'remote'
+	option dns_hosts 'cloudflare-dns.com 1.1.1.1
+dns.google.com 8.8.8.8'
+	# 用 passwall2 接管 dnsmasq（国内走 chinadns-ng 判分，命中直连 IP 白名单
+	# 的走 nft 内核快路径，不再进 sing-box）
+	option dns_redirect '1'
+	option remote_rewrite_ttl '30'
+
+config global_haproxy
+	option balancing_enable '0'
+
+config global_delay
+	option start_daemon '1'
+	option start_delay '60'
+
+config global_forwarding
+	option tcp_redir_ports '1:65535'
+	option udp_redir_ports '1:65535'
+	option accept_icmp '0'
+	option prefer_nft '1'
+	option tcp_proxy_way 'tproxy'
+	option ipv6_tproxy '0'
+
+config global_xray
+	option sniffing_override_dest '0'
+	option fragment '0'
+	option noise '0'
+
+config global_other
+	option auto_detection_time 'tcping'
+	option show_node_info '0'
+
+config global_rules
+	# 走 sing-box rule-set（在线 .srs），不用 geosite.dat / geoip.dat
+	option geosite_update '0'
+	option geoip_update '0'
+	option v2ray_location_asset '/usr/share/v2ray/'
+	option geoip_url 'https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat'
+	option geosite_url 'https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat'
+	option update_week_mode '7'
+	option update_time_mode '4:00'
+
+config global_app
+	option geoview_file '/usr/bin/geoview'
+	option xray_file '/usr/bin/xray'
+	option sing_box_file '/usr/bin/sing-box'
+
+config global_subscribe
+	option filter_keyword_mode '1'
+
+config global_singbox
+	option record_fragment '0'
+	option fragment '0'
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  ★ 节点模板 ①：VLESS + REALITY（推荐，抗封锁最好）
+#     要填的 5 项：address / port（默认 443）/ uuid / tls_serverName /
+#                  reality_publicKey + reality_shortId
+#     其余（协议、传输、TLS、uTLS 指纹、vision 流控）都已经设好，不用动。
+#     填完保存即可生效；不想用这个就把它留空（空 address 的节点不会被使用）。
+# ═══════════════════════════════════════════════════════════════════════════
+config nodes 'node_vless'
+	option remarks '① VLESS-REALITY（填入信息后可用）'
+	# 本固件不含 xray-core，这里必须用 sing-box 类型
+	option type 'sing-box'
+	option protocol 'vless'
+	# ↓↓↓ 填你的服务端地址（域名或 IP，不要带 https:// 和端口）↓↓↓
+	option address ''
+	option port '443'
+	# ↓↓↓ 填 UUID ↓↓↓
+	option uuid ''
+	option encryption 'none'
+	option flow 'xtls-rprx-vision'
+	option transport 'raw'
+	option tcp_guise 'none'
+	option tls '1'
+	option tls_allowInsecure '0'
+	# ↓↓↓ REALITY 伪装域名（SNI）↓↓↓
+	option tls_serverName ''
+	option reality '1'
+	# ↓↓↓ REALITY 公钥（public key）↓↓↓
+	option reality_publicKey ''
+	# ↓↓↓ REALITY short id ↓↓↓
+	option reality_shortId ''
+	option utls '1'
+	option fingerprint 'chrome'
+	option timeout '60'
+	option add_mode '2'
+	option group '1'
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  ★ 节点模板 ②：Shadowsocks（SS-Rust）
+#     要填的 3 项：address / port / password
+#     加密方式默认 aes-256-gcm，按你的服务端改。
+# ═══════════════════════════════════════════════════════════════════════════
+config nodes 'node_ss'
+	option remarks '② Shadowsocks（填入信息后可用）'
+	option type 'SS-Rust'
+	# ↓↓↓ 填你的服务端地址 ↓↓↓
+	option address ''
+	option port '8388'
+	option ss_method 'aes-256-gcm'
+	option method 'aes-256-gcm'
+	# ↓↓↓ 填密码 ↓↓↓
+	option password ''
+	option timeout '60'
+	option add_mode '2'
+	option group '1'
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  URLTest 自动选路组
+#  成员就是上面两个模板；哪个填好了就参与测速，按延迟自动用最快的那个。
+#  以后自己加节点，把它添进 urltest_node 列表即可（界面里能勾选）。
+#  想改用订阅：订阅更新出的节点是「分组」，更适合把 node_add_mode 改成
+#  batch 并用「选择分组」来动态纳入，不用一个个加。
+# ═══════════════════════════════════════════════════════════════════════════
+config nodes 'mainurltest'
+	option type 'sing-box'
+	option remarks '自动选择（URLTest）'
+	option protocol '_urltest'
+	option node_add_mode 'manual'
+	# 注意：列表型选项必须用 list，不能写成 option x 'a' 'b'
+	# （uci 的配置文件解析器只认 list 语法，单行多值会报 "too many arguments"）
+	list urltest_node 'node_vless'
+	list urltest_node 'node_ss'
+	option urltest_url 'https://www.google.com/generate_204'
+	option urltest_interval '3m'
+	option urltest_tolerance '50'
+	option urltest_idle_timeout '30m'
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  分流节点：把「规则组 → 出口」接起来
+#    Reject 组（广告域名）      → _blackhole  丢包
+#    Direct 组（国内/苹果/抖音） → _direct     直连
+#    Proxy  组（境外域名）      → _default    跟随下面的 default_node
+#    未命中任何规则的其余流量    → default_node
+#  ⇒ 国内直连、其余走代理，正是三年前那套「正常」的分流逻辑。
+#  ⚠️ default_node 千万不要改成 _direct —— 那会让未命中的域名全部直连，
+#     等于没有代理（这也是之前踩过的坑）。
+# ═══════════════════════════════════════════════════════════════════════════
+config nodes 'mainshunt'
+	option remarks '分流（直连 / 代理 / 拦截）'
+	option type 'sing-box'
+	option protocol '_shunt'
+	option write_ipset_direct '1'
+	option enable_geoview_ip '0'
+	option Reject '_blackhole'
+	option Direct '_direct'
+	option Proxy '_default'
+	option default_node 'mainurltest'
+
+# ── 分流规则组 ──────────────────────────────────────────────────────────
+# 用户显式要求的三层分流；规则本身是 sing-box rule-set 在线订阅
+# （GeoSite / GeoIP 的 .srs），命中哪一组就按分流节点的接线走。
+
+config shunt_rules 'Reject'
+	option remarks '广告拦截'
+	option network 'tcp,udp'
+	option domain_list 'rule-set:remote:https://raw.githubusercontent.com/SagerNet/sing-geosite/refs/heads/rule-set/geosite-category-ads-all.srs'
+
+config shunt_rules 'Direct'
+	option remarks '国内直连'
+	option network 'tcp,udp'
+	option domain_list 'rule-set:remote:https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs
+rule-set:remote:https://raw.githubusercontent.com/SagerNet/sing-geosite/refs/heads/rule-set/geosite-apple.srs
+rule-set:remote:https://raw.githubusercontent.com/SagerNet/sing-geosite/refs/heads/rule-set/geosite-apple%40cn.srs
+rule-set:remote:https://raw.githubusercontent.com/SagerNet/sing-geosite/refs/heads/rule-set/geosite-apple-update.srs
+rule-set:remote:https://raw.githubusercontent.com/SagerNet/sing-geosite/refs/heads/rule-set/geosite-category-bank-cn.srs
+rule-set:remote:https://raw.githubusercontent.com/SagerNet/sing-geosite/refs/heads/rule-set/geosite-douyin.srs'
+	option ip_list 'rule-set:remote:https://raw.githubusercontent.com/SagerNet/sing-geoip/refs/heads/rule-set/geoip-cn.srs'
+
+config shunt_rules 'Proxy'
+	option remarks '境外走代理'
+	option network 'tcp,udp'
+	option domain_list 'rule-set:remote:https://raw.githubusercontent.com/SagerNet/sing-geosite/refs/heads/rule-set/geosite-geolocation-!cn.srs'

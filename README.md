@@ -32,16 +32,22 @@
 │   ├── extra-packages.sh                    # 把自带配方 / ImmortalWrt 前端 / 代理栈放进 feed 目录树
 │   ├── resolve-versions.sh                  # 构建时解析上游最新版本，注入到上面两个配方
 │   └── push-to-github.sh                    # 本地一键推送脚本
-├── files/                                   # 原样叠加进固件的覆盖文件
-│   ├── etc/uci-defaults/99-qhora-301w       #   首次启动的设置（主机名、启用服务）
+├── files/                                   # 原样叠加进固件的覆盖文件（两个变体共用）
+│   ├── etc/uci-defaults/99-qhora-301w       #   首次启动的设置（主机名、LAN 网段、启用服务）
 │   ├── etc/uci-defaults/99-luci-statistics  #   打开 collectd 的温度采集
 │   ├── www/luci-static/resources/view/status/include/95_qhora_hw.js
 │   │                                        #   首页「CPU / 温度 / 内存」区块（见第六节 7）
 │   └── usr/share/rpcd/acl.d/qhora-overview.json
 │                                            #   上面那个 JS 读 /proc、/sys 的 rpcd 授权
+├── files-passwall2/                         # 变体专属覆盖层：只叠进 passwall2 版固件
+│   └── etc/config/passwall2                 #   passwall2 出厂预置：分流/DNS/选路，节点留空
 ├── .gitattributes / .gitignore
 └── README.md
 ```
+
+> 把 passwall2 的出厂配置放在 `files-passwall2/` 而不是 `files/`，是为了让它只出现在
+> passwall2 版固件里 —— HomeProxy 版不需要它。`prepare-build.sh` 会先叠 `files/`，
+> 再叠 `files-<PROXY_STACK>/`（对方目录不存在就跳过），后者同名文件覆盖前者。
 
 `configs/` 里的内容取自上游作者自己维护的
 [Qualcommax_NSS_Builder](https://github.com/JuliusBairaktaris/Qualcommax_NSS_Builder)
@@ -138,11 +144,13 @@ git push -u origin main
    bootm
    ```
 
-4. 起来后路由器默认地址 `192.168.1.1`，`root` 无密码。把 sysupgrade 镜像传上去：
+4. 起来后路由器地址是 **`192.168.35.1`**（本仓库把出厂默认的 `192.168.1.1` 换掉了，
+   见第四节），`root` 无密码。电脑重新获取一次 IP（DHCP 会发 `192.168.35.x`），
+   然后把 sysupgrade 镜像传上去：
 
    ```sh
-   scp openwrt-...-qnap_301w-squashfs-sysupgrade.bin root@192.168.1.1:/tmp/
-   ssh root@192.168.1.1
+   scp openwrt-...-qnap_301w-squashfs-sysupgrade.bin root@192.168.35.1:/tmp/
+   ssh root@192.168.35.1
    sysupgrade -n /tmp/openwrt-...-qnap_301w-squashfs-sysupgrade.bin
    ```
 
@@ -203,6 +211,57 @@ uci set nss.general.enabled='0'; uci commit nss; reboot
 
 **Wi-Fi 默认是关闭的，且没有密码。** 用网线连上后到 `网络 → 无线` 自己开射频并设密钥。
 
+### 默认 LAN 地址是 `192.168.35.1`
+
+出厂镜像是 `192.168.1.1`，本仓库在 `files/etc/uci-defaults/99-qhora-301w` 里改成
+**`192.168.35.1/24`**（DHCP 段随之变成 `192.168.35.100-249`，因为 `/etc/config/dhcp`
+里 lan 的 `start=100 limit=150` 是按网段算的）。
+
+时间点很关键：这个 uci-defaults 由 `/etc/init.d/boot`（`START=10`）执行，而 `network`
+是 `START=20` —— **在网络起来之前就写进 uci 了**，所以首次开机直接就是 `192.168.35.1`，
+不需要重启第二次（两个 START 值在实际设备上核对过）。
+
+### passwall2 出厂预置：只填节点信息就能用
+
+passwall2 版固件里带了一份完整的 `/etc/config/passwall2`
+（源文件 `files-passwall2/etc/config/passwall2`，逐字段搬自一台实际在跑的参考机）。
+**除了节点本身，分流 / DNS / 转发 / 选路全都配好了：**
+
+| 项 | 预置内容 |
+|---|---|
+| 直连 | `geosite-cn` + Apple 系（`apple`、`apple@cn`、`apple-update`）+ `geosite-category-bank-cn` + `geosite-douyin` + `geoip-cn` |
+| 代理 | `geosite-geolocation-!cn`；**没命中任何规则的流量也走代理** |
+| 拦截 | `geosite-category-ads-all` → 黑洞 |
+| DNS | DoH（`https://8.8.8.8/dns-query`）**走代理**去解析；直连侧 `UseIP`；`dns_redirect=1` 由 passwall2 接管 dnsmasq |
+| 转发 | nftables TPROXY（`prefer_nft=1`），TCP/UDP 全端口 |
+| 选路 | URLTest 组：`urltest_url=https://www.google.com/generate_204`，3 分钟一测、容差 50ms，自动用延迟最低的节点 |
+| 接线 | 分流节点 `mainshunt`：Reject→黑洞、Direct→直连、Proxy→URLTest 组 |
+
+**没预置的是节点凭据**（地址 / 端口 / 密码 / UUID / REALITY 公钥），因为固件是公开
+仓库的产物，写进去等于把账号贴到网上。文件里留了两个模板节点：
+
+- `node_vless` —— VLESS + REALITY，`type=sing-box`，协议/传输/uTLS 指纹/vision 流控都已设好，
+  只需填 `address` / `uuid` / `tls_serverName` / `reality_publicKey` / `reality_shortId`
+- `node_ss` —— Shadowsocks，`type=SS-Rust`，只需填 `address` / `port` / `password`
+
+用法：`服务 → Pass Wall 2 → 节点列表`，编辑对应模板填完保存；确认 `地址` 那栏不再是空的后，
+把主界面的总开关打开（相当于 `uci set passwall2.@global[0].enabled='1' && uci commit passwall2`）。
+不用的那个模板留空即可 —— 地址为空的节点不会被选中。
+
+三点必须注意：
+
+1. **节点类型别选 `Xray`**。本固件**不编译 xray-core**（只编 sing-box，见第五节），
+   类型选 `Xray` 的节点会因为没有 `/usr/bin/xray` 而启动失败。VLESS / VMess / Trojan /
+   Hysteria2 都请用 `sing-box` 类型；SS 用 `SS-Rust`（走 `sslocal`）。
+   如果你手上的节点是从别处导出的 `Xray` 类型，把下拉框改成 `sing-box` 再保存即可。
+2. **`enabled` 故意留 `0`**。节点还空着的时候，passwall2 会把 dnsmasq 的解析劫持到一条
+   走不通的代理链上，症状是"国内正常、国外网站全打不开"，很像断网。填好节点再打开开关，
+   不会遇到这个现象。
+3. 走**订阅**的话：在 `服务 → Pass Wall 2 → 订阅` 里加一条、更新出节点后，有两种接法 ——
+   ① 把节点的「分组」设成和 URLTest 组一致再手动勾进成员列表；
+   ② 或者把 URLTest 节点的「节点添加方式」从 `manual` 改成 `batch`，用「选择分组」动态纳入
+   （订阅更新后自动跟上，不用每次改成员列表）。
+
 ### 已启用的附加服务
 
 | 服务 | 状态 | 怎么用 |
@@ -210,7 +269,7 @@ uci set nss.general.enabled='0'; uci commit nss; reboot
 | **ddns-go** | 开机自启 | Web 界面 `http://<路由器IP>:9876`，在里面添加 DDNS 记录。数据在 `/etc/ddns-go/config.yaml` |
 | **msd_lite** | 开机自启 | 客户端按 `http://<路由器IP>:7088/udp/<组播地址>:<端口>` 取流。**接收组播的网卡需要在 `服务 → msd_lite` 里选**（见下） |
 | **WireGuard** | 仅装好 | 没有常驻服务，到 `网络 → 接口` 新建一个 `wg` 协议接口即可，内核模块会自动加载 |
-| **passwall2** | 装好，未启用 | `服务 → Pass Wall 2` 里加节点/订阅后手动起。核心只编了 **`sing-box`**（原生支持 SS/SSR/VMess/VLESS/Trojan/Hysteria2，`_shunt` 分流也由它实现），外带 **`sslocal`**（Shadowsocks-Rust 客户端，SS-Rust 类型节点靠它启动）；**没有** xray（见第五节）。界面里缺的组件可在「组件更新」在线拉 |
+| **passwall2** | 已预置分流，未启用 | 分流规则 / DNS / 转发 / URLTest 选路都已随固件预置好，**只剩节点凭据要填**（见上一节）。填完在 `服务 → Pass Wall 2` 打开总开关即可。核心只编了 **`sing-box`**（原生支持 SS/SSR/VMess/VLESS/Trojan/Hysteria2，`_shunt` 分流也由它实现），外带 **`sslocal`**（Shadowsocks-Rust 客户端，SS-Rust 类型节点靠它启动）；**没有** xray（见第五节，所以节点类型别选 Xray）。界面里缺的组件可在「组件更新」在线拉 |
 | **statistics** | 开机自启 | `状态 → 统计` 里有 CPU（每核占用）、**温度**、内存、接口流量、无线的曲线图。温度采集默认是开的（uci-defaults 打开了 thermal 插件），如果想调去 `统计 → 设置` |
 | **首页硬件区块** | 装好即生效 | `状态 → 总览` 页底部多出一块「CPU / 温度 / 内存」：CPU 占用率（带当前频率）、每个温度传感器（`cpu-thermal` / `nss-*-thermal` / `wifi-thermal` …）、内存用量。是本仓库自己写的 include（`files/www/luci-static/resources/view/status/include/95_qhora_hw.js`），**不依赖 collectd**，开机就有数 —— 和上面 collectd 那套曲线图是两回事（一个看当前值，一个看历史） |
 | **autocore** | 装好即生效 | 两个命令行脚本：`tempinfo`（输出 `CPU: 52.3°C, WiFi: 61.0°C`）和 `cpuinfo`（CPU 型号）。就是 ImmortalWrt 首页温度那一行背后用的东西，本仓库把它同源抄了进来（见第六节 7）。首页显示仍由上面那块自写区块负责，不依赖它 |
@@ -257,7 +316,8 @@ cat /sys/class/thermal/thermal_zone*/type    # 固件里有哪些温度传感器
 | 开关某个内核选项 | `common.config` 加 `CONFIG_KERNEL_xxx=y` |
 | 换编译分支 | 工作流 `Run workflow` 时填 `upstream_ref`，或改 YAML 里 `UPSTREAM_REF` 的默认值 |
 | 用自己 fork 的源码 | 改 YAML `env.UPSTREAM_REPOSITORY` |
-| 系统默认配置（主机名、IP、无线、服务开关） | 往 `files/` 里按路径放文件，会原样叠加进镜像；首次启动脚本在 `files/etc/uci-defaults/` |
+| 系统默认配置（主机名、**LAN 网段**、无线、服务开关） | 往 `files/` 里按路径放文件，会原样叠加进镜像；首次启动脚本在 `files/etc/uci-defaults/`。LAN 网段在 `files/etc/uci-defaults/99-qhora-301w` 里（现在是 `192.168.35.1/24`） |
+| 改 passwall2 的出厂预置（分流规则 / DNS / 节点模板） | `files-passwall2/etc/config/passwall2`（**改完记得把 `address` 之类留空**，别把凭据提交上去）；这个目录只叠进 passwall2 版固件 |
 | 同时编多个机型 | 在 `configs/qhora_301w.config` 再加 `CONFIG_TARGET_DEVICE_qualcommax_ipq807x_DEVICE_xxx=y`，注意 RTL 相关的高危项见下 |
 
 自带配方不用登记：`extra-packages.sh` 是 `find packages -name Makefile` 扫出来的，
@@ -368,6 +428,12 @@ SS / SSR / VMess / VLESS / Trojan / Hysteria2 / WireGuard，`_shunt` 分流也�
 `route.rules` 实现的，日常用不到 xray，少编一个省下约 20MB 镜像和几分钟构建时间。
 （组件配方仍会被落位到 `feeds/packages/net/xray-core`，只是不选中、不编译 —— 想切回来
 就改这一个符号，再到工作流 `WANT` 清单里补回 `xray-core`。）
+
+**这个选择对用的人有一个直接后果**：passwall2 节点列表里的「类型」选 `Xray` 时，
+它会去执行 `/usr/bin/xray` 来起每个节点；固件里没有这个二进制，节点就起不来。
+所以本仓库出厂预置的节点模板用的是 `type=sing-box`（VLESS/REALITY 直接由 sing-box
+原生收发），SS 用 `type=SS-Rust`（走 `sslocal`）。从别处导入的 `Xray` 类型节点，
+把类型改成 `sing-box` 即可。详见第四节「passwall2 出厂预置」。
 
 ⚠️ **`sslocal`（Shadowsocks-Rust 客户端）必须编，不能省。** passwall2 里节点类型为
 `SS-Rust` 的节点是直接 exec `/usr/bin/sslocal` 的（`app.sh` 的 `ss-rust` 分支 →
@@ -721,7 +787,8 @@ cd openwrt
 
 # 下面这一步会自己做完全部准备工作：追加 nss feed、落位自带配方 + 两个 luci 前端
 # + passwall2 及其 17 个组件、解析 ddns-go/msd_lite 的上游最新版本、
-# 跑 feeds update/install、拼 .config、跑 defconfig、校验符号、叠加 files/。
+# 跑 feeds update/install、拼 .config、跑 defconfig、校验符号、
+# 叠加 files/ 以及变体覆盖层 files-<PROXY_STACK>/（默认 files-passwall2/）。
 export GH_TOKEN=<你的 GitHub token>   # 可选，但建议给：避免撞未认证 API 限额
 OPENWRT_DIR="$PWD" BUILDER_DIR="../qhora-301w-build" bash ../qhora-301w-build/scripts/prepare-build.sh
 

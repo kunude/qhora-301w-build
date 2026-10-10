@@ -11,7 +11,7 @@
 #   2. 把 configs/common.config + configs/qhora_301w.config 拼成 .config，跑 make defconfig
 #   3. 校验 defconfig 没有静默丢弃符号（Kconfig 在依赖不满足时会无声地去掉选项）
 #   4. 关闭 NSS feed 的整体打包（feeds.conf 里声明了，但我们只要 .config 里显式选的包）
-#   5. 叠加 files/ 覆盖文件
+#   5. 叠加 files/ 覆盖文件，再叠一层 files-<PROXY_STACK>/（变体专属）
 #
 # 必需的环境变量：
 #   OPENWRT_DIR      已检出的 OpenWrt 源码目录（必须是 git 工作区）
@@ -23,6 +23,8 @@
 #                    homeproxy 时额外拼接 configs/homeproxy.config（覆盖层），
 #                    并把 feed 断言换成 homeproxy 那一组；默认值下本文件
 #                    的行为与以前完全一致。传给 extra-packages.sh 的是同一个变量。
+#                    同时决定叠加哪个变体覆盖目录：files-passwall2/ 或
+#                    files-homeproxy/（不存在就跳过）。
 #   DDNS_GO_VERSION  钉死 ddns-go 版本，例如 6.17.7（默认跟随上游最新 release）
 #   MSD_LITE_SHA     钉死 msd_lite 的 commit sha（默认跟随上游 master HEAD）
 #
@@ -277,21 +279,29 @@ feed_name="$(awk '{print $2}' <<<"$NSS_FEED")"
 log "关闭 CONFIG_FEED_${feed_name}（只保留 .config 里显式选中的包）"
 sed -i "s/^CONFIG_FEED_${feed_name}=.*/# CONFIG_FEED_${feed_name} is not set/" .config
 
-# ── 5. 叠加 files/ ──────────────────────────────────────────
-if [[ -d "$BUILDER_DIR/files" ]]; then
-  log "叠加 files/ 覆盖文件"
+# ── 5. 叠加 files/ 与 files-<PROXY_STACK>/ ──────────────────
+# files/               两个变体共用（主机名、LAN 网段、首页硬件区块…）
+# files-<PROXY_STACK>/ 只给对应变体叠加。目前用于把 passwall2 的出厂
+#                      预置配置（etc/config/passwall2）只放进 passwall2 版，
+#                      免得 HomeProxy 版固件里躺着一份用不上的 passwall2 配置。
+# 目录不存在就跳过；先叠共用、后叠变体，变体里的同名文件覆盖共用。
+overlay_variant="$BUILDER_DIR/files-$PROXY_STACK"
+for d in "$BUILDER_DIR/files" "$overlay_variant"; do
+  [[ -d "$d" ]] || continue
+  log "叠加覆盖文件：$(basename "$d")/"
   mkdir -p files
   # 用 cp -a 而不是 rsync：GitHub runner 上两者都有，但本地 Windows/MSYS 环境
   # 通常没有 rsync，用 cp 可以两边通用。斜杠点号保证是"合并"而不是"替换"。
-  cp -a "$BUILDER_DIR/files/." files/
+  cp -a "$d/." files/
+done
+
+if [[ -d files/etc/ssh ]]; then
   # sshd_config 必须是 0600，否则 dropbear/openssh 会拒绝加载。
-  if [[ -f files/etc/ssh/sshd_config ]]; then
-    chmod 0600 files/etc/ssh/sshd_config
-  fi
-  # uci-defaults 里的脚本需要可执行位才会在首次启动时运行。
-  if [[ -d files/etc/uci-defaults ]]; then
-    chmod 0755 files/etc/uci-defaults/* 2>/dev/null || true
-  fi
+  [[ -f files/etc/ssh/sshd_config ]] && chmod 0600 files/etc/ssh/sshd_config
+fi
+# uci-defaults 里的脚本需要可执行位才会在首次启动时运行。
+if [[ -d files/etc/uci-defaults ]]; then
+  chmod 0755 files/etc/uci-defaults/* 2>/dev/null || true
 fi
 
 log "构建环境就绪：qualcommax/ipq807x → QNAP QHora-301W（qnap_301w）"

@@ -71,6 +71,8 @@ on:
     paths:
       - ".github/workflows/build-qhora-301w-homeproxy.yml"
       - "configs/homeproxy.config"
+      # 变体专属覆盖层（目前还没有 files-homeproxy/，先声明着）
+      - "files-homeproxy/**"
 
 # 用**独立**的 concurrency group，不要和主线共用。
 # 实测教训：共用一个 group 时，主线那边只要有 run 在跑 / 排队，本工作流新进来的

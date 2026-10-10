@@ -57,6 +57,8 @@ on:
       - "packages/**"
       - "scripts/**"
       - "files/**"
+      # 变体专属覆盖层：passwall2 的出厂预置配置放在这里
+      - "files-passwall2/**"
   schedule:
     # GitHub 的 cron 用 UTC；16:30 UTC = 次日 00:30 东八区
     - cron: "30 16 * * 0"
