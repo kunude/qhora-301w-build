@@ -14,6 +14,8 @@
 #   5. 扫描出厂预置（files*/etc/config/），命中节点凭据 / 订阅链接就中断构建
 #      —— 固件是公开产物，凭据进来就等于公开
 #   6. 叠加 files/ 覆盖文件，再叠一层 files-<PROXY_STACK>/（变体专属）
+#   7. 把 patches/kernel/<KERNEL_PATCHVER>/ 下的补丁注入上游内核源码树
+#      （当前只有一条：arm64 的 /proc/cpuinfo 补 model name，修首页「架构」显示 ?）
 #
 # 必需的环境变量：
 #   OPENWRT_DIR      已检出的 OpenWrt 源码目录（必须是 git 工作区）
@@ -317,5 +319,61 @@ fi
 if [[ -d files/etc/uci-defaults ]]; then
   chmod 0755 files/etc/uci-defaults/* 2>/dev/null || true
 fi
+
+# ── 7. 注入 arm64 内核补丁：让 /proc/cpuinfo 带 model name ────
+# 现象：首页「架构」那一格显示 "? x 4 (1651MHz)"。
+#
+# 根因链（三处代码全在上游，我们一行都没改）：
+#   ① autocore 的 /sbin/cpuinfo 用
+#        awk -F ': ' '/model name/ {print $2}' /proc/cpuinfo
+#      取型号，取不到就写死 `?`；
+#   ② arm64 内核 arch/arm64/kernel/cpuinfo.c 里那一行被 `if (compat)` 包着，
+#      compat = "读它的进程是 32 位" ⇒ 64 位的 shell 永远读不到这一行；
+#   ③ LuCI 的 10_system.js 写的是 `cpuinfo.cpuinfo || boardinfo.system`，
+#      只有输出**为空**才回退 —— 脚本吐的是非空的 "?"，回退永不触发。
+# 核数（x 4）和频率（1651MHz，读 cpufreq/policy0/cpuinfo_cur_freq）不受影响。
+#
+# 修法：把本仓库 patches/kernel/<ver>/ 下的补丁叠进内核源码树，去掉那个 `if`。
+# 补丁是 NVIDIA 的 Sumit Gupta 2016 年发到 LKML 的版本，**没被主线接受**，
+# 所以 openwrt/openwrt（以及它的 fork，也就是我们的主线源码树）都没有；
+# ImmortalWrt 收编了它，放在同样的 generic/hack-<ver>/ 下 —— 这就是
+# 「同一份 autocore、同一份 LuCI，ImmortalWrt 的机器显示正常、我们的显示 ?」
+# 的全部原因：我们的固件是混血，UI 层借 ImmortalWrt，内核层来自 openwrt/openwrt。
+#
+# 落点与生效机制（都在上游源码里，已逐条核对）：
+#   include/target.mk:159  GENERIC_HACK_DIR := target/linux/generic/hack-$(KERNEL_PATCHVER)
+#   include/quilt.mk:104   $(call PatchDir,$(LINUX_DIR),$(GENERIC_HACK_DIR),generic-hack/)
+#   rules.mk:365           KPATCH := $(SCRIPT_DIR)/patch-kernel.sh
+# 即 Kernel/Patch/Default 按固定顺序应用：
+#   backport-<ver> → pending-<ver> → hack-<ver> → <target>/patches-<ver>
+# （hack 排在目标自己的 patches 之前；我们的补丁只碰 arch/arm64/kernel/cpuinfo.c，
+# 与 qualcommax 那批 arm64-dts-* 补丁没有交集。）
+# patch-kernel.sh 用 `patch -f -p1` 应用，失败会打 "Patch failed!" 并 exit 1，
+# 所以补丁对不上会**中断构建**，不会静默编出一个没打补丁的内核。
+#
+# 编号 312 在当前 generic/hack-6.18 里是空的（3xx 段只占 300 / 301-01 / 301-02），
+# 不会和上游撞号；万一上游以后收了同号补丁，下面的 cmp 会给 warning。
+kver="$(sed -n 's/^KERNEL_PATCHVER:=[[:space:]]*//p' "$OPENWRT_DIR/target/linux/qualcommax/Makefile" | head -n1)"
+[[ -n "$kver" ]] || die "没能从 target/linux/qualcommax/Makefile 读出 KERNEL_PATCHVER"
+kernel_patch_src="$BUILDER_DIR/patches/kernel/$kver"
+kernel_hack_dir="$OPENWRT_DIR/target/linux/generic/hack-$kver"
+[[ -d "$kernel_patch_src" ]] \
+  || die "本仓库没有为内核 $kver 准备补丁（$kernel_patch_src 不存在）" \
+         "上游很可能把 KERNEL_PATCHVER 升到 $kver 了，需要按新内核的上下文补一份" \
+         "（同一个补丁在 6.12 / 6.18 上的 hunk 不同：6.12 是 i + 两层缩进，6.18 是 cpu + 一层）"
+[[ -d "$kernel_hack_dir" ]] || die "上游的内核补丁目录不存在：$kernel_hack_dir"
+kernel_patches=0
+for kp in "$kernel_patch_src"/*.patch; do
+  [[ -f "$kp" ]] || continue
+  kp_dst="$kernel_hack_dir/$(basename "$kp")"
+  if [[ -e "$kp_dst" ]] && ! cmp -s "$kp" "$kp_dst"; then
+    warn "内核补丁同名但内容不同，已覆盖：$(basename "$kp")（上游后来收了同号补丁？）"
+  fi
+  cp -f "$kp" "$kp_dst"
+  log "注入内核补丁：generic/hack-$kver/$(basename "$kp")"
+  kernel_patches=$((kernel_patches + 1))
+done
+# 算术展开返回 0 在 set -e 下算失败，但它是 || 的左侧，所以安全。
+((kernel_patches)) || die "本仓库的补丁目录里没有 .patch 文件：$kernel_patch_src"
 
 log "构建环境就绪：qualcommax/ipq807x → QNAP QHora-301W（qnap_301w）"

@@ -63,6 +63,9 @@ on:
       - "configs/**"
       - "packages/**"
       - "scripts/**"
+      # 内核补丁：由 scripts/prepare-build.sh 注入上游源码树。
+      # 动了补丁必须重编内核，所以这里也要盯。
+      - "patches/**"
       - "files/**"
       # 变体专属覆盖层：passwall2 的出厂预置配置放在这里
       - "files-passwall2/**"

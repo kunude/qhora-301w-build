@@ -33,6 +33,7 @@ configs/
   homeproxy.config          # 覆盖层：关掉 passwall2 那组、换成 HomeProxy
 packages/net/{ddns-go,msd_lite}/   # 自带配方（直接引用上游源码，版本构建时解析注入）
 packages/emortal/autocore/         # 纯脚本包，提供 tempinfo / cpuinfo
+patches/kernel/6.18/               # 叠进上游内核源码树的内核补丁（见下）
 scripts/
   prepare-build.sh          # 组装 .config、跑 defconfig、校验符号、叠加覆盖文件
   extra-packages.sh         # 把 feed 里没有 / 不该用官方那份的包放进 feed 目录树
@@ -46,6 +47,32 @@ files-homeproxy/            # 只叠进 HomeProxy 版：etc/config/homeproxy
 **预置文件里只有「策略」，没有「凭据」。** 节点地址 / 端口 / 密码 / UUID / REALITY 公钥 /
 订阅链接一律不进仓库 —— 固件是公开产物，写进去等于公开。每次构建都会跑
 `scripts/check-no-credentials.sh` 扫 `files*/etc/config/`，命中就**中断构建**。
+
+### 内核补丁：`patches/kernel/6.18/`
+
+这是本仓库**唯一**往上游源码树（`openwrt-nss-edma` 那棵树）里加东西的地方。其余改动全部落在
+"配方层"：`configs/`（Kconfig 选项）、`scripts/`（构建编排）、`files*/`（镜像内文件覆盖）、
+`packages/`（自带配方）。
+
+落点由 `scripts/prepare-build.sh` 的第 7 步决定：把补丁拷进上游源码树的
+`target/linux/generic/hack-<ver>/`，也就是内核补丁队列的最后一站。这条链在源码树里是
+`include/target.mk`（定义 `GENERIC_HACK_DIR`）→ `include/quilt.mk`（`Kernel/Patch/Default`
+按 `backport-<ver>` → `pending-<ver>` → **`hack-<ver>`** → `<target>/patches-<ver>` 顺序应用）
+→ `rules.mk` 的 `KPATCH`（= `scripts/patch-kernel.sh`，用 `patch -f -p1` 执行）。
+补丁对不上时它打 `Patch failed!` 并 `exit 1`，所以**会中断构建**，不会静默编出没打补丁的内核。
+
+目前只有一条，解决首页「架构」显示 `?`（详见第六节排查表）：
+
+```
+patches/kernel/6.18/312-arm64-cpuinfo-Add-model-name-in-proc-cpuinfo-for-64bit-ta.patch
+```
+
+补丁本身抄自 ImmortalWrt 收录的版本（NVIDIA 的 Sumit Gupta 2016 年发到 LKML、**未被主线接受**），
+只改 `arch/arm64/kernel/cpuinfo.c` 一处。**上游把内核升到新版本时必须补一份对应版本**：
+同一个补丁在 6.12 与 6.18 上的 hunk 上下文不同（6.12 是 `i` + 两层缩进，6.18 是 `cpu` + 一层），
+拿 6.18 那份去打 6.12 内核会 `Hunk #1 FAILED`。目录名取自
+`target/linux/qualcommax/Makefile` 的 `KERNEL_PATCHVER` —— 读不到或对应目录不存在都**明确报错**，
+不会静默跳过。
 
 ---
 
@@ -513,6 +540,13 @@ HomeProxy 工作流的「校验功能包」清单里也点名核对它 —— �
 - **首页那两行在页面最底部、或出现两块内存** —— 那是早期版本留下的自写 JS
   （`/www/luci-static/resources/view/status/include/95_qhora_hw.js`）还在。
   从 2026-10-10 起已改为上游原生方案并删除该文件，刷新 build 即恢复正确顺序。
+- **首页「架构」显示 `? x 4 (1651MHz)`** —— 本固件已修（见「唯一的源码改动」）。原因是
+  `autocore` 的 `/sbin/cpuinfo` 只认 `/proc/cpuinfo` 的 `model name` 字段，而 arm64 内核
+  默认**只为 32 位进程**打印这一行（`if (compat)` 那处），64 位的 shell 读不到就回落成 `?`；
+  核数 `x 4` 与频率 `1651MHz` 都是真值，纯显示瑕疵、零功能影响。旧 build 上自查：
+  `grep -c 'model name' /proc/cpuinfo` 返回 **0** 就是中招（修好后应 ≥1，那一格变成
+  `ARMv8 Processor rev N (v8l) x 4`）。注意它显示的其实是 **CPU 型号**、不是架构名 ——
+  x86 上那一格显示的是 `Intel(R) Celeron...`，arm32 上是 `ARMv7 Processor rev N`。
 - **HomeProxy 起不来，日志报 `Unable to resolve path for module 'math'`** —— 缺 `ucode-mod-math`
   （见第五节）。早期 build 没带这个包；设备上 `apk add ucode-mod-math` 后重启 HomeProxy 即可。
 - **passwall2 日志报 `sslocal not found`** —— 节点类型是 `SS-Rust` 但固件里没有 `sslocal`。
