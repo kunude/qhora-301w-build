@@ -29,7 +29,13 @@
 │   ├── extra-packages.sh                    # 把自带配方 / ImmortalWrt 前端 / passwall2 放进 feed 目录树
 │   ├── resolve-versions.sh                  # 构建时解析上游最新版本，注入到上面两个配方
 │   └── push-to-github.sh                    # 本地一键推送脚本
-├── files/etc/uci-defaults/99-qhora-301w     # 首次启动的设置（主机名、启用服务）
+├── files/                                   # 原样叠加进固件的覆盖文件
+│   ├── etc/uci-defaults/99-qhora-301w       #   首次启动的设置（主机名、启用服务）
+│   ├── etc/uci-defaults/99-luci-statistics  #   打开 collectd 的温度采集
+│   ├── www/luci-static/resources/view/status/include/95_qhora_hw.js
+│   │                                        #   首页「CPU / 温度 / 内存」区块（见第六节 7）
+│   └── usr/share/rpcd/acl.d/qhora-overview.json
+│                                            #   上面那个 JS 读 /proc、/sys 的 rpcd 授权
 ├── .gitattributes / .gitignore
 └── README.md
 ```
@@ -38,7 +44,8 @@
 [Qualcommax_NSS_Builder](https://github.com/JuliusBairaktaris/Qualcommax_NSS_Builder)
 的 `devices/common/config` 与 `devices/ipq807x-1g/config` —— 那是这套 NSS 栈
 **唯一被持续验证过**的配置组合，所以基本保持原样，只做了两处针对性改动（见下），
-外加在文件末尾追加了 ddns-go / msd_lite / WireGuard / passwall2 / statistics 五组独立的功能包（见第五节）。
+外加在文件末尾追加了 ddns-go / msd_lite / WireGuard / passwall2 / statistics 五组独立的功能包，
+以及一个首页硬件区块（`files/www/…/status/include/95_qhora_hw.js`，见第五节、第六节 7）。
 
 ---
 
@@ -200,8 +207,9 @@ uci set nss.general.enabled='0'; uci commit nss; reboot
 | **ddns-go** | 开机自启 | Web 界面 `http://<路由器IP>:9876`，在里面添加 DDNS 记录。数据在 `/etc/ddns-go/config.yaml` |
 | **msd_lite** | 开机自启 | 客户端按 `http://<路由器IP>:7088/udp/<组播地址>:<端口>` 取流。**接收组播的网卡需要在 `服务 → msd_lite` 里选**（见下） |
 | **WireGuard** | 仅装好 | 没有常驻服务，到 `网络 → 接口` 新建一个 `wg` 协议接口即可，内核模块会自动加载 |
-| **passwall2** | 装好，未启用 | `服务 → Pass Wall 2` 里加节点/订阅后手动起。界面、`xray-core`、`sing-box` 等组件都在固件里；缺的组件可在页面里「组件更新」在线拉（见第五节） |
+| **passwall2** | 装好，未启用 | `服务 → Pass Wall 2` 里加节点/订阅后手动起。核心只编了 **`sing-box`**（原生支持 SS/SSR/VMess/VLESS/Trojan/Hysteria2，`_shunt` 分流也由它实现），外带 **`sslocal`**（Shadowsocks-Rust 客户端，SS-Rust 类型节点靠它启动）；**没有** xray（见第五节）。界面里缺的组件可在「组件更新」在线拉 |
 | **statistics** | 开机自启 | `状态 → 统计` 里有 CPU（每核占用）、**温度**、内存、接口流量、无线的曲线图。温度采集默认是开的（uci-defaults 打开了 thermal 插件），如果想调去 `统计 → 设置` |
+| **首页硬件区块** | 装好即生效 | `状态 → 总览` 页底部多出一块「CPU / 温度 / 内存」：CPU 占用率（带当前频率）、每个温度传感器（`cpu-thermal` / `nss-*-thermal` / `wifi-thermal` …）、内存用量。是本仓库自己写的 include（`files/www/luci-static/resources/view/status/include/95_qhora_hw.js`），**不依赖 collectd**，开机就有数 —— 和上面 collectd 那套曲线图是两回事（一个看当前值，一个看历史） |
 
 LuCI 界面默认就是简体中文（`CONFIG_LUCI_LANG_zh_Hans=y`，见第六节）。
 注意「状态 → NSS Offload」那一页是英文 —— 它定义在 NSS 分支主树的
@@ -216,9 +224,10 @@ LuCI 界面默认就是简体中文（`CONFIG_LUCI_LANG_zh_Hans=y`，见第六�
 ls /etc/rc.d/ | grep -E 'ddns-go|msd_lite'   # 有 S99 开头的链接说明开机自启已生效
 wg show                                      # 建好 wg 接口后可用
 /etc/init.d/passwall2 status                 # 配好节点后才有意义
-xray version; sing-box version               # 确认核心二进制在固件里
+sing-box version                             # 核心二进制在固件里（本轮起不再编 xray）
+sslocal --version                            # SS-Rust 客户端在不在（passwall2 的 SS-Rust 节点要用它）
 /etc/init.d/luci_statistics status           # collectd 在跑就有图表
-cat /sys/class/thermal/thermal_zone*/type    # 固件里有哪些温度传感器
+cat /sys/class/thermal/thermal_zone*/type    # 固件里有哪些温度传感器（首页区块读的就是这个）
 ```
 
 **关于 msd_lite 的组播网卡（`network` 项）**：出厂留空。它填的是"从哪张网卡收组播"，
@@ -235,7 +244,9 @@ cat /sys/class/thermal/thermal_zone*/type    # 固件里有哪些温度传感器
 | 多加一个软件包 | 在 `configs/common.config` 末尾加 `CONFIG_PACKAGE_xxx=y` |
 | 加一个**官方 feed 没有**的包 | 在 `packages/<分类>/<包>/` 放一份自带配方，`extra-packages.sh` 会自动落位；再到 `common.config` 加符号（见下） |
 | 只加一个 luci 前端页面 | 在 `scripts/extra-packages.sh` 的 `LUCI_PATHS` 里加路径，再到 `common.config` 加符号 |
-| 开关 passwall2 的某个组件 | 改 `common.config` 里 `CONFIG_PACKAGE_luci-app-passwall2_*` 那几行（例如把 `INCLUDE_Shadowsocks_Rust_Client` 改成 `=y` 就是把 ss-rust 编进固件） |
+| 开关 passwall2 的某个组件 | 改 `common.config` 里 `CONFIG_PACKAGE_luci-app-passwall2_*` 那几行（`INCLUDE_Shadowsocks_Rust_Client` 现在是 `y`，把它改回 `n` 就不再编 Rust） |
+| 换 passwall 核心（比如要回 xray） | 把 `..._Basic_Core_SingBox=y` 换成 `..._Basic_Core_Xray=y` 或 `..._Basic_Core_All=y`，再到工作流 `WANT` 清单里补回 `xray-core` |
+| 改首页硬件区块显示什么 | `files/www/luci-static/resources/view/status/include/95_qhora_hw.js`；新读的路径要同步加到 `files/usr/share/rpcd/acl.d/qhora-overview.json`（否则 rpcd 会拒读） |
 | 换 passwall 的仓库 / 分支 | 改 `extra-packages.sh` 顶部的 `PW_APP_REPO` / `PW_PKGS_REPO` / `PW_REF` 默认值（也可以用同名环境变量在 CI 里覆盖） |
 | 调 statistics 采集哪些数据 | `统计 → 设置` 页面，或直接改 `/etc/config/luci_statistics`（温度在 `collectd_thermal` 段） |
 | 钉死 ddns-go / msd_lite 的版本 | `Run workflow` 时填 `ddns_go_version` / `msd_lite_sha`，或改 `packages/net/*/Makefile` 里的兜底值 |
@@ -347,13 +358,29 @@ luci 应用是 `include ../../luci.mk`，`ddns-go` 是
 passwall 上游 CI 是让 passwall feed 排在 `feeds.conf` 最前面来取胜，效果一样。
 其余 13 个官方 feed 里没有（实测 `openwrt/packages` 的 `net/`、`lang/` 下均为 404）。
 
-⚠️ **`shadowsocks-rust` / `shadow-tls` 会拖进 Rust 工具链。** 它们的配方写着
-`PKG_BUILD_DEPENDS:=rust/host`，编它们等于把 Rust + LLVM 从源码编一遍（构建时间显著
-增长、磁盘压力大）—— passwall 官方 CI 为此专门去 patch
-`feeds/packages/lang/rust/Makefile`。所以 `common.config` 里两个
-`INCLUDE_Shadowsocks_Rust_*` 都是 `n`。真要用 ss-rust，在 LuCI 的「组件更新」里在线
-拉预编译二进制即可（passwall2 自带这个入口，见 `root/usr/share/passwall2/app.sh` 的
-`ss-rust` 分支）。想编进固件就把那两行改成 `y`。
+**核心只留 `sing-box`，不编 xray。** 上游对 aarch64 的默认值是 `Basic_Core_All`
+（xray + sing-box 都编），这份配置改成 `..._Basic_Core_SingBox=y`：sing-box 原生支持
+SS / SSR / VMess / VLESS / Trojan / Hysteria2 / WireGuard，`_shunt` 分流也是它自己用
+`route.rules` 实现的，日常用不到 xray，少编一个省下约 20MB 镜像和几分钟构建时间。
+（组件配方仍会被落位到 `feeds/packages/net/xray-core`，只是不选中、不编译 —— 想切回来
+就改这一个符号，再到工作流 `WANT` 清单里补回 `xray-core`。）
+
+⚠️ **`sslocal`（Shadowsocks-Rust 客户端）必须编，不能省。** passwall2 里节点类型为
+`SS-Rust` 的节点是直接 exec `/usr/bin/sslocal` 的（`app.sh` 的 `ss-rust` 分支 →
+`ln_run "$(first_type sslocal)" "sslocal" ${QUEUE_RUN} …`），缺了它运行日志会报
+`sslocal not found, unable to start...`，那种节点的透明代理 / 分流就起不来。
+最容易踩的场景是**从别的固件恢复了 passwall2 配置** —— 那台机器上有 sslocal，节点
+`type` 就存成了 `SS-Rust`，换到本固件后立刻变成"缺依赖"。
+
+它属于 `shadowsocks-rust`，配方写着 `PKG_BUILD_DEPENDS:=rust/host`，要拉 Rust 工具链
+（prebuilt 下载 + cargo 编译，构建大概多 15~25 分钟，固件 +6~8MB）。服务端
+（`INCLUDE_Shadowsocks_Rust_Server`）和 `shadow-tls` 用不上，继续关着；真要用就在 LuCI
+的「组件更新」里在线拉预编译二进制（passwall2 自带这个入口）。
+
+> **一个容易踩的副作用：**`sslocal` 一旦存在，从订阅导入的 **SS 节点默认类型会变成
+> `SS-Rust`**（`subscribe.lua` 里的候选顺序是 shadowsocks-rust → sing-box → xray）。
+> 这是上游默认行为。想让 SS 节点走 sing-box（不额外起 sslocal 进程），到「节点订阅」
+> 页把 SS 类型显式选成 sing-box。
 
 **透明代理走 nftables 那支。** 这份配置用的是 `firewall4`，所以开
 `..._Nftables_Transparent_Proxy=y`、关 `..._Iptables_Transparent_Proxy`。前者会
@@ -370,7 +397,7 @@ passwall 上游 CI 是让 passwall feed 排在 `feeds.conf` 最前面来取胜�
 
 ```
 ::notice:: passwall2 项目版本：luci-app-passwall2=26.10.1-2（取自 …openwrt-passwall2.git@main）
-::notice:: passwall 组件版本（引自上游 main）：chinadns-ng=2025.08.09  …  xray-core=26.9.30
+::notice:: passwall 组件版本（引自上游 main）：chinadns-ng=2025.08.09  …  sing-box=1.14.3
 ```
 
 这条注解同时是"上游最近一次更新有没有被这轮构建吃到"的凭证 —— 和 ddns-go 那条一样，
@@ -542,8 +569,9 @@ make defconfig
    `Openwrt-Passwall` 组织的浅克隆 —— **不抄配方、不改版本**，每次构建取当时的上游
    `main`。组件清单不写死（遍历上游顶层目录），上游加新组件会自动带上。带同名冲突的
    4 个组件（`xray-core` / `sing-box` / `v2ray-geodata` / `microsocks`）在落位时**覆盖**
-   官方 feed 那份；`shadowsocks-rust` / `shadow-tls` 因为会拖进 Rust 工具链而**不编**
-   （开关关着，需要时在 LuCI 里在线拉）。详见第五节。
+   官方 feed 那份。编进固件的是 **`sing-box`**（核心，xray 不编 —— 上游 aarch64 默认
+   是"All"，这里改成只 SingBox）和 **`sslocal`**（Shadowsocks-Rust 客户端，SS-Rust
+   类型节点必须靠它启动）；`shadow-tls` / SS-Rust 服务端不编。详见第五节。
 
 6. **`luci-app-statistics` 补上官方 LuCI 缺的 CPU/温度图表**。官方总览页只有
    负载均值 —— 10_system.js 里就没有 CPU 占用率和温度这两项，这不是缺包，
@@ -554,10 +582,28 @@ make defconfig
    `files/etc/uci-defaults/99-luci-statistics` 在开机时打开。
    全套在官方 feed 里，不需要 `extra-packages.sh` 介入。
 
+7. **首页（状态 → 总览）加了一块「CPU / 温度 / 内存」**，是两份覆盖文件，不走任何包：
+   - `files/www/luci-static/resources/view/status/include/95_qhora_hw.js` —— 渲染表格。
+     放这里就能生效，因为**上游总览页的 include 列表不是写死的**：`index.js` 用
+     `fs.list('/www/luci-static/resources/view/status/include')` 扫目录、按文件名排序后
+     逐个 `L.require()`。所以我们只是"多放了一个文件"，没有改上游任何代码。
+     数据源是只读 procfs / sysfs（`/proc/stat`、`/proc/meminfo`、
+     `/sys/class/thermal/thermal_zone<N>/`、`/sys/class/hwmon/hwmon<N>/`、
+     cpufreq 的 `scaling_cur_freq`），CPU 占用率用两次 `/proc/stat` 采样做差得到
+     （首页本来每几秒就轮询一次，直接用上一轮样本，首次打开才多采一次）。
+   - `files/usr/share/rpcd/acl.d/qhora-overview.json` —— 给 rpcd 开这些路径的读权限。
+     **这步不能省**：官方 `luci-base` 那组只授了 `list`（`read.file` 是 `/`+`/*` 的
+     `list`、`read.ubus.file` 只有 `list`），没授 `read`，LuCI 前端读任何文件都会被拒。
+     自己定义一个新 group 是安全的 —— `/etc/config/rpcd` 出厂就给 root 授
+     `list read '*'`，新 group 自动对 root 生效。
+   - 为什么不学 ImmortalWrt：他们那份 `10_system.js` 走的是 ubus 的
+     `luci.getCPUUsage` / `luci.getTempInfo`，那是 ImmortalWrt 给 `rpcd-mod-luci`
+     打的补丁，官方 `openwrt/luci` 的 `rpcd-mod-luci` 只有 `getBoardJSON` 那几个方法。
+
 另外，工作流本身也加了一条能力：**编译失败可远程诊断**（make 输出落盘 + 失败时把
 失败包名和真实报错行发成公开注解，见第八节）。
 
-这五组都是**独立追加**的，删掉它们不影响 NSS 卸载栈本身。
+这五组功能包（外加第七节那条首页小组件）都是**独立追加**的，删掉它们不影响 NSS 卸载栈本身。
 `WireGuard` 走的是官方 feed 的原生包，`statistics` 也在官方 feed 里，都不需要额外脚本。
 
 ---
@@ -627,7 +673,7 @@ Ubuntu 24.04/26.04 上需要：
 | `ddns-go / msd_lite 解析上游最新版本失败` **（warning）** | 查 GitHub API 或算 hash 失败 | **不影响构建**，那两个包会用配方里的兜底值；想确认编的是哪个版本，看同批的 notice |
 | `本轮固件里的上游包版本：…` **（notice）** | 这轮实际编进去的版本 | 核对是否是预期版本；不是就用 `ddns_go_version` / `msd_lite_sha` 钉死 |
 | `passwall2 项目版本：luci-app-passwall2=…` **（notice）** | 这轮取到的 passwall2 界面版本 | 和上游 release 对照；不对就看 `passwall_ref` / `passwall_app_repo` |
-| `passwall 组件版本（引自上游 …）` **（notice）** | 17 个组件各自的 `PKG_VERSION` | 想确认某个组件（如 `xray-core`）这轮编的是哪版，看这条 |
+| `passwall 组件版本（引自上游 …）` **（notice）** | 17 个组件各自的 `PKG_VERSION` | 想确认某个组件（如 `sing-box`）这轮编的是哪版，看这条 |
 | `克隆 … 失败（分支 …）` **（error）** | passwall 仓库浅克隆失败 | 检查 `passwall_ref` 分支是否存在、`passwall_*_repo` 地址、网络 |
 | `上游没有 …/Makefile（结构可能变了）` **（error）** | 上游仓库顶层结构变了 | 改 `extra-packages.sh` 里对应 `place()` 的 `src_rel` |
 | `passwall 组件 <名> 没落位` **（error）** | 关键组件在上游找不到了 | 看 `passwall_pkgs_repo` 的 `passwall_ref` 分支里是否还有它 |
@@ -683,8 +729,21 @@ CONFIG_LUCI_LANG_zh_Hans=y
 
 **首页（状态 → 总览）怎么没有 CPU 占用率和温度？**
 官方 LuCI 的总览页本来就没有这两项 —— `10_system.js` 只显示主机名/型号/内核/
-时间/运行时长/负载均值。要看曲线图去 `状态 → 统计`（collectd 那套，本固件已带，
-温度采集默认开着）；`状态 → NSS Offload` 里还有 NSS 专用的核心负载和端口卸载统计。
+时间/运行时长/负载均值。本固件在两个地方补上了：
+- **首页底部多了「CPU / 温度 / 内存」一块**（本仓库自己写的 include，
+  `files/www/…/status/include/95_qhora_hw.js`），显示当前 CPU 占用率（带频率）、
+  每个温度传感器、内存用量，开机就有数，不需要等采集；
+- 想看**曲线/历史**去 `状态 → 统计`（collectd 那套，本固件已带，温度采集默认开着）；
+- `状态 → NSS Offload` 里还有 NSS 专用的核心负载和端口卸载统计。
+
+如果首页那块显示的是 `?`，说明 rpcd 把读取拒了：确认
+`/usr/share/rpcd/acl.d/qhora-overview.json` 在固件里（`ls` 一下），
+再退出重新登录一次 LuCI 让会话重新取 ACL。
+
+**首页那块温度是空的？**
+先 `cat /sys/class/thermal/thermal_zone*/type` 看内核暴露了哪些温度区 ——
+有哪个就显示哪个（`cpu-thermal` / `nss-*-thermal` / `wifi-thermal` 之类），
+另外 `hwmon` 里的传感器也会被收进来。无线温度要射频打开后才更新。
 
 **「状态 → NSS Offload」为什么是英文？**
 这个页面不是 luci feed 里的应用，而是 NSS 分支主树 `package/nss/nss-tools` 附带的
@@ -730,11 +789,22 @@ passwall2 的两个仓库地址是 `extra-packages.sh` 的 `PW_APP_REPO` / `PW_P
 发生过一次；再遇到时改这两个变量即可，脚本其他地方不用动。
 
 **passwall2 编进去之后构建变慢了？**
-正常。17 个组件里有 Go 项目（`xray-core` / `sing-box` / `geoview` 等，走
-`lang/golang` 那套，自带 toolchain 编译），还有 `haproxy` 这种 C 大件，比不编它们
-肯定要久。真正会拖垮构建的是 `shadowsocks-rust` / `shadow-tls` —— 它们要编一整套
-Rust + LLVM，所以配置里已经关掉（见第五节），别随手打开。
+正常。17 个组件里有 Go 项目（`sing-box` / `geoview` 等，走 `lang/golang` 那套，
+自带 toolchain 编译），还有 `haproxy` 这种 C 大件，比不编它们肯定要久。
+另外 `sslocal` 属于 `shadowsocks-rust`，要拉整套 Rust 工具链（prebuilt 下载 +
+cargo 编译），比之前多 15~25 分钟 —— 这是为了 SS-Rust 类型节点能启动，不能省
+（见第五节）。没编的是 `shadow-tls` 和 SS-Rust 服务端。
 如果因此撞上 6 小时超时，重跑一次通常能过（`dl` 缓存和 ccache 会复用）。
+
+**passwall2 日志报 `sslocal not found, unable to start...`？**
+说明节点类型是 `SS-Rust` 但固件里没有 `sslocal`。本固件从这一版起已编入；
+如果你刷的是更早的 run，要么升级，要么在「节点订阅」页把 SS 类型显式选成
+`sing-box`（sing-box 原生支持 SS，不需要外部进程）。
+
+**为什么固件里没有 xray？**
+这是刻意的：`Basic_Core_SingBox=y`，只编 sing-box。sing-box 覆盖了 SS / SSR /
+VMess / VLESS / Trojan / Hysteria2 / WireGuard 全部常用协议，`_shunt` 分流也是它
+自己实现的。想切回 xray 见第五节表格最后一行。
 
 ---
 

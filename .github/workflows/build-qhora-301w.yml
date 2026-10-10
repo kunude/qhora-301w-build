@@ -401,17 +401,21 @@ jobs:
           #
           # passwall2 那一组单独列全：它的依赖组件是通过 Kconfig 的 select 拉进来的，
           # 而 select 失败是**静默**的（package/feeds 里少了配方，符号就被丢掉）。
-          # 不点名的话，"镜像里没有 xray-core"要等两小时编完才发现。
+          # 不点名的话，"镜像里缺组件"要等两小时编完才发现。
           #
           # dnsmasq-full 是"nftables 透明代理那支真的生效了"的凭证（默认镜像是
           # dnsmasq，被 dnsmasq-full 挤掉）。kmod-nft-* 是 TPROXY 的内核侧前提。
           # statistics 三个：CPU/内存/温度图表（collectd-mod-thermal 不在
           # luci-app-statistics 的默认依赖里，必须显式选）。
+          # shadowsocks-rust-sslocal = passwall2 的 SS-Rust 节点要 exec 的
+          # /usr/bin/sslocal（缺它运行日志会报 sslocal not found）。
+          # 这里**故意没有 xray-core** —— 本轮起不编 xray（见 configs/common.config）。
           WANT="msd_lite luci-app-msd_lite luci-i18n-msd_lite-zh-cn \
                 ddns-go luci-app-ddns-go luci-i18n-ddns-go-zh-cn \
                 wireguard-tools luci-proto-wireguard kmod-wireguard \
                 luci-app-passwall2 luci-i18n-passwall2-zh-cn \
-                xray-core sing-box chinadns-ng geoview tcping \
+                sing-box shadowsocks-rust-sslocal \
+                chinadns-ng geoview tcping \
                 v2ray-geoip v2ray-geosite shadowsocksr-libev-ssr-local \
                 simple-obfs-client v2ray-plugin haproxy lyaml \
                 dnsmasq-full kmod-nft-tproxy kmod-nft-socket \
