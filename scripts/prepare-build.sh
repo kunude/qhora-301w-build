@@ -183,7 +183,7 @@ log "feeds install 完成，package/feeds/ 下有："
 ls -1 package/feeds/ 2>/dev/null | sed 's/^/    /' | tee -a "$LOG_FILE" >&3 || true
 
 # 确认这些引入的包真的被 install 认领了（索引没重建的话这一步会漏）。
-for p in ddns-go msd_lite; do
+for p in ddns-go msd_lite autocore; do
   [[ -e "package/feeds/packages/$p" ]] \
     || die "package/feeds/packages/$p 不存在，引入的包没有被 feeds install 接管"
 done

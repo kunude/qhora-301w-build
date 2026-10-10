@@ -210,6 +210,7 @@ uci set nss.general.enabled='0'; uci commit nss; reboot
 | **passwall2** | 装好，未启用 | `服务 → Pass Wall 2` 里加节点/订阅后手动起。核心只编了 **`sing-box`**（原生支持 SS/SSR/VMess/VLESS/Trojan/Hysteria2，`_shunt` 分流也由它实现），外带 **`sslocal`**（Shadowsocks-Rust 客户端，SS-Rust 类型节点靠它启动）；**没有** xray（见第五节）。界面里缺的组件可在「组件更新」在线拉 |
 | **statistics** | 开机自启 | `状态 → 统计` 里有 CPU（每核占用）、**温度**、内存、接口流量、无线的曲线图。温度采集默认是开的（uci-defaults 打开了 thermal 插件），如果想调去 `统计 → 设置` |
 | **首页硬件区块** | 装好即生效 | `状态 → 总览` 页底部多出一块「CPU / 温度 / 内存」：CPU 占用率（带当前频率）、每个温度传感器（`cpu-thermal` / `nss-*-thermal` / `wifi-thermal` …）、内存用量。是本仓库自己写的 include（`files/www/luci-static/resources/view/status/include/95_qhora_hw.js`），**不依赖 collectd**，开机就有数 —— 和上面 collectd 那套曲线图是两回事（一个看当前值，一个看历史） |
+| **autocore** | 装好即生效 | 两个命令行脚本：`tempinfo`（输出 `CPU: 52.3°C, WiFi: 61.0°C`）和 `cpuinfo`（CPU 型号）。就是 ImmortalWrt 首页温度那一行背后用的东西，本仓库把它同源抄了进来（见第六节 7）。首页显示仍由上面那块自写区块负责，不依赖它 |
 
 LuCI 界面默认就是简体中文（`CONFIG_LUCI_LANG_zh_Hans=y`，见第六节）。
 注意「状态 → NSS Offload」那一页是英文 —— 它定义在 NSS 分支主树的
@@ -596,9 +597,19 @@ make defconfig
      `list`、`read.ubus.file` 只有 `list`），没授 `read`，LuCI 前端读任何文件都会被拒。
      自己定义一个新 group 是安全的 —— `/etc/config/rpcd` 出厂就给 root 授
      `list read '*'`，新 group 自动对 root 生效。
-   - 为什么不学 ImmortalWrt：他们那份 `10_system.js` 走的是 ubus 的
-     `luci.getCPUUsage` / `luci.getTempInfo`，那是 ImmortalWrt 给 `rpcd-mod-luci`
-     打的补丁，官方 `openwrt/luci` 的 `rpcd-mod-luci` 只有 `getBoardJSON` 那几个方法。
+   - 为什么不学 ImmortalWrt 那套：他们首页的温度走 ubus 的 `luci.getTempInfo`，
+     由 luci-base 的 ucode 插件（`/usr/share/rpcd/ucode/luci`）执行 `/sbin/tempinfo`
+     得到；那个**方法**和那个**脚本**分别来自 ImmortalWrt 的 luci 分支和它的
+     `autocore` 包，官方 `openwrt/luci` 两边都没有。
+     ⚠️ 别跟 `rpcd-mod-luci` 搞混 —— 那个包注册的 ubus 对象是 `luci-rpc`，
+     只有 `getBoardJSON` / `getDHCPLeases` 那 6 个方法，跟首页温度毫无关系。
+     要照搬就得覆盖上游的 `10_system.js` **和**整个 ucode 插件（跨分支替换，
+     上游一升级就漂移），而直读 sysfs 是等效的、且不改上游任何文件。
+   - 那为什么还编进来一个 `autocore`：它提供 `/sbin/tempinfo` 和 `/sbin/cpuinfo`
+     两个脚本（SSH 里可直接执行），与 ImmortalWrt 同源，日后若想接那套 ubus 前端
+     也现成。配方抄在 `packages/emortal/autocore/`（本仓库自带那类），
+     **纯脚本、零编译**；注意它的 Makefile 只对 `ipq% / mediatek% / qualcommax%`
+     目标安装 `tempinfo`，我们是 qualcommax ✓。
 
 另外，工作流本身也加了一条能力：**编译失败可远程诊断**（make 输出落盘 + 失败时把
 失败包名和真实报错行发成公开注解，见第八节）。
@@ -747,6 +758,24 @@ CONFIG_LUCI_LANG_zh_Hans=y
 `wcss-phya1-thermal`、`wcss-phyb0-thermal`、`wcss-phyb1-thermal`
 （**`wcss-*` 就是无线子系统，也就是 WiFi 温度** —— 射频没开时读数不动是正常的）。
 `hwmon` 里的传感器也会被一并收进来。
+
+**`tempinfo` 在哪？首页为什么不像 ImmortalWrt 那样显示一行「Temperature」？**
+`tempinfo` / `cpuinfo` 是 `autocore` 包装的两个脚本，SSH 里直接跑：
+
+```sh
+tempinfo        # CPU: 51.3°C, WiFi: 58.0°C
+cpuinfo         # Qualcomm Technologies, Inc. IPQ8072A
+```
+
+注意 `tempinfo` 只读 `thermal_zone0`，**不是**全部热区；WiFi 那半截按
+`/sys/class/ieee80211/phy*/hwmon*/` 找，ath11k 平台不一定有该路径，
+所以常见输出只有 `CPU: …` 半截 —— 属正常。
+
+我们**故意没有**照搬 ImmortalWrt 那种「System 表里插一行 Temperature」的样式：
+那要覆盖上游的 `10_system.js` 和整个 rpcd ucode 插件，跨分支替换会随上游漂移。
+首页温度由自写的 `95_qhora_hw.js` 负责，列的是**全部**热区（含 NSS / WiFi），
+信息比 ImmortalWrt 那一行更全，而且不依赖任何 ubus 方法，也就不受
+「官方 LuCI 没有 `luci.getTempInfo`」影响。
 
 **「状态 → NSS Offload」为什么是英文？**
 这个页面不是 luci feed 里的应用，而是 NSS 分支主树 `package/nss/nss-tools` 附带的

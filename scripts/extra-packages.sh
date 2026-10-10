@@ -3,10 +3,15 @@
 # 引入 OpenWrt 官方 feed 之外的包。现在分三类，处理方式按"上游有没有可指的
 # 源码仓库 / 配方是不是我们自己的"来区分：
 #
-# ── ① ddns-go / msd_lite（带二进制）→ 本仓库自带配方 ─────────────
-# 配方在 packages/net/*，PKG_SOURCE 直接指向上游源码仓库
-# （jeessy2/ddns-go、rozhuk-im/msd_lite），版本与 hash 由
-# scripts/resolve-versions.sh 在构建时解析后注入。
+# ── ① ddns-go / msd_lite / autocore → 本仓库自带配方 ─────────────
+# 配方在 packages/<分类>/<包>/ 下：
+#   packages/net/ddns-go、packages/net/msd_lite
+#     PKG_SOURCE 直接指向上游源码仓库（jeessy2/ddns-go、rozhuk-im/msd_lite），
+#     版本与 hash 由 scripts/resolve-versions.sh 在构建时解析后注入。
+#   packages/emortal/autocore
+#     纯脚本包（无 PKG_SOURCE、Build/Compile 为空），抄自 ImmortalWrt 主源码树，
+#     提供 /sbin/tempinfo、/sbin/cpuinfo —— ImmortalWrt 首页温度那一行背后的东西。
+#     它不属于任何 feed，ImmortalWrt 主仓库又太大不值得整库拉，所以自带一份。
 #
 # 为什么不再从 ImmortalWrt 取这两个包：ImmortalWrt 的配方把版本**写死**了
 # （例如 PKG_VERSION:=6.17.6 配对应 PKG_HASH），上游发了新版要等它 bump
@@ -245,7 +250,7 @@ ann "::notice title=passwall 组件版本（引自上游 $PW_REF）::${pw_summar
   || die "缺少 feeds/luci/luci.mk，luci-app-* 无法构建"
 
 log "引入完成："
-log "  · 自带配方        ddns-go / msd_lite"
+log "  · 自带配方        ddns-go / msd_lite / autocore"
 log "  · ImmortalWrt 前端 luci-app-{ddns-go,msd_lite}"
 log "  · passwall2       luci-app-passwall2 + ${#pw_rels[@]} 个依赖组件"
 warn "别忘了接着跑：./scripts/feeds update -i -a   # 重建索引，install 才看得到这些包"
