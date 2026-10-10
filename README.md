@@ -42,7 +42,8 @@
 ├── files-passwall2/                         # 变体专属覆盖层：只叠进 passwall2 版固件
 │   └── etc/config/passwall2                 #   passwall2 出厂预置：分流/DNS/选路，节点留空
 ├── files-homeproxy/                         # 变体专属覆盖层：只叠进 HomeProxy 版固件
-│   └── etc/config/homeproxy                 #   HomeProxy 出厂预置：custom 三分流/DNS，节点留空
+│   └── etc/config/homeproxy                 #   HomeProxy 出厂预置：custom 三分流/DNS/订阅开关，
+│                                            #   节点与订阅链接留空
 ├── .gitattributes / .gitignore
 └── README.md
 ```
@@ -50,6 +51,12 @@
 > 出厂代理配置按变体分开放：passwall2 的在 `files-passwall2/`，HomeProxy 的在
 > `files-homeproxy/`，都只出现在对应变体的固件里。`prepare-build.sh` 会先叠 `files/`，
 > 再叠 `files-<PROXY_STACK>/`（对方目录不存在就跳过），后者同名文件覆盖前者。
+>
+> **这两份预置里只有「策略」，没有任何「凭据」** —— 节点地址、端口、密码、UUID、
+> REALITY 公钥、机场订阅链接一律不进仓库：固件是公开产物，写进去就等于公开。
+> 构建时会跑 `scripts/check-no-credentials.sh` 扫一遍 `files*/etc/config/`，
+> 命中疑似凭据或订阅链接就**直接中断构建**（连合法内容如规则集 URL 不会被误判），
+> 把问题挡在 CI 里，而不是等镜像发出去才发现。
 
 `configs/` 里的内容取自上游作者自己维护的
 [Qualcommax_NSS_Builder](https://github.com/JuliusBairaktaris/Qualcommax_NSS_Builder)
@@ -281,8 +288,38 @@ HomeProxy 吃的是 sing-box 原生配置，和 passwall2 的 `shunt_rules` 结�
 | 直连 DNS | `dns_server 'direct_dns'`（udp 223.5.5.5）+ `dns_rule 'cn_dns'`（国内域名走它） |
 
 分流结果与 passwall2 版一致：**国内直连、境外走 URLTest 代理、广告域名丢弃**；DNS 也分域
-（国内用 223.5.5.5 直连解析，其余走 8.8.8.8 的 DoH 经代理）。同样**不含节点凭据**，
-留了 `node_vless`（VLESS+REALITY）、`node_ss`（Shadowsocks）两个模板。
+（国内用 223.5.5.5 直连解析，其余走 8.8.8.8 的 DoH 经代理）。
+
+**节点从哪来 —— 固件里只有策略，没有凭据**
+
+| 路线 | 你要做的 | 说明 |
+|---|---|---|
+| **A 手动** | 填 `node_vless`（VLESS+REALITY）或 `node_ss`（Shadowsocks）模板里的地址 / 公钥 / 密码 | 预置的 URLTest 组成员就是这两个模板，填完即可用 |
+| **B 订阅** | `服务 → HomeProxy → 节点 → Subscriptions` 填**你自己的**订阅链接 → `Update nodes from subscriptions` | 订阅开关已预置，唯独链接要自己填 |
+
+订阅那组设置（`auto_update` + 更新时间、`update_via_proxy`、`filter_nodes` / `filter_keywords`
+关键词过滤）已经预置在 `config homeproxy 'subscription'` 里，**唯独没有 `subscription_url`**
+—— 这条链接含机场的 service id 与密钥，不能进公开仓库。自动更新失败时
+`update_subscriptions.uc` 会跳过失败的那组、**保留旧节点**（`node_cache` 为空即 `return`），
+不会把节点清空，所以预置里默认就把 `auto_update` 打开了。
+
+> ⚠️ 走**订阅**路线时有个绕不开的步骤：订阅自动建出来的节点，section id 是 `MD5(节点名)`，
+> 固件没法预知，所以得把它们勾进 URLTest 组（HomeProxy 没有 passwall2 那种"按分组自动
+> 纳入"）。在设备上一条命令搞定：
+>
+> ```sh
+> # 把所有订阅节点（带 grouphash 的）加进 Main 组，并删掉空的手动模板
+> uci -q delete homeproxy.main.urltest_nodes
+> for n in $(uci show homeproxy | sed -n "s/^homeproxy\.\([^.]*\)=node$/\1/p"); do
+>   [ -n "$(uci -q get homeproxy.$n.grouphash)" ] && uci add_list homeproxy.main.urltest_nodes="$n"
+> done
+> # 注意 uci delete 一次只能删一个 section，别写成一行两个
+> uci -q delete homeproxy.node_vless
+> uci -q delete homeproxy.node_ss
+> uci commit homeproxy && /etc/init.d/homeproxy restart
+> ```
+>
+> 走**手动**路线则不用动成员列表 —— 预置的 `urltest_nodes` 已经指着那两个模板。
 
 **启用方式**（比 passwall2 多一步）：自定义路由模式下 HomeProxy 的"开关"不是主节点下拉，
 而是 `routing.default_outbound` —— `/etc/init.d/homeproxy` 取到 `nil` 时直接 `return 1`
@@ -308,8 +345,8 @@ HomeProxy 吃的是 sing-box 原生配置，和 passwall2 的 `shunt_rules` 结�
 | **ddns-go** | 开机自启 | Web 界面 `http://<路由器IP>:9876`，在里面添加 DDNS 记录。数据在 `/etc/ddns-go/config.yaml` |
 | **msd_lite** | 开机自启 | 客户端按 `http://<路由器IP>:7088/udp/<组播地址>:<端口>` 取流。**接收组播的网卡需要在 `服务 → msd_lite` 里选**（见下） |
 | **WireGuard** | 仅装好 | 没有常驻服务，到 `网络 → 接口` 新建一个 `wg` 协议接口即可，内核模块会自动加载 |
-| **passwall2** | 已预置分流，未启用 | 分流规则 / DNS / 转发 / URLTest 选路都已随固件预置好，**只剩节点凭据要填**（见上一节）。填完在 `服务 → Pass Wall 2` 打开总开关即可。核心只编了 **`sing-box`**（原生支持 SS/SSR/VMess/VLESS/Trojan/Hysteria2，`_shunt` 分流也由它实现），外带 **`sslocal`**（Shadowsocks-Rust 客户端，SS-Rust 类型节点靠它启动）；**没有** xray（见第五节，所以节点类型别选 Xray）。界面里缺的组件可在「组件更新」在线拉 |
-| **HomeProxy**（仅 HomeProxy 版） | 已预置 custom 三分流，未启用 | 与 passwall2 同源的三分流规则（Reject / Direct / Proxy）、URLTest 选路、分域 DNS（国内直连解析、其余 DoH 经代理）全部随固件预置，**只剩节点凭据要填**。填完把 `路由设置 → Default outbound` 选成 `Main` 即启用，详见上一节 |
+| **passwall2** | 已预置分流，未启用 | 分流规则 / DNS / 转发 / URLTest 选路都已随固件预置好，**只剩节点凭据 / 订阅链接要填**（见上一节）。填完在 `服务 → Pass Wall 2` 打开总开关即可。核心只编了 **`sing-box`**（原生支持 SS/SSR/VMess/VLESS/Trojan/Hysteria2，`_shunt` 分流也由它实现），外带 **`sslocal`**（Shadowsocks-Rust 客户端，SS-Rust 类型节点靠它启动）；**没有** xray（见第五节，所以节点类型别选 Xray）。界面里缺的组件可在「组件更新」在线拉 |
+| **HomeProxy**（仅 HomeProxy 版） | 已预置 custom 三分流，未启用 | 与 passwall2 同源的三分流规则（Reject / Direct / Proxy）、URLTest 选路、分域 DNS（国内直连解析、其余 DoH 经代理）全部随固件预置，**只剩节点凭据 / 订阅链接要填**（订阅开关也已预置，见上一节）。填完把 `路由设置 → Default outbound` 选成 `Main` 即启用，详见上一节 |
 | **statistics** | 开机自启 | `状态 → 统计` 里有 CPU（每核占用）、**温度**、内存、接口流量、无线的曲线图。温度采集默认是开的（uci-defaults 打开了 thermal 插件），如果想调去 `统计 → 设置` |
 | **首页硬件区块** | 装好即生效 | `状态 → 总览` 页底部多出一块「CPU / 温度 / 内存」：CPU 占用率（带当前频率）、每个温度传感器（`cpu-thermal` / `nss-*-thermal` / `wifi-thermal` …）、内存用量。是本仓库自己写的 include（`files/www/luci-static/resources/view/status/include/95_qhora_hw.js`），**不依赖 collectd**，开机就有数 —— 和上面 collectd 那套曲线图是两回事（一个看当前值，一个看历史） |
 | **autocore** | 装好即生效 | 两个命令行脚本：`tempinfo`（输出 `CPU: 52.3°C, WiFi: 61.0°C`）和 `cpuinfo`（CPU 型号）。就是 ImmortalWrt 首页温度那一行背后用的东西，本仓库把它同源抄了进来（见第六节 7）。首页显示仍由上面那块自写区块负责，不依赖它 |
@@ -358,7 +395,8 @@ cat /sys/class/thermal/thermal_zone*/type    # 固件里有哪些温度传感器
 | 用自己 fork 的源码 | 改 YAML `env.UPSTREAM_REPOSITORY` |
 | 系统默认配置（主机名、**LAN 网段**、无线、服务开关） | 往 `files/` 里按路径放文件，会原样叠加进镜像；首次启动脚本在 `files/etc/uci-defaults/`。LAN 网段在 `files/etc/uci-defaults/99-qhora-301w` 里（现在是 `192.168.35.1/24`） |
 | 改 passwall2 的出厂预置（分流规则 / DNS / 节点模板） | `files-passwall2/etc/config/passwall2`（**改完记得把 `address` 之类留空**，别把凭据提交上去）；这个目录只叠进 passwall2 版固件 |
-| 改 HomeProxy 的出厂预置（custom 三分流 / DNS / 节点模板） | `files-homeproxy/etc/config/homeproxy`（同样**别把凭据提交上去**）；只叠进 HomeProxy 版固件。注意它 `routing.default_outbound` 默认是 `nil`，即预置但不启用 |
+| 改 HomeProxy 的出厂预置（custom 三分流 / DNS / 节点模板 / 订阅开关） | `files-homeproxy/etc/config/homeproxy`（同样**别把凭据提交上去**）；只叠进 HomeProxy 版固件。注意它 `routing.default_outbound` 默认是 `nil`，即预置但不启用 |
+| 想确认预置里没夹带凭据 | 每次构建都会自动跑 `scripts/check-no-credentials.sh` —— 扫 `files*/etc/config/`，命中节点地址 / 密码 / UUID / REALITY 公钥 / 订阅链接就中断构建。也可以手动跑：`BUILDER_DIR=$PWD bash scripts/check-no-credentials.sh` |
 | 同时编多个机型 | 在 `configs/qhora_301w.config` 再加 `CONFIG_TARGET_DEVICE_qualcommax_ipq807x_DEVICE_xxx=y`，注意 RTL 相关的高危项见下 |
 
 自带配方不用登记：`extra-packages.sh` 是 `find packages -name Makefile` 扫出来的，

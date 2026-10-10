@@ -25,10 +25,20 @@
 #    remote_dns_doh / detour        dns_server 'remote_dns' (https 8.8.8.8, outbound=main)
 #    直连 DNS                       dns_server 'direct_dns' (udp 223.5.5.5)
 #
-#  ❌ 没有配、需要你自己填的：节点本身（地址 / 端口 / 密码 / UUID / REALITY
-#     公钥等）。固件是公开仓库产物，凭据不写进来。
-#     下面 node_vless / node_ss 两个模板，填你实际用的那个即可
-#     （另一个留空没有关系，URLTest 组会自己跳过不可用的）。
+#  ❌ 不写进固件的（固件是公开仓库产物，凭据进来就等于公开）：
+#     · 节点本身的地址 / 端口 / 密码 / UUID / REALITY 公钥
+#     · 机场订阅链接（含 service id 与密钥）
+#     ⇒ 出厂只预置「策略」（分流 / DNS / 选路 / 订阅开关），凭据由使用者自己补。
+#     两条路：
+#       A) 手动节点：填下面 node_vless / node_ss 里你实际用的那个即可
+#       B) 订阅：在「节点 → Subscriptions」页填链接后更新（开关已预置，见
+#          下面的 subscription 段）。注意订阅自动建出来的节点，section id 是
+#          MD5(节点名)，固件没法预知 ⇒ 刷完要把它勾进 routing_node 'main' 的
+#          URLTest 成员里（工程有现成的 uci 命令，见 README）。
+#     ⚠️ 两个模板留空是可以的，但**此时必须保持 default_outbound='nil'**：
+#        address 为空的节点生成的出站不合法，sing-box check 会 FATAL，
+#        init 据此 return 1 —— 也就是说，节点没填就启用是起不来的
+#        （好在它发生在改 dnsmasq / nft 之前，不会把 LAN 弄断）。
 #
 #  ⚠️ default_outbound 故意留 'nil'（= 不启动服务）——
 #     /etc/init.d/homeproxy 的 start_service() 是这样判的：
@@ -67,6 +77,31 @@ config homeproxy 'dns'
 	option dns_strategy 'prefer_ipv4'
 	# 未命中 dns_rule 的查询默认走这台（经代理的 DoH）
 	option default_server 'remote_dns'
+
+# ── 订阅设置（开关全部预置，唯独 ❌ 不含订阅 URL）────────────────────────
+#  刷完机在「服务 → HomeProxy → 节点 → Subscriptions」页填入你自己的订阅链接，
+#  点「Update nodes from subscriptions」，节点会自动建出来（带分组标签页）。
+#  ⚠️ 这里刻意没有 subscription_url —— 固件是公开产物，订阅链接里含机场的
+#     service id 与密钥，写进预置等于把它们公开。仓库有构建期守卫
+#     （scripts/check-no-credentials.sh）盯着这一点，写了会直接编不过。
+#  · auto_update      每天定时自动更新订阅节点与规则资源。拉取失败时
+#                     update_subscriptions.uc 会跳过该组、**保留旧节点**
+#                     （node_cache 为空即 return），不会把节点清空。
+#  · update_via_proxy 0 = 直连拉取订阅。首次填链接时还没有可用节点，只能直连；
+#                     若你的订阅域名本身被墙，先手动加一个节点并启用，
+#                     再把这项改成 1（经代理更新）。
+#  · filter_nodes / filter_keywords
+#                     机场常把「剩余流量 100G / 到期时间」塞成假节点，
+#                     这里按关键词把它们过滤掉（与参考机实测配置一致）。
+config homeproxy 'subscription'
+	option auto_update '1'
+	option auto_update_time '2'
+	option update_via_proxy '0'
+	option allow_insecure '0'
+	option packet_encoding 'xudp'
+	option filter_nodes 'blacklist'
+	list filter_keywords '重置|到期|过期|剩余|套餐'
+	list filter_keywords 'Expiration|Remaining'
 
 # ── 节点模板 ①：VLESS + REALITY（推荐，抗封锁最好）──────────────────────
 #    要填：address / uuid / tls_sni / tls_reality_public_key / tls_reality_short_id

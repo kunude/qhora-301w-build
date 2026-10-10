@@ -11,7 +11,9 @@
 #   2. 把 configs/common.config + configs/qhora_301w.config 拼成 .config，跑 make defconfig
 #   3. 校验 defconfig 没有静默丢弃符号（Kconfig 在依赖不满足时会无声地去掉选项）
 #   4. 关闭 NSS feed 的整体打包（feeds.conf 里声明了，但我们只要 .config 里显式选的包）
-#   5. 叠加 files/ 覆盖文件，再叠一层 files-<PROXY_STACK>/（变体专属）
+#   5. 扫描出厂预置（files*/etc/config/），命中节点凭据 / 订阅链接就中断构建
+#      —— 固件是公开产物，凭据进来就等于公开
+#   6. 叠加 files/ 覆盖文件，再叠一层 files-<PROXY_STACK>/（变体专属）
 #
 # 必需的环境变量：
 #   OPENWRT_DIR      已检出的 OpenWrt 源码目录（必须是 git 工作区）
@@ -279,7 +281,17 @@ feed_name="$(awk '{print $2}' <<<"$NSS_FEED")"
 log "关闭 CONFIG_FEED_${feed_name}（只保留 .config 里显式选中的包）"
 sed -i "s/^CONFIG_FEED_${feed_name}=.*/# CONFIG_FEED_${feed_name} is not set/" .config
 
-# ── 5. 叠加 files/ 与 files-<PROXY_STACK>/ ──────────────────
+# ── 5. 出厂预置守卫：不许出现凭据 / 订阅链接 ─────────────────
+# 固件是公开产物：覆盖层里任何节点地址 / 密码 / 订阅链接都会随镜像公开。
+# 这一步把「不小心把机场订阅写进预置文件」挡在构建阶段。
+log "扫描出厂预置（files*/etc/config/），确认没有节点凭据 / 订阅链接"
+if ! cred_report="$(BUILDER_DIR="$BUILDER_DIR" bash "$BUILDER_DIR/scripts/check-no-credentials.sh" 2>&1)"; then
+  mapfile -t _cred_hits <<<"$cred_report"
+  die "出厂预置里出现了疑似凭据 / 订阅链接（固件是公开产物，绝不能有）" "${_cred_hits[@]}"
+fi
+log "$cred_report"
+
+# ── 6. 叠加 files/ 与 files-<PROXY_STACK>/ ──────────────────
 # files/               两个变体共用（主机名、LAN 网段、首页硬件区块…）
 # files-<PROXY_STACK>/ 只给对应变体叠加。目前用于把 passwall2 的出厂
 #                      预置配置（etc/config/passwall2）只放进 passwall2 版，

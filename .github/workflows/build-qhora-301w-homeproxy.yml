@@ -71,7 +71,7 @@ on:
     paths:
       - ".github/workflows/build-qhora-301w-homeproxy.yml"
       - "configs/homeproxy.config"
-      # 变体专属覆盖层（目前还没有 files-homeproxy/，先声明着）
+      # 变体专属覆盖层：HomeProxy 的出厂预置（分流 / DNS / 订阅开关，不含任何凭据）
       - "files-homeproxy/**"
 
 # 用**独立**的 concurrency group，不要和主线共用。
