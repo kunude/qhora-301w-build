@@ -466,11 +466,17 @@ jobs:
           # luci-app-statistics 的默认依赖里，必须显式选）。
           # autocore 是 ImmortalWrt 首页温度那一行背后的包，提供 /sbin/tempinfo
           # 与 /sbin/cpuinfo（纯脚本，配方抄在本仓库 packages/emortal/autocore/）。
+          # ucode-mod-math 是**必须**的：homeproxy 的 generate_client.uc 第 11 行
+          # 写着 `import { isnan } from 'math'`，而上游 LUCI_DEPENDS 漏声明了这个模块。
+          # 少了它，固件刷进去后 HomeProxy 起不来，报
+          # "Unable to resolve path for module 'math'" 与
+          # "failed to generate client configuration"（192.168.2.1 实测）。
+          # 这里点名核对，等于保证「不会又编出一份 homeproxy 跑不起来的固件」。
           WANT="msd_lite luci-app-msd_lite luci-i18n-msd_lite-zh-cn \
                 ddns-go luci-app-ddns-go luci-i18n-ddns-go-zh-cn \
                 wireguard-tools luci-proto-wireguard kmod-wireguard \
                 luci-app-homeproxy luci-i18n-homeproxy-zh-cn \
-                sing-box kmod-nft-tproxy ucode-mod-digest \
+                sing-box kmod-nft-tproxy ucode-mod-digest ucode-mod-math \
                 luci-app-statistics luci-i18n-statistics-zh-cn \
                 collectd-mod-thermal rrdtool1 autocore"
 
@@ -587,7 +593,7 @@ jobs:
           UP_COMMIT="$(git -C openwrt log -1 --format='%h · %cs' 2>/dev/null || echo '?')"
           OW_VER="$(sed -n 's/^RELEASE:=//p' openwrt/include/version.mk 2>/dev/null | head -n1)"
 
-          PKGS="luci-app-homeproxy sing-box kmod-nft-tproxy ucode-mod-digest \
+          PKGS="luci-app-homeproxy sing-box kmod-nft-tproxy ucode-mod-digest ucode-mod-math \
                 msd_lite luci-app-msd_lite ddns-go luci-app-ddns-go \
                 wireguard-tools luci-proto-wireguard \
                 luci-app-statistics collectd-mod-thermal rrdtool1 autocore"

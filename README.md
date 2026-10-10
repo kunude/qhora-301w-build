@@ -359,6 +359,30 @@ FATAL: legacy inbound fields are deprecated in 1.11.0 and removed in 1.13.0
 > 出路：① 把 `imm_ref` 钉到 sing-box 仍是 1.12.25 的那个提交；② 确认 HomeProxy 的配置
 > 生成器已兼容后，设 `singbox_expect` 显式放行。
 
+### 另外还有个「必须有」：ucode 的 `math` 模块
+
+`generate_client.uc` 第 11 行是 `import { isnan } from 'math';`，而 ucode 的每个模块都是
+**独立子包**（`/usr/lib/ucode/<名>.so`，见 `package/utils/ucode/Makefile` 里的 `UcodeModule`
+列表）—— 基础包 `ucode` 只依赖 `libucode`，**本身不带 `math`**。
+`luci-base` 的依赖里只有 `ucode-mod-fs` / `-log` / `-uci` / `-ubus`，
+`luci-app-homeproxy` 自己只声明了 `+ucode-mod-digest`，**`math` 谁都不会拉**（上游漏声明）。
+
+少了它的后果同样是**运行期**才暴露：
+
+```
+Syntax error: Unable to resolve path for module 'math'
+In line 11, byte 29:
+`import { isnan } from 'math';`
+Near here ------------------^
+[DAEMON] Error: failed to generate client configuration.
+```
+
+HomeProxy 起不来。所以 `configs/homeproxy.config` 显式选了 `CONFIG_PACKAGE_ucode-mod-math=y`，
+HomeProxy 工作流的「校验功能包」清单里也点名核对它 —— 保证不会又编出一份跑不起来的固件。
+（`isnan` 确实由 `math` 模块导出，装上即好，不需要打补丁。）
+
+> 已经刷了不带这个包的固件：设备上 `apk add ucode-mod-math` 再 `/etc/init.d/homeproxy restart`。
+
 ---
 
 ## 六、排查
@@ -385,6 +409,8 @@ FATAL: legacy inbound fields are deprecated in 1.11.0 and removed in 1.13.0
   在固件里，然后退出重新登录 LuCI 让会话重取 ACL。
 - **首页温度某些项是空的** —— `cat /sys/class/thermal/thermal_zone*/type` 看内核暴露了哪些；
   `wcss-*` 是 WiFi 子系统，射频没开时读数不动属正常。
+- **HomeProxy 起不来，日志报 `Unable to resolve path for module 'math'`** —— 缺 `ucode-mod-math`
+  （见第五节）。早期 build 没带这个包；设备上 `apk add ucode-mod-math` 后重启 HomeProxy 即可。
 - **passwall2 日志报 `sslocal not found`** —— 节点类型是 `SS-Rust` 但固件里没有 `sslocal`。
   本固件已编入；刷的是更早的 run 就把 SS 类型改成 `sing-box`（sing-box 原生支持 SS）。
 - **为什么固件里没有 xray** —— 刻意的：`Basic_Core_SingBox=y`，只编 sing-box。它覆盖
