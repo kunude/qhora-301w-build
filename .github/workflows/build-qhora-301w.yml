@@ -49,6 +49,13 @@ on:
         description: "openwrt-passwall-packages 仓库地址（留空 = Openwrt-Passwall 官方）"
         required: false
         default: ""
+      # 勾选后**不恢复任何构建缓存**（dl 源码包 + ccache），完全从零编译。
+      # 只影响本次运行：跑完仍会保存新的源码包缓存供下次复用。
+      # 代价是慢很多（单条线常要 3 小时以上），只在想验证"真·干净构建"时勾。
+      clean_build:
+        description: "从头编译：忽略 dl 与 ccache 缓存"
+        type: boolean
+        default: false
   push:
     branches: [main]
     paths:
@@ -210,7 +217,9 @@ jobs:
 
       # ── 下载源码包 ────────────────────────────────────────────
       # 上游镜像偶尔抽风，重试三次。下载好的包在多次运行之间缓存复用。
+      # clean_build=true 时跳过恢复，从零开始下载。
       - name: 恢复源码包缓存
+        if: github.event.inputs.clean_build != 'true'
         uses: actions/cache/restore@v6
         with:
           path: openwrt/dl
@@ -262,6 +271,7 @@ jobs:
           echo "prefix=ccache-qhora301w-$sum-" >>"$GITHUB_OUTPUT"
 
       - name: 恢复 ccache
+        if: github.event.inputs.clean_build != 'true'
         uses: actions/cache@v6
         with:
           path: openwrt/.ccache
@@ -493,6 +503,70 @@ jobs:
           retention-days: 30
 
       # ── 可选：发 Release ──────────────────────────────────────
+      # 说明文本里的版本取自 rootfs 清单（*.manifest，每行 "<包> - <版本>"）——
+      # 那是固件里**实际装进去**的版本，比读配方文件可靠（配方版本 ≠ 最终包版本）。
+      # 生成 release-notes.md 后用 body_path 交给 gh-release：比在 body: 里内联
+      # ${{ }} 稳，多行表格与反引号都不用担心被解析。
+      # ── 版本汇总 ──────────────────────────────────────────────
+      - name: 生成 Release 说明（编译日期 / 各组件版本）
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.release == 'true'
+        run: |
+          set -uo pipefail
+          out="openwrt/bin/targets/${TARGET}/${SUBTARGET}"
+          manifest=$(find "$out" -maxdepth 1 -name '*.manifest' -print -quit 2>/dev/null || true)
+
+          # 取版本；没收录（本版没编进去）就如实写"未收录"，不编数字
+          ver_of() {
+            local v=""
+            if [[ -n "$manifest" ]]; then
+              v="$(sed -n "s/^$1[[:space:]]\+-[[:space:]]\+//p" "$manifest" | head -n1)"
+            fi
+            printf '%s' "${v:-未收录}"
+          }
+
+          DATE_UTC="$(date -u '+%Y-%m-%d %H:%M UTC')"
+          DATE_CN="$(date -u -d '+8 hours' '+%Y-%m-%d %H:%M')"
+          UP_COMMIT="$(git -C openwrt log -1 --format='%h · %cs' 2>/dev/null || echo '?')"
+          OW_VER="$(sed -n 's/^RELEASE:=//p' openwrt/include/version.mk 2>/dev/null | head -n1)"
+
+          PKGS="luci-app-passwall2 passwall2 sing-box xray-core \
+                shadowsocks-rust-sslocal chinadns-ng geoview tcping \
+                v2ray-geoip v2ray-geosite dnsmasq-full \
+                kmod-nft-tproxy msd_lite ddns-go autocore"
+
+          {
+            printf '# QHora-301W · NSS EDMA 固件（passwall2 版）\n\n'
+            printf '| | |\n|---|---|\n'
+            printf '| **编译日期** | %s（北京时间 %s） |\n' "$DATE_UTC" "$DATE_CN"
+            printf '| **代理栈** | passwall2（`luci-app-passwall2`） |\n'
+            printf '| **上游源码** | `%s` @ `%s`，提交 `%s` |\n' "$UPSTREAM_REPOSITORY" "$UPSTREAM_REF" "$UP_COMMIT"
+            printf '| **OpenWrt** | %s |\n' "${OW_VER:-未知}"
+            printf '| **构建配方** | `kunude/qhora-301w-build` @ `%s`，run #%s |\n\n' "${{ github.sha }}" "${{ github.run_number }}"
+
+            printf '## 组件版本（取自固件 rootfs 清单）\n\n'
+            printf '| 组件 | 版本 |\n|---|---|\n'
+            for p in $PKGS; do printf '| `%s` | %s |\n' "$p" "$(ver_of "$p")"; done
+            printf '\n'
+
+            cat <<'MD'
+          ## 文件
+
+          | 文件 | 用途 |
+          |---|---|
+          | `*-initramfs-uImage.itb` | **首次安装**：U-Boot 里用 TFTP 引导，再 sysupgrade |
+          | `*-squashfs-sysupgrade.bin` | 日常升级（已在跑 OpenWrt 时） |
+          | `*-squashfs-factory.bin` | eMMC 整盘写入 |
+
+          刷机前先用 `sha256sums` 校验。默认 LAN `192.168.35.1`，NSS 硬件卸载开机自启
+          （`nss-status` 查看状态）。出厂已配好分流 / DNS / 选路，**只需填节点或订阅链接**。
+
+          > ⚠️ 本固件不含 HomeProxy。两者共用同一个 `/usr/bin/sing-box` 与同一套
+          > nftables 透明代理，只能同时启用一个。
+          MD
+          } > "$GITHUB_WORKSPACE/release-notes.md"
+
+          echo "已生成 release-notes.md（$(wc -l < "$GITHUB_WORKSPACE/release-notes.md") 行）"
+
       - name: 计算 Release 标签
         if: github.event_name == 'workflow_dispatch' && github.event.inputs.release == 'true'
         id: tag
@@ -506,19 +580,6 @@ jobs:
           name: QHora-301W NSS EDMA ${{ steps.tag.outputs.tag }}
           draft: false
           prerelease: false
-          body: |
-            QNAP QHora-301W（qualcommax / ipq807x / qnap_301w）固件，
-            基于 `${{ env.UPSTREAM_REPOSITORY }}` 的 `${{ env.UPSTREAM_REF }}` 分支，
-            带 Qualcomm NSS 硬件卸载。
-
-            | 文件 | 用途 |
-            |---|---|
-            | `*-initramfs-uImage.itb` | **首次安装**：U-Boot 里用 TFTP 引导，再 sysupgrade |
-            | `*-squashfs-sysupgrade.bin` | 日常升级（已在跑 OpenWrt 时） |
-            | `*-squashfs-factory.bin` | eMMC 整盘写入 |
-
-            刷机前先用 `sha256sums` 校验。
-            NSS 卸载开机自启，`nss-status` 可查看运行状态；
-            想退回纯主机协议栈：`uci set nss.general.enabled='0'; uci commit nss; reboot`。
+          body_path: release-notes.md
           files: |
             openwrt/bin/targets/qualcommax/ipq807x/*qnap_301w*

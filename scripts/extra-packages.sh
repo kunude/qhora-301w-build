@@ -71,6 +71,9 @@
 #   IMM_REF         ImmortalWrt 的分支，默认 master
 #   IMM_LUCI        immortalwrt/luci 仓库地址
 #   IMM_PKGS        immortalwrt/packages 仓库地址（homeproxy 版取 sing-box 用）
+#   SINGBOX_EXPECT  homeproxy 版期望的 sing-box 配方版本，默认 1.12.25。
+#                   不符**直接中断构建**（不是警告）。想要 1.12.x 任意补丁版就写
+#                   `SINGBOX_EXPECT=1.12.*`（支持通配）。
 #   PW_REF          passwall 三个仓库的分支，默认 main
 #   PW_APP_REPO     openwrt-passwall2 仓库地址
 #   PW_PKGS_REPO    openwrt-passwall-packages 仓库地址
@@ -86,6 +89,8 @@
 #      1.14.0，而 HomeProxy 生成的配置还在用 1.13 已删除的 inbound 字段，
 #      1.14 上 sing-box check 直接 FATAL、服务起不来；
 #      immortalwrt/packages 是 1.12.25，正是 ImmortalWrt 自己配 HomeProxy 用的版本。
+#      该版本被 SINGBOX_EXPECT（默认 1.12.25）**硬断言**：不一致就中断构建，
+#      避免悄悄编出一份 homeproxy 起不来的固件。
 #
 # SPDX-License-Identifier: GPL-2.0-only
 set -euo pipefail
@@ -96,6 +101,9 @@ PROXY_STACK="${PROXY_STACK:-passwall2}"
 IMM_REF="${IMM_REF:-master}"
 IMM_LUCI="${IMM_LUCI:-https://github.com/immortalwrt/luci.git}"
 IMM_PKGS="${IMM_PKGS:-https://github.com/immortalwrt/packages.git}"
+# homeproxy 版期望的 sing-box 配方版本。默认钉在 1.12.25 —— ImmortalWrt 自己
+# 配 HomeProxy 用的就是它。支持通配（如 1.12.*）。
+SINGBOX_EXPECT="${SINGBOX_EXPECT:-1.12.25}"
 PW_REF="${PW_REF:-main}"
 PW_APP_REPO="${PW_APP_REPO:-https://github.com/Openwrt-Passwall/openwrt-passwall2.git}"
 PW_PKGS_REPO="${PW_PKGS_REPO:-https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git}"
@@ -251,16 +259,26 @@ if [[ "$PROXY_STACK" == "homeproxy" ]]; then
     || die "immortalwrt/packages 的 net/sing-box 没落位，检查 $IMM_PKGS 的 $IMM_REF 分支"
 
   sb_ver="$(pkg_ver_of feeds/packages/net/sing-box/Makefile)"
-  # sing-box 1.13 起删掉了 HomeProxy 仍在写的 inbound 字段，所以这里对
-  # "上游把配方升级了"给出显式警告 —— 那样编出来的固件里
-  # homeproxy 会在启动时被自己生成的配置卡死，而且是运行期才暴露。
-  case "$sb_ver" in
-    1.12.*) : ;;
-    *) warn "sing-box 配方版本是 $sb_ver，不是 1.12.x —— 请确认当前的 HomeProxy 生成器是否还兼容（1.13 起删除了 sniff / set_system_proxy 等 inbound 字段）" ;;
-  esac
+  # sing-box 1.13 起删掉了 HomeProxy 仍在写的 inbound 字段
+  # （sniff / sniff_override_destination / set_system_proxy），1.14 上
+  # `sing-box check` 直接 FATAL、/etc/init.d/homeproxy 据此 return 1，
+  # 服务永远起不来 —— 而且是**运行期才暴露**（编得出来、刷得进去、跑不起来）。
+  #
+  # 所以这里不留余地：配方版本必须等于 SINGBOX_EXPECT（默认 1.12.25），
+  # 否则中断构建。immortalwrt/packages 哪天把 sing-box 抬到新版本，
+  # 构建会在这里明确失败，而不是悄悄产出一份 homeproxy 起不来的固件。
+  # 出路两条，都写进了下面的报错里。
+  [[ "$sb_ver" == "$SINGBOX_EXPECT" ]] || die "sing-box 配方版本不符：实际 '$sb_ver'，期望 '$SINGBOX_EXPECT'
+      （配方取自 $IMM_PKGS@$IMM_REF）
+      HomeProxy 生成的配置里使用 1.13 起已删除的 inbound 字段（sniff /
+      sniff_override_destination / set_system_proxy），版本不符会让
+      /etc/init.d/homeproxy 在 sing-box check 阶段 return 1、服务起不来。
+      出路：① 把工作流输入 imm_ref 钉到 sing-box 仍是 1.12.25 的那个提交；
+            ② 确认 HomeProxy 的配置生成器已兼容后，设 SINGBOX_EXPECT=$sb_ver
+               显式放行（或写 SINGBOX_EXPECT=1.12.* 只锁小版本）。"
   luci_sha="$(git -C "$WORK/luci" rev-parse --short HEAD 2>/dev/null || echo '?')"
   ann "::notice title=HomeProxy 版本::luci-app-homeproxy（取自 immortalwrt/luci@$IMM_REF，commit ${luci_sha}）"
-  ann "::notice title=sing-box 版本::sing-box=${sb_ver}（取自 immortalwrt/packages@$IMM_REF —— 1.12.x 才与 HomeProxy 的配置生成器匹配）"
+  ann "::notice title=sing-box 版本::sing-box=${sb_ver}（取自 immortalwrt/packages@$IMM_REF，已断言 == ${SINGBOX_EXPECT}）"
 else
   # ════════════════════════════════════════════════════════════
   # ③-P 代理栈 = passwall2（默认）
