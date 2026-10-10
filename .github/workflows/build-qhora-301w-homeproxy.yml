@@ -72,9 +72,13 @@ on:
       - ".github/workflows/build-qhora-301w-homeproxy.yml"
       - "configs/homeproxy.config"
 
-# 不要并发跑两个全量编译，否则磁盘和 runner 都不够用。
+# 用**独立**的 concurrency group，不要和主线共用。
+# 实测教训：共用一个 group 时，主线那边只要有 run 在跑 / 排队，本工作流新进来的
+# run 会被 GitHub 直接判定为 cancelled（第一次触发就撞上了，run 还没开始就没了）。
+# 独立之后两条流水线各排各的。两个 job 跑在不同托管 runner 上，磁盘互不影响；
+# 真要担心账户并发额度，把本工作流的 schedule / push 都关掉、只手动跑即可。
 concurrency:
-  group: build-qhora-301w-${{ github.ref }}
+  group: build-qhora-301w-homeproxy-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
