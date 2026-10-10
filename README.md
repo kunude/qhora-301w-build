@@ -118,14 +118,23 @@ msd_lite / WireGuard / statistics / autocore ……）。版本取自固件 root
    ```
 
 4. 起来后路由器地址是 **`192.168.35.1`**（本仓库把出厂默认的 `192.168.1.1` 换掉了），
-   `root` 无密码。电脑重取一次 DHCP，再刷 sysupgrade：
+   `root` **没有密码**。⚠️ 此时 **LuCI 网页能空密码登录，SSH 不能** —— 本固件用的
+   openssh 默认拒绝空密码（原因与解法见「三、刷完之后 → SSH 登录」）。所以先在
+   **串口控制台**里给 root 设个密码，之后才能 `scp` / `ssh`：
 
    ```sh
+   # ① 串口控制台（本来就插着 USB-TTL，回车进 shell）
+   passwd                            # 设 root 密码；不设的话 SSH 一律拒绝
+
+   # ② 电脑上（重取一次 DHCP）
    scp openwrt-...-qnap_301w-squashfs-sysupgrade.bin root@192.168.35.1:/tmp/
    ssh root@192.168.35.1
    fw_printenv -n current_entry      # 必须是 0，不是就 fw_setenv current_entry 0
    sysupgrade -n /tmp/openwrt-...-qnap_301w-squashfs-sysupgrade.bin
    ```
+
+   不想设密码也行：镜像直接用 LuCI（`http://192.168.35.1`，空密码登录）的
+   `系统 → 备份/刷写固件` 上传。
 
 ### 以后升级
 
@@ -175,6 +184,52 @@ uci set nss.general.enabled='0'; uci commit nss; reboot
 所以首次开机直接生效，不用重启第二遍。
 
 **Wi-Fi 默认关闭且没有密码**，用网线连上后到 `网络 → 无线` 自己开射频并设密钥。
+
+### SSH 登录（root 密码；为什么"网页能进、SSH 提示密码错误"）
+
+本固件**关掉了 dropbear、改用 openssh-server**（`configs/common.config` 里
+`CONFIG_PACKAGE_dropbear=n` + `CONFIG_PACKAGE_openssh-server=y`）。OpenWrt 的 openssh
+包是**直接把上游原版 `sshd_config` 装进去**的，里面 `PermitRootLogin` 那行处于
+**注释**状态 ⇒ 生效值 = 上游默认的 **`prohibit-password`** ⇒ **root 只接受公钥，
+密码一律被拒**。而 LuCI 走的是 rpcd，其 `session.c` 的 `rpc_login_test_password()`
+第一句就是 `if (!hash || !*hash) return true;` —— **密码哈希为空就放行**。两者叠加
+就是你看到的现象：网页空密码能进，SSH 永远 `Permission denied, please try again`。
+
+固件现已用 `files/etc/ssh/sshd_config` 覆盖这份配置（只改 3 处：顶部加
+`Include /etc/ssh/sshd_config.d/*.conf`、`PermitRootLogin yes`、
+`PasswordAuthentication yes`）。**刷了更早 build 的设备要手动补一次**：
+
+```sh
+# ① 确认主配置里有 Include 那行（更早的 build 没有）
+grep -n '^Include' /etc/ssh/sshd_config
+#    没有 → 直接改主文件这两行也行：
+#    sed -i 's/^#PermitRootLogin prohibit-password/PermitRootLogin yes/;
+#            s/^#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+
+# ② 放开 root 密码登录（有 ① 的 Include 时用 drop-in，比改主文件干净）
+mkdir -p /etc/ssh/sshd_config.d
+cat > /etc/ssh/sshd_config.d/10-root-login.conf <<'EOF'
+PermitRootLogin yes
+PasswordAuthentication yes
+EOF
+chmod 0600 /etc/ssh/sshd_config.d/10-root-login.conf
+
+# ③ root 必须有密码 —— `PermitEmptyPasswords` 是上游默认的 no，空密码照样进不来
+passwd                            # 等价于 LuCI 的 `系统 → 管理权`
+
+# ④ 重启并核对**生效值**（-T 打印的是合并后的最终配置）
+/etc/init.d/sshd restart
+sshd -T | grep -Ei 'permitrootlogin|passwordauth|permitempty'   # 期望 yes / yes / no
+```
+
+排错提示：`sshd` 对同一关键字**取先出现的值**，所以 drop-in 必须写在 `Include` 那行
+之后的位置才能覆盖主配置；`sshd_config.d/` 里的文件权限太松（group/other 可写）
+会导致**整份配置被拒**，必须 `0600`。
+
+安全性：`PermitRootLogin yes` 只把密码爆破面暴露给**能连上 LAN 的人**，和 LuCI 原本的
+暴露面一致。想更稳就走公钥 —— `prohibit-password` 本来就允许 root 用公钥登录，把
+`id_ed25519.pub` 追加到 `/root/.ssh/authorized_keys`（`chmod 700 /root/.ssh`、
+`chmod 600 /root/.ssh/authorized_keys`）即可。
 
 ### passwall2 出厂预置（仅 passwall2 版）
 
@@ -454,6 +509,14 @@ HomeProxy 工作流的「校验功能包」清单里也点名核对它 —— �
 - **为什么固件里没有 xray** —— 刻意的：`Basic_Core_SingBox=y`，只编 sing-box。它覆盖
   SS / SSR / VMess / VLESS / Trojan / Hysteria2 / WireGuard 全部常用协议，`_shunt` 分流
   也是它自己实现的。
+- **网页能登录、SSH 一直提示密码错误** —— 不是密码打错了，是 sshd 的策略：本固件用
+  openssh（不是 dropbear），上游默认 `PermitRootLogin prohibit-password`（root 只收公钥），
+  空密码还会被 `PermitEmptyPasswords no` 挡掉；LuCI 走 rpcd，密码哈希为空时直接放行，
+  所以**只有 SSH 受影响**。补 `/etc/ssh/sshd_config.d/10-root-login.conf` 并给 root
+  设密码即可，详见「三、刷完之后 → SSH 登录」。
+- **`scp` 报 `subsystem request failed`** —— openssh ≥9 的 `scp` 默认走 SFTP 协议，
+  需要 `sshd_config` 里有 `Subsystem sftp /usr/libexec/sftp-server`（本固件带的覆盖版
+  有这行；`openssh-sftp-server` 也已编入）。临时可用 `scp -O` 退回旧协议。
 
 ---
 

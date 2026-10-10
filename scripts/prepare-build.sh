@@ -309,8 +309,9 @@ for d in "$BUILDER_DIR/files" "$overlay_variant"; do
 done
 
 if [[ -d files/etc/ssh ]]; then
-  # sshd_config 必须是 0600，否则 dropbear/openssh 会拒绝加载。
-  [[ -f files/etc/ssh/sshd_config ]] && chmod 0600 files/etc/ssh/sshd_config
+  # sshd 的配置文件不能对 group/other 可写，否则 openssh 会拒绝加载整个配置；
+  # 一律收紧成 0600（git 只记可执行位，检出后权限是 0644，所以必须在这里补）。
+  find files/etc/ssh -type f -exec chmod 0600 {} + 2>/dev/null || true
 fi
 # uci-defaults 里的脚本需要可执行位才会在首次启动时运行。
 if [[ -d files/etc/uci-defaults ]]; then
