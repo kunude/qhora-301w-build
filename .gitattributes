@@ -5,3 +5,6 @@
 *.config text eol=lf
 *.yml text eol=lf
 *.yaml text eol=lf
+# 内核补丁：CR 混进 hunk 会让 patch 报 "malformed patch" 直接失败，
+# 单列一条把意图写死（上面那条 * text=auto eol=lf 本来也覆盖它）。
+*.patch text eol=lf
