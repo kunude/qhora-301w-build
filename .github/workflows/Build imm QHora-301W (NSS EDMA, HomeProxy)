@@ -1,4 +1,4 @@
-name: Build QHora-301W (NSS EDMA, HomeProxy)
+name: Build imm QHora-301W (NSS EDMA, HomeProxy)
 
 # 从 JuliusBairaktaris/openwrt-nss-edma 的 nss-edma-rework 分支，为 QNAP QHora-301W
 # （qualcommax / ipq807x / qnap_301w）编译带 Qualcomm NSS 硬件卸载的 OpenWrt 固件。
