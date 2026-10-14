@@ -103,7 +103,7 @@ permissions:
 env:
   # ── 上游源码 ────────────────────────────────────────────────
   # 如果你想用自己 fork 的源码，把这里改成 "你的用户名/openwrt-nss-edma" 即可。
-  UPSTREAM_REPOSITORY: immortalwrt/master
+  UPSTREAM_REPOSITORY: immortalwrt/immortalwrt/master
   # 用 github.event.inputs 而不是 inputs：两者在 workflow_dispatch 下等价，
   # 但前者在 push / schedule 事件下也能安全求值（返回空）。
   UPSTREAM_REF: ${{ github.event.inputs.upstream_ref || 'nss-edma-rework' }}
