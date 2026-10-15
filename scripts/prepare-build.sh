@@ -45,6 +45,14 @@
 #                    拉最新 .srs；0 = 只用仓库内置的固定版（完全不联网）。
 #   RULESETS_STRICT  仅 PROXY_STACK=homeproxy 有意义。1 = 规则集没拿到最新版
 #                    就中断构建（默认 0：下载失败退回仓库副本并告警，照常出固件）。
+#   SINGBOX_MODE     仅 PROXY_STACK=homeproxy 有意义，原样透传给 extra-packages.sh：
+#                    fixed（默认）= 把 sing-box 钉回 1.12.25（旧线的组合）；
+#                    builtin = 用基座自带的那一对（基座是 immortalwrt 的线走这条）；
+#                    latest = 给 HomeProxy 打 1.13+ 兼容补丁（已过时，见该脚本）。
+#   SINGBOX_PKGS_REF 仅 SINGBOX_MODE=fixed 有意义：从 immortalwrt/packages 的哪个
+#                    ref 取那份 1.12.25，默认发布分支 openwrt-25.12。
+#                    **故意不跟 IMM_REF 走** —— master 上的 1.12.25 已在
+#                    2026-10-15 被 1.14.3 取代，跟着 master 走这条通道必然失败。
 #
 set -Eeuo pipefail
 
@@ -206,6 +214,7 @@ ls -1 feeds/ 2>/dev/null | sed 's/^/    /' | tee -a "$LOG_FILE" >&3 || true
 log "引入官方 feed 之外的包（PROXY_STACK=${PROXY_STACK}）"
 OPENWRT_DIR="$OPENWRT_DIR" BUILDER_DIR="$BUILDER_DIR" PROXY_STACK="$PROXY_STACK" \
   SINGBOX_MODE="${SINGBOX_MODE:-fixed}" SINGBOX_VERSION="${SINGBOX_VERSION:-}" \
+  SINGBOX_EXPECT="${SINGBOX_EXPECT:-}" SINGBOX_PKGS_REF="${SINGBOX_PKGS_REF:-}" \
   bash "$BUILDER_DIR/scripts/extra-packages.sh"
 
 # 解析这两个包的上游最新版本，注入到刚落位的自带配方里 —— 这是「上游一发新版，

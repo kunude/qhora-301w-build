@@ -80,10 +80,9 @@ It carried the vendor NSS stack … and is no longer updated or built.*），
 
 ### 与前两条 homeproxy 线最大的不同：sing-box 不降版本
 
-`build-qhora-301w-homeproxy.yml` 把 sing-box 钉在 **1.12.25**，是因为**旧版** HomeProxy
-生成的配置里写着 sing-box 1.13 已删除的 inbound 字段（`sniff` /
-`sniff_override_destination`），在 1.14 上 `sing-box check` 会 FATAL、
-`/etc/init.d/homeproxy` 据此 `return 1`，服务起不来（详见第五章）。
+`build-qhora-301w-homeproxy.yml` 把 sing-box 钉在 **1.12.25**，是为了配**1.12.25 时代**的
+HomeProxy 组合（legacy 写法在 1.14 上会 FATAL、`/etc/init.d/homeproxy` 据此 `return 1`，
+服务起不来 —— 详见第五章）。
 
 第四条线的基座是 immortalwrt，HomeProxy 与 sing-box 由**同一个上游**同步维护。
 实测（2026-10-15，immortalwrt master `da63f7d6`）两者已经互相适配：
@@ -110,13 +109,18 @@ HomeProxy 写的，其正则已经匹配不上 immortalwrt 当前的结构）。
 一旦上游把 legacy inbound 字段写回来，构建会**直接失败**，而不是悄悄产出一份
 homeproxy 起不来的固件。
 
-> ⚠️ `builtin` 只对 **immortalwrt 基座**成立。前两条线的基座是 nss-edma，那边
-> HomeProxy 还没迁移，必须继续走 `fixed`（钉 1.12.25）或 `latest`（打补丁）。
+> ⚠️ `builtin` 只对 **immortalwrt 基座**成立 —— 它依赖"基座自带的 HomeProxy 与基座的
+> sing-box 是同一上游配好的"这一条。nss-edma 基座不满足：它的 sing-box 来自
+> `openwrt/packages`（1.14.0），而 HomeProxy 是从 `immortalwrt/luci` 取的，那条线于是走
+> `fixed`（钉 1.12.25）。
+> 顺带说明：`immortalwrt/luci` 的生成器**已经迁移**到新版写法，所以 `fixed` 那条线实际
+> 拿到的是"迁移后的生成器 + 1.12.25"—— 实测这个组合 `check` 通过，成立（见第五章的对照表）。
 
 ## 目录结构
 
 ```
-.github/workflows/          # 四条构建线（前两条 nss-edma 基座；后两条 immortalwrt 基座 + NSS 补丁）
+.github/workflows/          # 六条构建线：nss-edma 基座 4 条（passwall2 / HomeProxy 钉 1.12.25 /
+                            #   HomeProxy 新版 sing-box / 上面那条的副本）+ immortalwrt 基座 + NSS 2 条
 configs/
   common.config             # NSS 卸载栈 + 通用选项 + 附加功能包
   qhora_301w.config         # 机型：target / 子目标 / 设备 / 内存档位
@@ -628,25 +632,43 @@ cat /sys/class/thermal/thermal_zone*/type     # 固件里有哪些温度传感�
 
 ---
 
-## 五、sing-box 版本（前两条 HomeProxy 线必须是 1.12.25）
+## 五、sing-box 版本（两条 HomeProxy 线走了相反的路）
 
-> 本节说的是**前两条 homeproxy 线**（nss-edma 基座）。第四条线
-> （`build-qhora-301w-imm-nss-homeproxy.yml`）的基座是 immortalwrt，它的
-> HomeProxy 与 sing-box 由同一上游同步维护、已互相适配，走 `SINGBOX_MODE=builtin`
-> 用基座自带的 1.14.x，**不受本节约束** —— 原因见上面「第四条线」那节。
+| 工作流 | `SINGBOX_MODE` | sing-box | 说明 |
+|---|---|---|---|
+| `build-qhora-301w-homeproxy.yml`（正式线） | `fixed`（默认） | **钉 1.12.25** | 从 `immortalwrt/packages@openwrt-25.12` 取配方覆盖基座那份 |
+| `Build imm QHora-301W (NSS EDMA, HomeProxy).yml` | 同上 | 同上 | 与正式线内容一致的副本 |
+| `build-qhora-301w-homeproxy-sb114.yml`（实验线） | `builtin` | **基座自带**（`openwrt/packages`，1.14.0） | 不换版本、不打补丁 |
+| `build-qhora-301w-imm-nss-homeproxy.yml`（第四条线） | `builtin` | **基座自带**（`immortalwrt/packages`，1.14.3） | 同上 |
 
-HomeProxy 生成的 client 配置里**仍写着 sing-box 1.13 已删除的 inbound 字段**
-（`sniff` / `sniff_override_destination` / `set_system_proxy`）。在 1.14 上：
+先纠正一个流传很久的错话：**`set_system_proxy` 不是 legacy 字段。** 它在 sing-box 1.14.x 的
+`option/simple.go` 里仍是 `HTTPMixedInboundOptions` 的合法成员（1.14.0 与 1.14.3 都一样）。
+真正会让 `sing-box check` 报错的是 `option/inbound.go` 里的 `SniffEnabled` /
+`SniffOverrideDestination` / `SniffTimeout`：
 
 ```
-FATAL: legacy inbound fields are deprecated in 1.11.0 and removed in 1.13.0
+FATAL: legacy inbound fields are deprecated in sing-box 1.11.0 and removed in sing-box 1.13.0
 ```
 
 `/etc/init.d/homeproxy` 会据此 `return 1` —— **服务永远起不来**，而且这是**运行期**才暴露的问题
-（编得出来、刷得进去、跑不起来）。三处来源的实测版本：`openwrt/packages` = 1.14.0、
-`openwrt-passwall-packages` = 1.14.0、**`immortalwrt/packages` = 1.12.25**。
+（编得出来、刷得进去、跑不起来）。
 
-所以 HomeProxy 版从 `immortalwrt/packages` 取 `net/sing-box` 覆盖官方那份，并做了**两道硬断言**：
+### 实测对照（官方二进制，与固件里那份同版本）
+
+同一份配置形态，两个版本分别跑 `sing-box check`：
+
+| 配置形态 | 1.12.25 | 1.14.3 |
+|---|---|---|
+| **迁移后写法**：`route.rules` 里 `{ action: 'sniff' }` / `{ action: 'hijack-dns' }`，inbound 带 `set_system_proxy: false`，规则集 `type: local` | ✅ 通过 | ✅ 通过 |
+| **legacy 写法**：inbound 上直接写 `sniff: true` | ✅ 通过（1.12 上还合法） | ❌ FATAL（上面那条） |
+
+这张表解释了两条线的全部理由：**迁移后的写法两个版本都吃**，所以"迁移后的生成器 + 1.12.25"
+（正式线现在的实际组合）和"迁移后的生成器 + 1.14.3"（builtin 那两条）都成立；而 legacy 写法在
+1.14 上必挂，所以才需要"把 sing-box 钉回 1.12.25"或者"换掉生成器"。
+
+### 正式线：钉 1.12.25（`SINGBOX_MODE=fixed`）
+
+做法是从 `immortalwrt/packages` 取 `net/sing-box` 覆盖基座那份，并做**两道硬断言**：
 
 1. `extra-packages.sh` 断言引入的**配方版本** == `SINGBOX_EXPECT`（默认 `1.12.25`；
    工作流输入 `singbox_expect` 可覆盖，支持通配如 `1.12.*`）；
@@ -654,35 +676,49 @@ FATAL: legacy inbound fields are deprecated in 1.11.0 and removed in 1.13.0
 
 任一不符则 `::error::` 并中断构建 —— 宁可编不出来，也不产出一份 HomeProxy 起不来的固件。
 
-> 上游哪天把 `immortalwrt/packages` 的 sing-box 抬到 1.13+，构建会在这里明确失败。
-> 出路：① 把 `imm_ref` 钉到 sing-box 仍是 1.12.25 的那个提交；② 确认 HomeProxy 的配置
-> 生成器已兼容后，设 `singbox_expect` 显式放行；③ 走下面的实验线。
+#### ⚠️ 取 1.12.25 的那个 ref 是**发布分支**，不是 master
 
-### 实验线：反过来 —— 留新版 sing-box、改 HomeProxy
+`SINGBOX_PKGS_REF`（默认 `openwrt-25.12`）决定从 `immortalwrt/packages` 的哪个 ref 取它，
+**故意不跟 `imm_ref` 走**：
 
-上面两条是**正式线**的做法（`SINGBOX_MODE=fixed`，sing-box 钉 1.12.25，HomeProxy 一字不动）。
-仓库里另有一条**实验线**，工作流 `build-qhora-301w-homeproxy-sb114.yml`，走的是反方向
-（`SINGBOX_MODE=latest`）：
+```
+2026-10-15T09:30:34Z   immortalwrt/packages 提交 0d7620f1ab7d
+    "sing-box: Update to 1.14.3"        master: 1.12.25  →  1.14.3
+```
 
-1. **不覆盖**官方配方，直接用 `openwrt/packages` 的 `net/sing-box`，把 `PKG_VERSION`
-   改成输入 `singbox_version`（默认 `1.14.3`），并用 codeload 的
-   `.../tar.gz/v<版本>` **现下现算** `PKG_HASH` 写回配方 —— 所以填一个不存在的版本号
-   会在准备阶段就明确失败；
-2. 构建期调 `scripts/patch-homeproxy-for-singbox113.py` 给 `generate_client.uc` 打补丁：
-   **删掉 inbound 上的 legacy 字段**，并按官方迁移方案在 `route.rules` 里补一条
-   `{ action: 'sniff' }`（上游其实早就留了注释占位，只是一直没启用）。
+master 上已经没有 1.12.25 了，跟着 master 走必然在版本断言处失败 —— 这正是 2026-10-16 那轮
+CI 红掉的原因（报错里会直接指出这一点）。仍带 1.12.25 的 ref：
 
-补丁用 sing-box 官方二进制的 `check` 在**同一份等价配置**上验证过：
-
-| 组合 | 结果 |
+| ref | sing-box |
 |---|---|
-| 1.14.3 + HomeProxy 原版 | ❌ FATAL（复现设备上的问题） |
-| 1.14.3 + 补丁版 | ✅ 通过 |
-| 1.12.25 + 补丁版 | ✅ 通过（**回归安全**：`action: 'sniff'` 自 1.11 起就可用） |
+| `openwrt-25.12` | 1.12.25 ← **默认** |
+| `openwrt-24.10` | 1.12.25 |
+| `ea19b15494f4ec531d608a9e9324e8794d47544f` | 1.12.25（master 上最后一次） |
+| `openwrt-23.05` | 1.11.15（不要用） |
 
-实验线**只能手动触发**，产物单独打标签 `qhora-301w-homeproxy-sb114-*`，不会和正式线混。
-构建期还会核对两件事：编出来的 sing-box 版本是否等于输入值、以及打补丁后的
-`generate_client.uc` 是否真的无 legacy 字段（这是本线与正式线唯一的差别，失效就等于白测）。
+工作流输入 `singbox_pkgs_ref` 可以按次覆盖它。
+
+### 实验线：反过来 —— 用基座自带的新版 sing-box（`SINGBOX_MODE=builtin`）
+
+`build-qhora-301w-homeproxy-sb114.yml` 原来走 `latest`：不换配方、把 `PKG_VERSION` 改成输入
+`singbox_version` 并重算 `PKG_HASH`，再调 `scripts/patch-homeproxy-for-singbox113.py` 给生成器
+打补丁。**这条路现在必然失败**，因为上游自己把这件事做完了：
+
+- `immortalwrt/luci` 的 `generate_client.uc` 已迁移到 1.13+ 写法 —— `route.rules` 里直接就是
+  `{ action: 'sniff' }` / `{ action: 'hijack-dns' }`，1.13 删掉的那两个 inbound 字段
+  **已删干净**；
+- 于是补丁脚本的正则匹配不上新结构，`latest` 会在"打补丁"这一步报错（实测确认）。
+
+所以实验线改走 `builtin`：**两边都不动**。它的输入里 `singbox_version` / `singbox_expect`
+已删除（不再换版本，留着只会误导 —— 填了不生效，界面却写着"要编的版本"）。产物阶段改为核对
+两件事：真正进固件的 sing-box 版本，以及同轮源码树里的 `generate_client.uc` 有没有 legacy
+inbound 字段（只认 `字段: true`；上游那份 `set_system_proxy: false` 不在此列，老版本的本步骤
+把它当 legacy 是**误杀**）。
+
+`extra-packages.sh` 里的 `latest` 通道与那个补丁脚本都保留着（万一上游回退还有出口），
+但**目前没有工作流用它**。
+
+实验线只能手动触发，产物单独打标签 `qhora-301w-homeproxy-sb114-*`，不会和正式线混。
 
 ### 另外还有个「必须有」：ucode 的 `math` 模块
 

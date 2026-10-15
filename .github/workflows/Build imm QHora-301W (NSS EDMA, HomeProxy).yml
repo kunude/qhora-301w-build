@@ -3,6 +3,17 @@ name: Build imm QHora-301W (NSS EDMA, HomeProxy)
 # 从 JuliusBairaktaris/openwrt-nss-edma 的 nss-edma-rework 分支，为 QNAP QHora-301W
 # （qualcommax / ipq807x / qnap_301w）编译带 Qualcomm NSS 硬件卸载的 OpenWrt 固件。
 #
+# ⚠️ 两点先说清楚（这两点都曾经把排查带偏）：
+#   1. 名字里的 "imm" 是**历史遗留**：本文件编的是 **nss-edma（openwrt 系）** 基座，
+#      **不是** immortalwrt。immortalwrt 基座上的 HomeProxy 版是另外那条
+#      build-qhora-301w-imm-nss-homeproxy.yml（它会打 NSS 补丁集、拼 imm-nss.config）。
+#   2. 本文件与 build-qhora-301w-homeproxy.yml 内容**完全一致**，只差 name 与
+#      concurrency group（早先 UPSTREAM_REPOSITORY 还被误写成
+#      "immortalwrt/immortalwrt/master" —— owner/repo 里混进了分支名，checkout 必失败，
+#      已改回 JuliusBairaktaris/openwrt-nss-edma）。
+#      既然两条线内容一样、又都监听 push，改一次文件会把同一份固件编两遍。
+#      想省一半额度就把下面 push 段整块注释掉、只留手动触发。
+#
 # 本工作流 = 主线 build-qhora-301w.yml 的**代理栈替换版**：
 #   passwall2（luci-app-passwall2 + 17 个组件）  →  HomeProxy（luci-app-homeproxy）
 # 其余一切完全一致：同一个上游源码与 ref、同一个 target/subtarget/device、
@@ -15,7 +26,10 @@ name: Build imm QHora-301W (NSS EDMA, HomeProxy)
 #     · 多拼一份 configs/homeproxy.config（覆盖层：把 passwall2 那组符号按掉，
 #       换成 homeproxy 那组 —— 见该文件头部对"为什么必须写 =n"的说明）
 #     · 从 immortalwrt/luci 稀疏检出 applications/luci-app-homeproxy
-#     · 从 immortalwrt/packages 取 net/sing-box（1.12.25）覆盖官方那份（1.14.0）
+#     · 从 immortalwrt/packages **的某个 ref** 取 net/sing-box（1.12.25）覆盖
+#       官方那份（1.14.0）。那个 ref 由 SINGBOX_PKGS_REF 指定、默认发布分支
+#       openwrt-25.12，**不跟 imm_ref 走** —— 上游 2026-10-15 已把 master 上的
+#       1.12.25 抬到 1.14.3，跟着 master 走本线必然失败。
 #   两条分支都留在同一份脚本里，默认值 passwall2 —— 主线构建行为一字未改。
 #
 # 触发方式：
@@ -63,7 +77,15 @@ on:
         required: false
         default: ""
       imm_pkgs:
-        description: "immortalwrt/packages 仓库地址（留空 = 官方；sing-box 1.12.x 从这里取）"
+        description: "immortalwrt/packages 仓库地址（留空 = 官方；只影响 fixed 通道取 sing-box）"
+        required: false
+        default: ""
+      # SINGBOX_PKGS_REF：上面那个仓库用**哪个 ref** 取 sing-box（只有默认的
+      # fixed 通道看它）。留空 = 脚本默认的 openwrt-25.12（ImmortalWrt 发布分支，
+      # 仍带本线要的 1.12.25）。它**不跟 imm_ref 走**，理由见文件头。
+      # 真出现"这个 ref 也没 1.12.25 了"，构建会明确报错，届时填 openwrt-24.10。
+      singbox_pkgs_ref:
+        description: "取 sing-box 1.12.25 的 ref（留空 = openwrt-25.12）"
         required: false
         default: ""
       # 勾选后**不恢复任何构建缓存**（dl 源码包 + ccache），完全从零编译。
@@ -83,7 +105,9 @@ on:
   push:
     branches: [main]
     paths:
-      - ".github/workflows/build-qhora-301w-homeproxy.yml"
+      # 原来这里写的是 build-qhora-301w-homeproxy.yml（那条线的文件名）——
+      # 典型复制粘贴：本文件改动自己反而不触发，改那条线才触发。改成自己的名字。
+      - ".github/workflows/Build imm QHora-301W (NSS EDMA, HomeProxy).yml"
       - "configs/homeproxy.config"
       # 变体专属覆盖层：HomeProxy 的出厂预置（分流 / DNS / 订阅开关，不含任何凭据）
       - "files-homeproxy/**"
@@ -94,7 +118,10 @@ on:
 # 独立之后两条流水线各排各的。两个 job 跑在不同托管 runner 上，磁盘互不影响；
 # 真要担心账户并发额度，把本工作流的 schedule / push 都关掉、只手动跑即可。
 concurrency:
-  group: build-qhora-301w-homeproxy-${{ github.ref }}
+  # 独立 group —— 注意线和线之间**不能共用**：早先本文件与
+  # build-qhora-301w-homeproxy.yml 共用 "build-qhora-301w-homeproxy-${{ github.ref }}"，
+  # 结果两条一样的流水线互相排队/取消（这个 group 的名字就是从那条线抄过来的）。
+  group: build-qhora-301w-homeproxy-dup-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -103,7 +130,7 @@ permissions:
 env:
   # ── 上游源码 ────────────────────────────────────────────────
   # 如果你想用自己 fork 的源码，把这里改成 "你的用户名/openwrt-nss-edma" 即可。
-  UPSTREAM_REPOSITORY: immortalwrt/immortalwrt/master
+  UPSTREAM_REPOSITORY: JuliusBairaktaris/openwrt-nss-edma
   # 用 github.event.inputs 而不是 inputs：两者在 workflow_dispatch 下等价，
   # 但前者在 push / schedule 事件下也能安全求值（返回空）。
   UPSTREAM_REF: ${{ github.event.inputs.upstream_ref || 'nss-edma-rework' }}
@@ -122,7 +149,8 @@ env:
   # ── 代理栈 ──────────────────────────────────────────────────
   # 与主线唯一的功能差异就在这里。脚本（prepare-build.sh / extra-packages.sh）
   # 读到它之后：多拼一份 configs/homeproxy.config、从 immortalwrt/luci 取
-  # luci-app-homeproxy、从 immortalwrt/packages 取 sing-box 1.12.x 覆盖官方那份。
+  # luci-app-homeproxy、从 immortalwrt/packages 的 SINGBOX_PKGS_REF（默认发布分支
+  # openwrt-25.12）取 sing-box 1.12.25 覆盖官方那份。
   PROXY_STACK: homeproxy
 
 jobs:
@@ -208,13 +236,16 @@ jobs:
           # 求值为空字符串，所以那两个触发方式天然就是"跟随最新"。
           DDNS_GO_VERSION: ${{ github.event.inputs.ddns_go_version }}
           MSD_LITE_SHA: ${{ github.event.inputs.msd_lite_sha }}
-          # HomeProxy 的两半都来自 ImmortalWrt：luci 提供 luci-app-homeproxy，
-          # packages 提供与它匹配的 sing-box（1.12.x，见 homeproxy.config 头部）。
-          # 全部留空 = 用 extra-packages.sh 里的默认值（ImmortalWrt 官方 master）。
+          # HomeProxy 的两半都来自 ImmortalWrt：luci 提供 luci-app-homeproxy
+          # （跟 imm_ref，默认 master），packages 提供本线要的 sing-box 1.12.25
+          # （跟下面的 SINGBOX_PKGS_REF，**故意不跟 imm_ref 走**，理由见文件头）。
+          # 全部留空 = 用 extra-packages.sh 里的默认值。
           # PROXY_STACK=homeproxy 在顶层 env 里，脚本据此切分支。
           IMM_REF: ${{ github.event.inputs.imm_ref }}
           IMM_LUCI: ${{ github.event.inputs.imm_luci }}
           IMM_PKGS: ${{ github.event.inputs.imm_pkgs }}
+          # 取那份 1.12.25 用的 ref（空 = 脚本默认 openwrt-25.12）。
+          SINGBOX_PKGS_REF: ${{ github.event.inputs.singbox_pkgs_ref }}
           # sing-box 配方版本的硬断言目标（空 = 脚本默认 1.12.25）。
           # 不一致时 extra-packages.sh 会直接中断构建。
           SINGBOX_EXPECT: ${{ github.event.inputs.singbox_expect }}
@@ -452,12 +483,13 @@ jobs:
           # +ucode-mod-digest），而 select 失败是**静默**的（package/feeds 里少了
           # 配方，符号就被丢掉）。不点名的话，"镜像里缺组件"要等两小时编完才发现。
           #
-          # sing-box 是代理核心，且**必须是 ImmortalWrt 那份 1.12.x**：
-          # 官方 feed 是 1.14.0，HomeProxy 生成的配置在 1.14 上
-          # `sing-box check` 直接 FATAL（1.13 起删除了 sniff /
-          # sniff_override_destination / set_system_proxy 等 inbound 字段），
-          # /etc/init.d/homeproxy 据此 return 1，服务起不来。
-          # prepare-build.sh 里另有一处对配方版本的显式断言。
+          # sing-box 是代理核心，且**必须是 ImmortalWrt 那份 1.12.25**：
+          # 基座官方 feed 是 1.14.0，而本线用的是 1.12.25 时代的 HomeProxy，
+          # 它的生成器会写出 1.13 起已删除的 inbound 字段（sniff /
+          # sniff_override_destination —— 注意 set_system_proxy 不在其列，
+          # 它在 1.14.x 里仍是合法字段），在 1.14 上 `sing-box check` 直接
+          # FATAL，/etc/init.d/homeproxy 据此 return 1，服务起不来。
+          # extra-packages.sh 里有一处对配方版本的显式断言。
           # kmod-nft-tproxy 是透明代理（TPROXY）的内核侧前提。
           #
           # 这里**故意没有** passwall2 / chinadns-ng / xray-core / sslocal /
@@ -617,9 +649,10 @@ jobs:
             printf '| 组件 | 版本 |\n|---|---|\n'
             for p in $PKGS; do printf '| `%s` | %s |\n' "$p" "$(ver_of "$p")"; done
             printf '\n'
-            printf '> HomeProxy 必须搭配 sing-box **1.12.x**：1.13 起删除了它生成的配置仍在\n'
-            printf '> 使用的 inbound 字段（`sniff` / `sniff_override_destination` /\n'
-            printf '> `set_system_proxy`），版本不符会让服务直接起不来。构建期已硬断言。\n\n'
+            printf '> HomeProxy 必须搭配 sing-box **1.12.x**：1.13 起删除了它生成的配置\n'
+            printf '> 仍在使用的 inbound 字段（`sniff` / `sniff_override_destination` —— 注意\n'
+            printf '> `set_system_proxy` **不**在此列，它在 1.14.x 里仍是合法字段）。版本不符\n'
+            printf '> 会让服务直接起不来，构建期已硬断言。\n\n'
 
             cat <<'MD'
           ## 文件

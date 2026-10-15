@@ -93,9 +93,16 @@
 #   OPENWRT_DIR     OpenWrt 源码目录（必需）
 #   BUILDER_DIR     本仓库检出目录（必需）
 #   PROXY_STACK     代理栈：passwall2（默认）| homeproxy
-#   IMM_REF         ImmortalWrt 的分支，默认 master
+#   IMM_REF         ImmortalWrt 的分支，默认 master（luci 侧也用它）
 #   IMM_LUCI        immortalwrt/luci 仓库地址
 #   IMM_PKGS        immortalwrt/packages 仓库地址（homeproxy 版取 sing-box 用）
+#   SINGBOX_PKGS_REF
+#                   IMM_PKGS 用哪个 ref，默认 openwrt-25.12。**只有 fixed 通道看它**，
+#                   而且它**故意不跟 IMM_REF 走**：IMM_REF 默认 master，而 master 在
+#                   2026-10-15（提交 0d7620f1ab7d）把 net/sing-box 从 1.12.25 抬到了
+#                   1.14.3 —— 1.12.25 在 master 上已经不存在。openwrt-25.12 是
+#                   ImmortalWrt 的发布分支，仍带 1.12.25（openwrt-24.10 也是，可作备选）。
+#                   想让它跟 IMM_REF 走（比如自己钉了个旧提交）就显式赋值。
 #   SINGBOX_EXPECT  homeproxy 版期望的 sing-box 配方版本，默认 1.12.25。
 #                   不符**直接中断构建**（不是警告）。想要 1.12.x 任意补丁版就写
 #                   `SINGBOX_EXPECT=1.12.*`（支持通配）。只在 SINGBOX_MODE=fixed 下生效。
@@ -123,16 +130,16 @@
 #      要拉一个"界面仓库 + 组件仓库"。
 #   ③ 段完全不跑（不引入 passwall 的两个仓库），sing-box 那边按
 #      SINGBOX_MODE 分三种处理：
-#       fixed  从 immortalwrt/packages 取 net/sing-box 落位到 feeds/packages/net/，
-#              **覆盖官方那份**。原因见 configs/homeproxy.config 头部：
-#              openwrt/packages 的 sing-box 是 1.14.x，而旧版 HomeProxy 生成的
-#              配置还在写 1.13 已删除的 inbound 字段，1.14 上 `sing-box check`
-#              直接 FATAL、服务起不来；immortalwrt/packages 长期是 1.12.25，
-#              正是 ImmortalWrt 自己配 HomeProxy 用的版本。该版本被
-#              SINGBOX_EXPECT（默认 1.12.25）**硬断言**：不一致就中断构建。
-#              ⚠️ 这条路依赖 immortalwrt/packages 里仍有 1.12.25。上游把它抬到
-#                 1.14.3 之后，**基座是 immortalwrt 的线不要再走这里**，
-#                 改用 builtin（基座自带的那一对本来就匹配）。
+#       fixed  从 immortalwrt/packages@SINGBOX_PKGS_REF（默认 openwrt-25.12）取
+#              net/sing-box 落位到 feeds/packages/net/，**覆盖官方那份**。
+#              为什么：nss-edma 基座的 openwrt/packages 是 1.14.x，而**旧线**
+#              （1.12.25 时代的 HomeProxy）要的是 ImmortalWrt 长期在用的 1.12.25。
+#              该版本被 SINGBOX_EXPECT（默认 1.12.25）**硬断言**：不一致就中断构建。
+#              2026-10-15 上游把 immortalwrt/packages 的 master 抬到 1.14.3，
+#              线1/线2 就是在这里红掉的 —— 修法是**别跟着 master 走**、钉发布分支，
+#              而不是放弃 1.12.25。
+#              ⚠️ 基座是 immortalwrt 的线不要走这里（它自带的那对本来就是新版的），
+#                 用 builtin。
 #       latest 见下面 ③-H 的通道说明（改 HomeProxy、留新 sing-box）。
 #       builtin 什么都不做：直接用基座自带的那一对。
 #
@@ -148,6 +155,9 @@ IMM_PKGS="${IMM_PKGS:-https://github.com/immortalwrt/packages.git}"
 # homeproxy 版期望的 sing-box 配方版本。默认钉在 1.12.25 —— ImmortalWrt 自己
 # 配 HomeProxy 用的就是它。支持通配（如 1.12.*）。
 SINGBOX_EXPECT="${SINGBOX_EXPECT:-1.12.25}"
+# 上面那版从 immortalwrt/packages 的**哪个 ref** 取，见文件头。默认发布分支
+# openwrt-25.12，而不是 IMM_REF（master 上已经没有 1.12.25 了）。
+SINGBOX_PKGS_REF="${SINGBOX_PKGS_REF:-openwrt-25.12}"
 # homeproxy 版处理「配置 ↔ sing-box 版本」的通道，见文件头说明。默认 fixed =
 # 与以前完全一致的行为；latest 改 HomeProxy、留新 sing-box；builtin 两边都不动
 # （基座自带的那一对，只对 immortalwrt 基座成立）。
@@ -262,20 +272,23 @@ fi
 # 稀疏检出：只下载指定目录的 blob，仓库其余部分不落地。
 # immortalwrt/luci 很大，所以这里值得用稀疏；passwall 那两个仓库很小，
 # 用后面的 clone_shallow 就够，不必把稀疏那套脆弱性引进来。
+#
+# ref 默认取 IMM_REF（luci 侧都是这样）。调用方可以用 `SPARSE_REF=xxx sparse_clone ...`
+# 覆盖 —— fixed 通道要钉 immortalwrt/packages 的**发布分支**，不能跟着 master 走。
 sparse_clone() {
-  local repo="$1" dest="$2"; shift 2
+  local repo="$1" dest="$2" ref="${SPARSE_REF:-$IMM_REF}"; shift 2
 
-  log "稀疏检出 $(basename "$repo")（只取：$*）"
+  log "稀疏检出 $(basename "$repo")@${ref}（只取：$*）"
   if git clone -q --depth=1 --filter=blob:none --sparse \
-       --branch "$IMM_REF" "$repo" "$dest" 2>/dev/null; then
+       --branch "$ref" "$repo" "$dest" 2>/dev/null; then
     git -C "$dest" sparse-checkout set "$@" >/dev/null 2>&1 \
       || warn "sparse-checkout set 失败，改用已有内容继续"
   else
     # 少数环境不支持 partial clone（--filter），退化为浅克隆整库。
     warn "稀疏检出失败，退化为浅克隆整库（会慢一些）"
     rm -rf "$dest"
-    git clone -q --depth=1 --branch "$IMM_REF" "$repo" "$dest" \
-      || die "克隆 $repo 失败"
+    git clone -q --depth=1 --branch "$ref" "$repo" "$dest" \
+      || die "克隆 $repo 失败（ref=$ref）"
     git -C "$dest" sparse-checkout set "$@" >/dev/null 2>&1 || true
   fi
 }
@@ -335,16 +348,31 @@ if [[ "$PROXY_STACK" == "homeproxy" ]]; then
   # 不拉 passwall 那两个仓库 —— HomeProxy 不需要它们（分流、DNS、协议实现
   # 全部由它自己生成的 sing-box 配置完成）。
   #
-  # HomeProxy 生成的 client 配置里写着 **sing-box 1.13.0 已删除**的 inbound 字段
-  # （sniff / sniff_override_destination / set_system_proxy），而 openwrt/packages
-  # 的 sing-box 已是 1.14.x —— 直接编出来会在运行期 FATAL：
-  #     legacy inbound fields are deprecated in 1.11.0 and removed in 1.13.0
-  # /etc/init.d/homeproxy 据此 return 1，服务永远起不来
-  # （编得出、刷得进、跑不起来；在 192.168.2.1 上实测确认过）。三条出路：
-  #   ① fixed   钉 immortalwrt/packages 的 1.12.25（默认；依赖上游仍有该版本）
-  #   ② latest  给 HomeProxy 打 1.13+ 兼容补丁、留新 sing-box
-  #   ③ builtin 基座自带的组合本来就已互相适配（immortalwrt 基座走这条）
-  # 走哪条由 SINGBOX_MODE 决定，下面三个分支一一对应。
+  # 【背景】这件事有两个互不相干的时代，别混起来看：
+  #
+  #   旧时代（1.12.25）：immortalwrt/luci 的 HomeProxy 生成器还在写 sing-box
+  #     1.13.0 已删除的 inbound 字段（sniff / sniff_override_destination），
+  #     而它配套的 sing-box 是 immortalwrt/packages 里的 1.12.25。openwrt/packages
+  #     已经是 1.14.x，直接混编会在运行期 FATAL：
+  #         legacy inbound fields are deprecated in 1.11.0 and removed in 1.13.0
+  #     /etc/init.d/homeproxy 据此 return 1，服务永远起不来
+  #     （编得出、刷得进、跑不起来；在 192.168.2.1 上实测确认过）。
+  #     所以旧线的做法是**把 sing-box 钉回 1.12.25**（通道 fixed）。
+  #
+  #   新时代（2026-10-15 起）：immortalwrt/luci 的生成器**自己迁移到新版写法**了
+  #     （route.rules 里直接是 { action: 'sniff' }；legacy inbound 字段已删干净），
+  #     immortalwrt/packages 也随之把 sing-box 抬到 1.14.3。两边由同一个上游
+  #     同步维护、已互相适配 —— 这时什么都不用做（通道 builtin）。
+  #
+  # 三条通道（由 SINGBOX_MODE 选，下面三个分支一一对应）：
+  #   ① fixed   钉 1.12.25：从 immortalwrt/packages@SINGBOX_PKGS_REF
+  #             （默认发布分支 openwrt-25.12）取那份配方覆盖掉基座的。
+  #             只有「基座是 openwrt / nss-edma 且要旧组合」的线才用它。
+  #   ② builtin 两边都不动，用基座自带的那一对（基座是 immortalwrt 的线走这条）。
+  #   ③ latest  给 HomeProxy 的生成器打 1.13+ 兼容补丁、留新 sing-box。
+  #             **已过时**：上游的生成器迁移之后，补丁脚本的正则匹配不上新结构，
+  #             这条通道现在必然报错。留着是给"万一上游回退"留个出口，别用它。
+  #             想跟新 sing-box 就走 builtin。
 
   if [[ "$SINGBOX_MODE" == "builtin" ]]; then
     # ── 通道 C：基座自带的那一对，两边都不动 ────────────────────────────
@@ -384,10 +412,13 @@ if [[ "$PROXY_STACK" == "homeproxy" ]]; then
     log "代理栈 = homeproxy：SINGBOX_MODE=builtin，沿用基座自带的 HomeProxy + sing-box ${sb_ver}（不改版本、不打补丁）"
 
     # 保险丝：万一上游哪天把 legacy inbound 字段写回来，这里必须有人喊。
-    if grep -qE '^[ \t]*sniff[ \t]*:[ \t]*true' "$gin"; then
-      die "基座的 generate_client.uc 里又出现了 legacy inbound 字段 sniff（上游回退了？）
+    # （注意只认 `字段: true` —— 残留的 `set_system_proxy: false` 是**合法**的
+    #   HTTPMixedInboundOptions 字段，不是 legacy，别把 line 误杀。）
+    if grep -qE '^[ \t]*(sniff|sniff_override_destination)[ \t]*:[ \t]*true' "$gin"; then
+      die "基座的 generate_client.uc 里又出现了 legacy inbound 字段 sniff / sniff_override_destination（上游回退了？）
       sing-box ${sb_ver} 会在 /etc/init.d/homeproxy 的 sing-box check 阶段 FATAL。
-      出路：改用 SINGBOX_MODE=latest（给 HomeProxy 打 1.13+ 兼容补丁）。"
+      出路：改用 SINGBOX_MODE=latest（给 HomeProxy 打 1.13+ 兼容补丁），
+            或把 sing-box 钉回 1.12.25（SINGBOX_MODE=fixed + SINGBOX_PKGS_REF）。"
     fi
     sb_desc="基座自带（$IMM_PKGS@$IMM_REF，HomeProxy 与 sing-box 由上游同步维护）"
   elif [[ "$SINGBOX_MODE" == "latest" ]]; then
@@ -429,36 +460,37 @@ if [[ "$PROXY_STACK" == "homeproxy" ]]; then
   else
     # ── 通道 A（默认）：钉 1.12.25，HomeProxy 一字不动 ─────────────────
     # ImmortalWrt 自己就是 sing-box 1.12.25 + homeproxy，上游验证过的组合。
-    log "代理栈 = homeproxy：取 ImmortalWrt 的 sing-box 配方（覆盖官方 1.14.x）"
-    sparse_clone "$IMM_PKGS" "$WORK/imm-packages" net/sing-box
+    # 关键：**不跟着 IMM_REF 走**，而是钉 SINGBOX_PKGS_REF（默认发布分支
+    # openwrt-25.12）—— 2026-10-15 上游把 immortalwrt/packages 的 master 从
+    # 1.12.25 抬到了 1.14.3，跟着 master 走这条通道就永远不成立。
+    log "代理栈 = homeproxy：取 ImmortalWrt 的 sing-box 配方（覆盖官方那份）"
+    log "  ref = $SINGBOX_PKGS_REF（IMM_PKGS=$IMM_PKGS）"
+    SPARSE_REF="$SINGBOX_PKGS_REF" \
+      sparse_clone "$IMM_PKGS" "$WORK/imm-packages" net/sing-box
     place "$WORK/imm-packages" feeds/packages/net net/sing-box sing-box \
       "ImmortalWrt sing-box（homeproxy 用）"
 
     [[ -f feeds/packages/net/sing-box/Makefile ]] \
-      || die "immortalwrt/packages 的 net/sing-box 没落位，检查 $IMM_PKGS 的 $IMM_REF 分支"
+      || die "immortalwrt/packages 的 net/sing-box 没落位，检查 $IMM_PKGS 的 $SINGBOX_PKGS_REF"
 
     sb_ver="$(pkg_ver_of feeds/packages/net/sing-box/Makefile)"
-    # sing-box 1.13 起删掉了 HomeProxy 仍在写的 inbound 字段
-    # （sniff / sniff_override_destination / set_system_proxy），1.14 上
-    # `sing-box check` 直接 FATAL、/etc/init.d/homeproxy 据此 return 1，
-    # 服务永远起不来 —— 而且是**运行期才暴露**（编得出来、刷得进去、跑不起来）。
+    # sing-box 1.13 起删掉了旧版 HomeProxy 仍在写的 inbound 字段
+    # （sniff / sniff_override_destination），1.14 上 `sing-box check` 直接
+    # FATAL、/etc/init.d/homeproxy 据此 return 1，服务永远起不来 ——
+    # 而且是**运行期才暴露**（编得出来、刷得进去、跑不起来）。
     #
     # 所以这里不留余地：配方版本必须等于 SINGBOX_EXPECT（默认 1.12.25），
-    # 否则中断构建。immortalwrt/packages 哪天把 sing-box 抬到新版本，
+    # 否则中断构建。SINGBOX_PKGS_REF 指的 ref 哪天也把 1.12.25 抬走，
     # 构建会在这里明确失败，而不是悄悄产出一份 homeproxy 起不来的固件。
-    # 出路三条，都写进了下面的报错里。
-    [[ "$sb_ver" == "$SINGBOX_EXPECT" ]] || die "sing-box 配方版本不符：实际 '$sb_ver'，期望 '$SINGBOX_EXPECT'
-      （配方取自 $IMM_PKGS@$IMM_REF）
-      HomeProxy 生成的配置里使用 1.13 起已删除的 inbound 字段（sniff /
-      sniff_override_destination / set_system_proxy），版本不符会让
-      /etc/init.d/homeproxy 在 sing-box check 阶段 return 1、服务起不来。
-      出路：① 把工作流输入 imm_ref 钉到 sing-box 仍是 1.12.25 的那个提交；
-            ② 确认 HomeProxy 的配置生成器已兼容后，设 SINGBOX_EXPECT=$sb_ver
-               显式放行（或写 SINGBOX_EXPECT=1.12.* 只锁小版本）；
-            ③ 想直接用新 sing-box，就走实验通道：SINGBOX_MODE=latest
-               （会调 scripts/patch-homeproxy-for-singbox113.py 改 HomeProxy，
-                而不是改 sing-box 版本）。"
-    sb_desc="immortalwrt/packages@$IMM_REF（已断言 == ${SINGBOX_EXPECT}）"
+    # 注意 RHS 不加引号：SINGBOX_EXPECT 支持 1.12.* 这类通配。
+    [[ "$sb_ver" == ${SINGBOX_EXPECT} ]] || die "sing-box 配方版本不符：实际 '$sb_ver'，期望 '$SINGBOX_EXPECT'
+      （配方取自 $IMM_PKGS@$SINGBOX_PKGS_REF）
+      这条通道要的是 1.12.25 那版 sing-box（旧线 HomeProxy 与它配套）。
+      出路：① 换一个仍带该版本的 ref —— 设 SINGBOX_PKGS_REF=openwrt-24.10
+              （或打开本仓库 README 第五章，那里列了所有仍带 1.12.25 的 ref）；
+            ② 真要跟着新 sing-box 走，就改用 SINGBOX_MODE=builtin（基座自带）
+               或 =latest（给 HomeProxy 打兼容补丁）—— 这两条通道不要 1.12.25。"
+    sb_desc="$IMM_PKGS@$SINGBOX_PKGS_REF（已断言 == ${SINGBOX_EXPECT}）"
   fi
 
   luci_sha="$(git -C "$WORK/luci" rev-parse --short HEAD 2>/dev/null || echo '?')"
