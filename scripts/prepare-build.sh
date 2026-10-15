@@ -14,10 +14,12 @@
 #   5. 扫描出厂预置（files*/etc/config/），命中节点凭据 / 订阅链接就中断构建
 #      —— 固件是公开产物，凭据进来就等于公开
 #   6. 叠加 files/ 覆盖文件，再叠一层 files-<PROXY_STACK>/（变体专属）
-#   6b.（仅 PROXY_STACK=homeproxy）把 HomeProxy 的 9 个 .srs 规则集刷成上游
-#      最新版并放进覆盖层 —— 固件里这些 ruleset 是 type=local + path，
-#      首次启动零下载，不会出现"规则下载失败 ⇒ sing-box 起不来 ⇒ dnsmasq
-#      已把 DNS 劫持到 5333 ⇒ 整个 LAN 断网"这条链。
+#   6b.（仅 PROXY_STACK=homeproxy）先断言出厂配置确实走"本地规则集"这条路
+#      （routing_mode=custom 且 ruleset 全是 type=local），再把 9 个 .srs
+#      规则集刷成上游最新版并放进覆盖层 —— 固件里这些 ruleset 是
+#      type=local + path，首次启动零下载，不会出现"规则下载失败 ⇒
+#      sing-box 起不来 ⇒ dnsmasq 已把 DNS 劫持到 5333 ⇒ 整个 LAN 断网"这条链。
+#      断言是必需的：模式不对时预置会**静默失效**（见 6b 处的注释）。
 #   7. 把 patches/kernel/<KERNEL_PATCHVER>/ 下的补丁注入上游内核源码树
 #      （当前只有一条：arm64 的 /proc/cpuinfo 补 model name，修首页「架构」显示 ?）
 #
@@ -382,6 +384,38 @@ fi
 # 下载失败默认不中断构建（用仓库兜底副本顶上 + ::warning::），
 # 需要"必须最新才允许编"时设 RULESETS_STRICT=1。
 if [[ "$PROXY_STACK" == "homeproxy" ]]; then
+  # ── 6b-0. 前提断言：这份配置真的会走"本地规则集"那条路 ──────────────
+  # generate_client.uc 第 62 行是 `if (routing_mode !== 'custom')` 的顶层分叉：
+  #   非 custom 模式 → 走"自动生成"分支，它**完全忽略** UCI 里的 config
+  #                    ruleset 节；bypass_mainland_china 还会另行硬编码注入
+  #                    3 个 remote 规则集（geoip-cn / geosite-cn /
+  #                    geosite-noncn，指向 fastly.jsdelivr.net，
+  #                    download_detour='main-out'），在 run 阶段才下载
+  #                    ⇒ "下载失败 ⇒ 起不来 ⇒ DNS 已被劫持到 5333"原样复现；
+  #   custom 模式   → 才轮到下面预置的那 9 条 local。
+  # 这个耦合不会报任何错、只会静默失效（预置白做、断网照旧），所以构建期拦死。
+  hp_conf="files/etc/config/homeproxy"
+  [[ -f "$hp_conf" ]] || die \
+    "PROXY_STACK=homeproxy 但覆盖层里没有 $hp_conf" \
+    "（files/ 与 files-homeproxy/ 都没提供出厂配置，检查覆盖目录）"
+
+  hp_mode="$(awk -F"'" '/^[[:space:]]*option[[:space:]]+routing_mode/ {print $2; exit}' "$hp_conf")"
+  if [[ "$hp_mode" != "custom" ]]; then
+    die "HomeProxy 出厂配置的 routing_mode 是 '${hp_mode:-未设置}'，必须是 custom" \
+        "非 custom 模式会忽略全部 config ruleset 节，并改用 3 个硬编码的 remote 规则集" \
+        "（generate_client.uc:62）—— 预置的 9 个本地 .srs 会静默失效、首启断网复现" \
+        "确实要换模式的话，得连本脚本与 README 的预期一起改，别只改这一行配置"
+  fi
+
+  hp_sections="$(grep -cE "^[[:space:]]*config[[:space:]]+ruleset[[:space:]]" "$hp_conf" || true)"
+  hp_local="$(grep -cE "^[[:space:]]*option[[:space:]]+type[[:space:]]+'local'" "$hp_conf" || true)"
+  if [[ "$hp_sections" != "$hp_local" ]]; then
+    die "HomeProxy 出厂配置里有 ruleset 不是 type='local'（共 $hp_sections 节，只有 $hp_local 节是 local）" \
+        "remote 规则集由 sing-box 在服务启动那一刻才下载，而 init.d 早已把 dnsmasq" \
+        "劫持到 5333 —— 任一条下载失败即整个 LAN 断网。必须全部 type='local' + path"
+  fi
+  log "HomeProxy 出厂配置：routing_mode=custom，$hp_local 条规则集全为 local（预置生效的前提成立）"
+
   ruleset_dir="files/etc/homeproxy/ruleset"
   if [[ ! -d "$ruleset_dir" ]]; then
     die "PROXY_STACK=homeproxy 但覆盖层里没有 $ruleset_dir ——" \

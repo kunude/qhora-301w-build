@@ -477,6 +477,47 @@ type=remote  ⇒ sing-box 在**服务启动那一刻**才去 url 下载规则（
 
 实测复现过这个现象（刷完配好节点一启用就断网），所以固件端必须消灭这条链。
 
+**换成 local 之后，失败发生的阶段也前移了 —— 断了也不会全网断**
+
+这不只是"少一次下载"。实测（官方 sing-box 1.14.3，与固件内同版本）：
+
+| 形态 | `sing-box check` 结果 |
+|---|---|
+| `local` + 合法文件 | rc=0 |
+| `local` + 文件不存在 | **rc=1** `parse rule-set[0]: no such file or directory` |
+| `local` + 垃圾内容 | **rc=1** `invalid sing-box rule-set file` |
+| `local` + 文件被截断 | **rc=1** `unexpected EOF` |
+| `remote` + 不存在的 URL（对照） | **rc=0 放行**，跑到 `run` 才 `FATAL` |
+
+关键在错误信息里的 `initialize router:` —— `check` 会把本地规则集整个解析一遍，
+而 remote 它根本不碰。`/etc/init.d/homeproxy` 里那句
+`elif ! "$PROG" check ...; then return 1` 位于**劫持 dnsmasq 之前**，`return 1`
+意味着后面每一行都不执行 ⇒ dnsmasq 从头到尾没被碰过。
+
+所以本地化之后最坏情况是「代理起不来、但网是通的」，不再是「整个 LAN 断网」。
+
+**⚠️ 前提：`routing_mode` 必须是 `custom`**
+
+`generate_client.uc:62` 是 `if (routing_mode !== 'custom')` 的顶层分叉：
+
+- **`custom`** → 走 `else` 分支，才轮到我们预置的那 9 条 local 规则集；
+- **非 `custom`**（`bypass_mainland_china` / `gfwlist` / `proxy_mainland_china` / `global`）
+  → 走"自动生成"分支，它**完全忽略** `config ruleset` 节；其中
+  `bypass_mainland_china` 还会另行硬编码注入 3 个 **remote** 规则集：
+
+  | tag | URL |
+  |---|---|
+  | `geoip-cn` | `fastly.jsdelivr.net/gh/1715173329/IPCIDR-CHINA@rule-set/cn.srs` |
+  | `geosite-cn` | `.../sing-geosite@rule-set-unstable/geosite-geolocation-cn.srs` |
+  | `geosite-noncn` | `.../geosite-geolocation-!cn.srs` |
+
+  三个都带 `download_detour: 'main-out'`，在 `run` 阶段才下载 ⇒ 断网那条链原样回来，
+  **而且预置的 9 个本地文件一点用都没有**。
+
+这个耦合不报任何错、只会静默失效，所以 `prepare-build.sh` 第 6b 步加了断言：
+`routing_mode` 必须是 `custom`，且 ruleset 节数必须等于 `type 'local'` 的个数，
+对不上直接中断构建。
+
 **规则文件怎么保持最新**
 
 | 时机 | 做法 |
