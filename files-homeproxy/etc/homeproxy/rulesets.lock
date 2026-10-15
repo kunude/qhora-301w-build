@@ -1,0 +1,13 @@
+# HomeProxy 规则集溯源（由 scripts/fetch-homeproxy-rulesets.sh 生成）
+# 生成时间(UTC): 2026-10-15 15:51:03
+# dest: files-homeproxy/etc/homeproxy/ruleset
+# 字段: <名字> <sha256> <字节> <来源: upstream|kept|pinned|existing> <URL>
+ads 84e2ed79617a492cb1adaf28bf0c59a1a42af854ab935605ba84e0deba386c88 8121 upstream https://raw.githubusercontent.com/SagerNet/sing-geosite/refs/heads/rule-set/geosite-category-ads-all.srs
+cn 7e5edaa3156918ebb732629f7b4ab3f03040b9940456438f976c2046033fc15c 56189 upstream https://raw.githubusercontent.com/SagerNet/sing-geosite/refs/heads/rule-set/geosite-cn.srs
+apple 9418454daa0f7f9935576ecf4270110621253382cbde6cd2b7bd96011f3b4463 17230 upstream https://raw.githubusercontent.com/SagerNet/sing-geosite/refs/heads/rule-set/geosite-apple.srs
+apple_cn 682b0e0fe96628e32c943386e048b4b3f15c95d54949c455045725baa8497159 2320 upstream https://raw.githubusercontent.com/SagerNet/sing-geosite/refs/heads/rule-set/geosite-apple%40cn.srs
+apple_upd 06fd413265f33782e9f186368a9346da9d2b46e3a1110d9304848ff97edeb0e4 249 upstream https://raw.githubusercontent.com/SagerNet/sing-geosite/refs/heads/rule-set/geosite-apple-update.srs
+bank_cn 2ba494e2f49792681f612352b2bb63dd59ebbad584436919ac5080773b9b3e0a 1145 upstream https://raw.githubusercontent.com/SagerNet/sing-geosite/refs/heads/rule-set/geosite-category-bank-cn.srs
+douyin f227d8ccdab524c3ede31db3144bbb0b7850b7154cca6ce0c1f43f03849f1093 699 upstream https://raw.githubusercontent.com/SagerNet/sing-geosite/refs/heads/rule-set/geosite-douyin.srs
+noncn 53fd2565620e60bc8a4c578840e99649d73e9d2134b751ce72b30941049a00ba 168357 upstream https://raw.githubusercontent.com/SagerNet/sing-geosite/refs/heads/rule-set/geosite-geolocation-!cn.srs
+geoip_cn 81ada5cafd9d831adc48776f29cdfe55c9713d9287caeef9de925ef30f66cce4 34268 upstream https://raw.githubusercontent.com/SagerNet/sing-geoip/refs/heads/rule-set/geoip-cn.srs

@@ -14,6 +14,10 @@
 #   5. 扫描出厂预置（files*/etc/config/），命中节点凭据 / 订阅链接就中断构建
 #      —— 固件是公开产物，凭据进来就等于公开
 #   6. 叠加 files/ 覆盖文件，再叠一层 files-<PROXY_STACK>/（变体专属）
+#   6b.（仅 PROXY_STACK=homeproxy）把 HomeProxy 的 9 个 .srs 规则集刷成上游
+#      最新版并放进覆盖层 —— 固件里这些 ruleset 是 type=local + path，
+#      首次启动零下载，不会出现"规则下载失败 ⇒ sing-box 起不来 ⇒ dnsmasq
+#      已把 DNS 劫持到 5333 ⇒ 整个 LAN 断网"这条链。
 #   7. 把 patches/kernel/<KERNEL_PATCHVER>/ 下的补丁注入上游内核源码树
 #      （当前只有一条：arm64 的 /proc/cpuinfo 补 model name，修首页「架构」显示 ?）
 #
@@ -35,6 +39,10 @@
 #                    immortalwrt 线（scripts/prepare-build-imm-nss.sh）会设它：
 #                    换成 ImmortalWrt 基座后个别符号与 openwrt 不同，那些差异
 #                    只对那条线成立，不能写进 common.config。不设则行为不变。
+#   RULESETS_REFRESH 仅 PROXY_STACK=homeproxy 有意义。1（默认）= 构建时从上游
+#                    拉最新 .srs；0 = 只用仓库内置的固定版（完全不联网）。
+#   RULESETS_STRICT  仅 PROXY_STACK=homeproxy 有意义。1 = 规则集没拿到最新版
+#                    就中断构建（默认 0：下载失败退回仓库副本并告警，照常出固件）。
 #
 set -Eeuo pipefail
 
@@ -358,6 +366,53 @@ fi
 # uci-defaults 里的脚本需要可执行位才会在首次启动时运行。
 if [[ -d files/etc/uci-defaults ]]; then
   chmod 0755 files/etc/uci-defaults/* 2>/dev/null || true
+fi
+
+# ── 6b. HomeProxy 规则集：编译期刷新到最新版 ──────────────────
+# 为什么固件里必须是 local 规则文件、不能是 remote：
+#   remote 时 sing-box 是**在服务启动那一刻**才去下载的，而
+#   /etc/init.d/homeproxy 早在那之前就把 dnsmasq 劫持到 127.0.0.1:5333 ——
+#   9 条规则里任意一条下载失败（raw.githubusercontent.com 直连不通，能用的
+#   代理又正是这个还没起来的服务），sing-box 就起不来，DNS 指向一个没人
+#   监听的端口 ⇒ 整个 LAN 上不了网。文件预置进固件后这条链不存在。
+#
+# 这里做两件事：
+#   ① 把 9 个 .srs 刷成上游最新（RULESETS_REFRESH=0 则用仓库里的固定版）；
+#   ② 断言"清单 ↔ 出厂配置 ↔ uci-defaults"三处名字一致、文件都是合法 .srs。
+# 下载失败默认不中断构建（用仓库兜底副本顶上 + ::warning::），
+# 需要"必须最新才允许编"时设 RULESETS_STRICT=1。
+if [[ "$PROXY_STACK" == "homeproxy" ]]; then
+  ruleset_dir="files/etc/homeproxy/ruleset"
+  if [[ ! -d "$ruleset_dir" ]]; then
+    die "PROXY_STACK=homeproxy 但覆盖层里没有 $ruleset_dir ——" \
+        "出厂配置里的 ruleset 是 type=local + path，文件缺失会让 sing-box check 直接 FATAL"
+  fi
+
+  if [[ "${RULESETS_REFRESH:-1}" == "1" ]]; then
+    log "HomeProxy 规则集：从上游拉取最新版（RULESETS_REFRESH=1）"
+    run_env=()
+    [[ "${RULESETS_STRICT:-0}" == "1" ]] && run_env+=( "--strict" )
+    if ! bash "$BUILDER_DIR/scripts/fetch-homeproxy-rulesets.sh" \
+           --dest "$ruleset_dir" \
+           --manifest "$BUILDER_DIR/configs/homeproxy-rulesets.list" \
+           --pinned "$BUILDER_DIR/files-homeproxy/etc/homeproxy/ruleset" \
+           "${run_env[@]}" 2>&1 | sed 's/^/    /'; then
+      die "HomeProxy 规则集处理失败"
+    fi
+  else
+    log "HomeProxy 规则集：RULESETS_REFRESH=0，使用仓库内置的固定版本（不联网）"
+    if ! bash "$BUILDER_DIR/scripts/fetch-homeproxy-rulesets.sh" \
+           --dest "$ruleset_dir" \
+           --manifest "$BUILDER_DIR/configs/homeproxy-rulesets.list" \
+           --verify-only 2>&1 | sed 's/^/    /'; then
+      die "HomeProxy 规则集校验失败（RULESETS_REFRESH=0 时要求仓库副本齐全）"
+    fi
+  fi
+
+  # 逐条列出来，日志里能一眼看到"这次固件里到底带了哪 9 个规则、多大"
+  mapfile -t _rs < <(find "$ruleset_dir" -maxdepth 1 -name '*.srs' -printf '%f %s\n' | sort)
+  log "固件预置规则集 ${#_rs[@]} 个：${_rs[*]}"
+  [[ "${#_rs[@]}" -gt 0 ]] || die "规则集目录是空的：$ruleset_dir"
 fi
 
 # ── 7. 注入 arm64 内核补丁：让 /proc/cpuinfo 带 model name ────

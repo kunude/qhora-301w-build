@@ -1,0 +1,110 @@
+#!/bin/sh
+# ═══════════════════════════════════════════════════════════════════════════
+#  HomeProxy 规则集：remote → 固件预置 local
+#
+#  ── 为什么首次开机必须做这件事 ────────────────────────────────────────
+#  规则集写成 type='remote' 时，sing-box 是**在服务启动那一刻**才去 url 下载
+#  的。/etc/init.d/homeproxy 的启动顺序是：
+#
+#      generate_client.uc → sing-box check → 写 dnsmasq 劫持(127.0.0.1:5333)
+#        → 建路由表 → procd 起 sing-box
+#
+#  注意 dnsmasq 劫持写在**起 sing-box 之前**。于是只要 sing-box 因为规则集
+#  下载不出来而起不来（raw.githubusercontent.com 直连不通，而能通的代理又
+#  正是这个还没起来的服务 —— 先有鸡还是先有蛋），DNS 就被指向一个没人监听
+#  的 5333 端口，**整个 LAN 上不了网**。
+#
+#  固件把这 9 个 .srs 预置在 /etc/homeproxy/ruleset/ 并改成 type='local'，
+#  首启零下载 ⇒ 不存在这条链。
+#
+#  ── 两种场景 ──────────────────────────────────────────────────────────
+#   · 全新刷机：/etc/config/homeproxy 已经就是 local，这里只做兜底校正；
+#   · 保留配置升级：旧 overlay 里的 /etc/config/homeproxy（remote 版）会盖住
+#     固件里那份 ⇒ 这里就地把它改写成 local。
+#
+#  ── 执行时机与幂等 ────────────────────────────────────────────────────
+#  /etc/init.d/boot（START=10）会 `cd /etc/uci-defaults` 后逐个 source，
+#  返回 0 的脚本随即被删除；同时它排在 homeproxy（START=99）之前 ——
+#  也就是说改写一定发生在 sing-box 被拉起之前。
+#  脚本本身幂等：已经是 local 且 path 正确的节，一个字节都不动。
+#  （保留配置升级后这些脚本会再次出现并重跑 —— overlay 备份不保存"已删除"
+#    标记，这正是我们想要的：用户机器上那份 remote 配置也能被修好。）
+# ═══════════════════════════════════════════════════════════════════════════
+
+RS_DIR=/etc/homeproxy/ruleset
+
+# 没有预置目录就什么都不做（例如精简自编固件把规则集去掉了）
+[ -d "$RS_DIR" ] || exit 0
+
+changed=0
+
+migrate() {
+	name="$1"                       # uci 节名 == /etc/homeproxy/ruleset/<名字>.srs
+	label="$2"
+
+	# 文件不在就别改配置：留一份指向不存在文件的 local 规则，比 remote 更糟
+	# （sing-box check 直接 FATAL）。
+	[ -s "$RS_DIR/$name.srs" ] || return 0
+
+	local path="$RS_DIR/$name.srs"
+
+	if uci -q get "homeproxy.$name" >/dev/null 2>&1; then
+		# 已经是 local：只补 path / format（用户手工动过或缺字段时）
+		local ctype cpath
+		ctype="$(uci -q get "homeproxy.$name.type")"
+		cpath="$(uci -q get "homeproxy.$name.path")"
+		if [ "$ctype" = "local" ] && [ "$cpath" = "$path" ]; then
+			return 0
+		fi
+		if [ "$ctype" = "local" ]; then
+			uci set "homeproxy.$name.path=$path"
+			uci set "homeproxy.$name.format=binary"
+			changed=1
+			echo "homeproxy: ruleset '$name' 补全 path"
+			return 0
+		fi
+
+		# 旧配置是 remote ⇒ 就地改成本地预置，并把只有 remote 才用的字段删干净
+		# （type=local 时 sing-box 只认 format/path，多出来的 url 会让
+		#   sing-box check 报 unknown field 而 FATAL）。
+		uci set "homeproxy.$name.type=local"
+		uci set "homeproxy.$name.format=binary"
+		uci set "homeproxy.$name.path=$path"
+		uci -q delete "homeproxy.$name.url"
+		uci -q delete "homeproxy.$name.outbound"
+		uci -q delete "homeproxy.$name.update_interval"
+		changed=1
+		echo "homeproxy: ruleset '$name' 由 remote 迁移为固件预置 local"
+	else
+		# 配置里根本没有这一条（用户删除过，或旧配置早于这版预设）⇒ 建出来
+		uci -q set "homeproxy.$name=ruleset"
+		uci set "homeproxy.$name.label=$label"
+		uci set "homeproxy.$name.enabled=1"
+		uci set "homeproxy.$name.type=local"
+		uci set "homeproxy.$name.format=binary"
+		uci set "homeproxy.$name.path=$path"
+		changed=1
+		echo "homeproxy: 新增固件预置 ruleset '$name'"
+	fi
+}
+
+# 名字/标签必须与 configs/homeproxy-rulesets.list 和
+# files-homeproxy/etc/config/homeproxy 三处一致
+# （scripts/fetch-homeproxy-rulesets.sh 会在构建期替你核对）。
+migrate ads       Ads
+migrate cn        CN
+migrate apple     Apple
+migrate apple_cn  AppleCN
+migrate apple_upd AppleUpdate
+migrate bank_cn   BankCN
+migrate douyin    Douyin
+migrate noncn     NonCN
+migrate geoip_cn  GeoIPCN
+
+if [ "$changed" = "1" ]; then
+	uci commit homeproxy 2>/dev/null
+	sync
+fi
+
+# 返回 0 ⇒ 本脚本被框架删除，不再重跑
+exit 0

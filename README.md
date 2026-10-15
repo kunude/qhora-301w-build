@@ -122,6 +122,7 @@ configs/
   qhora_301w.config         # 机型：target / 子目标 / 设备 / 内存档位
   homeproxy.config          # 覆盖层：关掉 passwall2 那组、换成 HomeProxy
   imm-nss.config            # 覆盖层：只给两条 imm 线（immortalwrt 的符号差异）
+  homeproxy-rulesets.list   # HomeProxy 规则集清单（名字 ↔ 上游 URL，9 条）
 packages/net/{ddns-go,msd_lite}/   # 自带配方（直接引用上游源码，版本构建时解析注入）
 packages/emortal/autocore/         # 纯脚本包，提供 tempinfo / cpuinfo
 patches/kernel/6.18/               # 叠进上游内核源码树的内核补丁（见下）
@@ -133,9 +134,12 @@ scripts/
   extra-packages.sh         # 把 feed 里没有 / 不该用官方那份的包放进 feed 目录树
   resolve-versions.sh       # 构建时解析 ddns-go / msd_lite 的上游最新版本
   check-no-credentials.sh   # 构建期守卫：预置文件里出现凭据/订阅链接就中断
+  fetch-homeproxy-rulesets.sh # 拉取/校验 9 个 .srs 规则集（构建期刷新 + 刷新仓库副本）
 files/                      # 两个变体共用的覆盖文件（uci-defaults、首页硬件区块等）
 files-passwall2/            # 只叠进 passwall2 版：etc/config/passwall2
-files-homeproxy/            # 只叠进 HomeProxy 版：etc/config/homeproxy
+files-homeproxy/            # 只叠进 HomeProxy 版：etc/config/homeproxy、
+                            #   etc/homeproxy/ruleset/*.srs（9 个预置规则集）、
+                            #   etc/uci-defaults/95-homeproxy-rulesets（升级时 remote→local）
 ```
 
 **预置文件里只有「策略」，没有「凭据」。** 节点地址 / 端口 / 密码 / UUID / REALITY 公钥 /
@@ -455,6 +459,68 @@ service id 与密钥）。自动更新失败时 `update_subscriptions.uc` 会跳
 1. 列表型选项必须写 `list`，写 `option x 'a' 'b'` 会被 uci 解析器拒（`too many arguments`）。
 2. `routing_rule` 段的**先后顺序就是匹配优先级**，Reject 必须排最前。
 3. `urltest_interval` 要写裸秒数（生成器做的是 `值 + 's'`），写 `3m` 会得到 `3ms`。
+
+#### 规则集（9 个 `.srs`）是**随固件预置**的，首启不下载
+
+出厂配置里这 9 条 ruleset 一律是 `type 'local'` + `path '/etc/homeproxy/ruleset/x.srs'`，
+文件直接打进固件。**别改成 `remote`** —— 那不是风格问题，是会断网的事故链：
+
+```
+type=remote  ⇒ sing-box 在**服务启动那一刻**才去 url 下载规则（还得经代理）
+             ⇒ 9 条里任一条失败（raw.githubusercontent.com 直连不通，
+                能用的代理恰恰是这个还没起来的服务，先有鸡后有蛋）
+             ⇒ sing-box 起不来
+             ⇒ 而 /etc/init.d/homeproxy 早在起 sing-box **之前**
+                就把 dnsmasq 劫持到 127.0.0.1:5333 了
+             ⇒ DNS 指向一个没人监听的端口 ⇒ 整个 LAN 上不了网
+```
+
+实测复现过这个现象（刷完配好节点一启用就断网），所以固件端必须消灭这条链。
+
+**规则文件怎么保持最新**
+
+| 时机 | 做法 |
+|---|---|
+| 编译时（默认） | `prepare-build.sh` 第 6b 步自动从上游拉最新 `.srs` 写进覆盖层，并写一份 `/etc/homeproxy/rulesets.lock` 溯源 |
+| 编译时（固定版） | `RULESETS_REFRESH=0`：完全不联网，用仓库里 `files-homeproxy/etc/homeproxy/ruleset/` 那份固定副本（= 可复现固件） |
+| 编译时（严格） | `RULESETS_STRICT=1`：没拿到全部最新版就中断构建（默认 0：下载失败退回仓库副本 + `::warning::`，照常出固件） |
+| 机器上 | 换掉 `/etc/homeproxy/ruleset/*.srs` 后 `/etc/init.d/homeproxy restart` |
+| 想彻底换成自动更新 | LuCI 里把某条的 **Type 改成 Remote** 并填 URL（选 Local 时 URL 字段会自动隐藏，反之亦然）。⚠️ 在节点还没配好之前别这么干 |
+
+CI 上直接勾选：第四条线的 `rulesets_refresh`（默认勾选）/ `rulesets_strict`（默认不勾）。
+
+**升级时旧配置怎么办**：`/etc/uci-defaults/95-homeproxy-rulesets` 会在首次开机
+（`/etc/init.d/boot`，START=10 → 早于 homeproxy 的 START=99）把你机器上那份
+**remote 配置就地改写成 local**，并删掉只有 remote 才用的 `url` / `outbound` /
+`update_interval`：
+
+```sh
+# ⚠️ type=local 时这三个字段必须删干净，否则 sing-box check 直接 FATAL：
+#    FATAL decode config: route.rule_set[0].url: json: unknown field "url"
+# （用官方 sing-box 1.14.3 实测确认过）
+```
+
+这正是"保留配置升级"也不会再断网的原因；全新刷机时配置本来就是 local，脚本只做兜底校正。
+
+**三处名字必须一致**（改名字要同步改）：
+
+```
+configs/homeproxy-rulesets.list                              ← 清单（名字 ↔ URL）
+files-homeproxy/etc/config/homeproxy                          ← 出厂配置（local + path）
+files-homeproxy/etc/uci-defaults/95-homeproxy-rulesets         ← 升级迁移
+```
+
+构建期由 `scripts/fetch-homeproxy-rulesets.sh` 自动核对，名字对不上会**直接中断构建**
+（否则会出现"配了 ruleset x、文件却叫 y.srs"这种一启动就 FATAL 的固件）。
+文件校验用的是硬指标：非空 + 文件头必须是 `SRS`（sing-box 二进制规则集魔数），
+外加用官方 `sing-box 1.14.3 rule-set decompile` 逐条解过一遍（9/9 通过）。
+
+想手动刷新仓库里那份固定副本：
+
+```sh
+bash scripts/fetch-homeproxy-rulesets.sh --dest files-homeproxy/etc/homeproxy/ruleset
+bash scripts/fetch-homeproxy-rulesets.sh --dest files-homeproxy/etc/homeproxy/ruleset --verify-only  # 只校验不联网
+```
 
 ### 附加服务
 

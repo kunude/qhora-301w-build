@@ -98,6 +98,19 @@ on:
         description: "从头编译：忽略 dl 与 ccache 缓存"
         type: boolean
         default: false
+      # HomeProxy 的 9 个 .srs 规则集随固件预置（type=local），首启零下载。
+      # 默认在**每次构建时**从上游拉最新版写进覆盖层 —— 想要"每次都最新"就
+      # 保持勾选；想要可复现的固件（规则版本固定成仓库里那份）就取消勾选。
+      # 拉取失败默认不中断构建（退回仓库内置副本 + 打 ::warning::），
+      # 要"必须最新、否则别编"就同时勾上下面那个 strict。
+      rulesets_refresh:
+        description: "构建时从上游拉最新 HomeProxy 规则集（取消勾选 = 用仓库内置固定版）"
+        type: boolean
+        default: true
+      rulesets_strict:
+        description: "规则集必须全部拿到最新版，否则中断构建"
+        type: boolean
+        default: false
   push:
     branches: [main]
     # 与老 homeproxy 线同样的取舍：只监听"只属于本线"的文件。
@@ -106,6 +119,12 @@ on:
       - ".github/workflows/build-qhora-301w-imm-nss-homeproxy.yml"
       - "configs/homeproxy.config"
       - "configs/imm-nss.config"
+      # 规则集清单（名字 ↔ URL）改了要重编：文件随固件打包，
+      # 清单就是"固件里该有哪 9 个规则"的唯一声明。
+      # ⚠️ files-homeproxy/** 与 scripts/** 故意**不**监听（会让 imm-nss 线
+      #    一起进全量编译）；改了规则文件本身（files-homeproxy/.../ruleset/*.srs）
+      #    或脚本，手动 Run workflow 即可 —— 与老 homeproxy 线的取舍一致。
+      - "configs/homeproxy-rulesets.list"
   schedule:
     # GitHub 的 cron 用 UTC。20:00 UTC = 次日 04:00 东八区。
     # imm-nss 线是 17:00 UTC，错开 3 小时，别让两个全量编译撞在一起。
@@ -160,6 +179,16 @@ env:
   # 另外两个取值：fixed（钉 1.12.25）/ latest（打 HomeProxy 补丁）—— 二者都是
   # 为 nss-edma 基座准备的，在 immortalwrt 基座上不适用。
   SINGBOX_MODE: builtin
+
+  # ── HomeProxy 规则集（prepare-build.sh 第 6b 步）──────────────
+  # 固件里这 9 条 ruleset 是 type=local + /etc/homeproxy/ruleset/*.srs，
+  # 随固件打包 ⇒ 首启零下载 ⇒ 不会出现"规则下载失败 ⇒ sing-box 起不来 ⇒
+  # dnsmasq 已把 DNS 劫持到 5333 ⇒ 整个 LAN 断网"。
+  # 这里的开关只决定"这些文件在**编译时**要不要从上游刷新"。
+  # 注意 github.event.inputs 在 push / schedule 事件下是空串，所以用
+  # `== 'false' && '0' || '1'` 把"没勾/没传"统一成默认值。
+  RULESETS_REFRESH: ${{ github.event.inputs.rulesets_refresh == 'false' && '0' || '1' }}
+  RULESETS_STRICT: ${{ github.event.inputs.rulesets_strict == 'true' && '1' || '0' }}
 
 jobs:
   build:

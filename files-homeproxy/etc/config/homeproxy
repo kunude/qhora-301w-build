@@ -148,90 +148,107 @@ config routing_node 'main'
 	option urltest_tolerance '50'
 	option urltest_idle_timeout '1800'
 
-# ── 规则集（远程 .srs）─────────────────────────────────────────────────
-#  outbound=main ⇒ 生成 download_detour 指向代理组。
-#  raw.githubusercontent.com 直连不通，必须经代理下载，所以这里不能填 direct-out。
+# ── 规则集（固件预置的 .srs，type=local）────────────────────────────────
+#  这 9 个二进制规则文件随固件打包在 /etc/homeproxy/ruleset/，
+#  首次启动**零下载** ⇒ sing-box 必然起得来。
+#
+#  ⚠️ 出厂默认绝不能写成 type 'remote'，原因是一条很硬的链：
+#     remote 是 sing-box **在服务启动那一刻**才去 url 下载（生成出来的
+#     download_detour 还得经代理）。raw.githubusercontent.com 直连不通、只能走
+#     代理，而能用的代理恰恰是这个还没起来的服务 —— 先有鸡后有蛋。任一规则
+#     下载失败 ⇒ sing-box 起不来；而 /etc/init.d/homeproxy 早在起 sing-box
+#     **之前**就把 dnsmasq 劫持到 127.0.0.1:5333 了 ⇒ DNS 全挂
+#     ⇒ **整个 LAN 上不了网**（实测过：刷完配好节点一启用就断网）。
+#     文件齐了 + local ⇒ 这条链根本不存在。
+#
+#  规则文件怎么保持最新：
+#    · 编译期（推荐）：每次构建自动从上游拉最新 .srs 写进覆盖层 ——
+#        scripts/fetch-homeproxy-rulesets.sh（prepare-build.sh 自动调用）。
+#        关掉它用仓库固定版：RULESETS_REFRESH=0；要求"必须最新、否则别编"：
+#        RULESETS_STRICT=1。
+#    · 机器上：换掉 .srs 后 /etc/init.d/homeproxy restart 即可。
+#    · 想恢复自动更新：界面里把某条的 Type 改成 Remote 并填 URL
+#      （选 Local 时 URL 字段会自动隐藏，反之亦然）。
+#    · 看固件里这份规则的来源与时间：cat /etc/homeproxy/rulesets.lock
+#
+#  ⚠️ type=local 时只认 format/path —— 多写 url/outbound/update_interval 会让
+#     sing-box check 报 unknown field 而 FATAL，所以只留三个字段。
+#
+#  名字对应关系（三处必须一致：本文件、configs/homeproxy-rulesets.list、
+#  files-homeproxy/etc/uci-defaults/95-homeproxy-rulesets；
+#  构建期由 fetch-homeproxy-rulesets.sh 自动核对）
+
+# 上游：…/sing-geosite/rule-set/geosite-category-ads-all.srs
 config ruleset 'ads'
 	option label 'Ads'
 	option enabled '1'
-	option type 'remote'
+	option type 'local'
 	option format 'binary'
-	option url 'https://raw.githubusercontent.com/SagerNet/sing-geosite/refs/heads/rule-set/geosite-category-ads-all.srs'
-	option outbound 'main'
-	option update_interval '1d'
+	option path '/etc/homeproxy/ruleset/ads.srs'
 
+# 上游：…/sing-geosite/rule-set/geosite-cn.srs
 config ruleset 'cn'
 	option label 'CN'
 	option enabled '1'
-	option type 'remote'
+	option type 'local'
 	option format 'binary'
-	option url 'https://raw.githubusercontent.com/SagerNet/sing-geosite/refs/heads/rule-set/geosite-cn.srs'
-	option outbound 'main'
-	option update_interval '1d'
+	option path '/etc/homeproxy/ruleset/cn.srs'
 
+# 上游：…/sing-geosite/rule-set/geosite-apple.srs
 config ruleset 'apple'
 	option label 'Apple'
 	option enabled '1'
-	option type 'remote'
+	option type 'local'
 	option format 'binary'
-	option url 'https://raw.githubusercontent.com/SagerNet/sing-geosite/refs/heads/rule-set/geosite-apple.srs'
-	option outbound 'main'
-	option update_interval '1d'
+	option path '/etc/homeproxy/ruleset/apple.srs'
 
+# 上游：…/sing-geosite/rule-set/geosite-apple%40cn.srs   （%40 是 URL 编码的 @）
 config ruleset 'apple_cn'
 	option label 'AppleCN'
 	option enabled '1'
-	option type 'remote'
+	option type 'local'
 	option format 'binary'
-	# %40 是 URL 编码的 @，别改成字面 @
-	option url 'https://raw.githubusercontent.com/SagerNet/sing-geosite/refs/heads/rule-set/geosite-apple%40cn.srs'
-	option outbound 'main'
-	option update_interval '1d'
+	option path '/etc/homeproxy/ruleset/apple_cn.srs'
 
+# 上游：…/sing-geosite/rule-set/geosite-apple-update.srs
 config ruleset 'apple_upd'
 	option label 'AppleUpdate'
 	option enabled '1'
-	option type 'remote'
+	option type 'local'
 	option format 'binary'
-	option url 'https://raw.githubusercontent.com/SagerNet/sing-geosite/refs/heads/rule-set/geosite-apple-update.srs'
-	option outbound 'main'
-	option update_interval '1d'
+	option path '/etc/homeproxy/ruleset/apple_upd.srs'
 
+# 上游：…/sing-geosite/rule-set/geosite-category-bank-cn.srs
 config ruleset 'bank_cn'
 	option label 'BankCN'
 	option enabled '1'
-	option type 'remote'
+	option type 'local'
 	option format 'binary'
-	option url 'https://raw.githubusercontent.com/SagerNet/sing-geosite/refs/heads/rule-set/geosite-category-bank-cn.srs'
-	option outbound 'main'
-	option update_interval '1d'
+	option path '/etc/homeproxy/ruleset/bank_cn.srs'
 
+# 上游：…/sing-geosite/rule-set/geosite-douyin.srs
 config ruleset 'douyin'
 	option label 'Douyin'
 	option enabled '1'
-	option type 'remote'
+	option type 'local'
 	option format 'binary'
-	option url 'https://raw.githubusercontent.com/SagerNet/sing-geosite/refs/heads/rule-set/geosite-douyin.srs'
-	option outbound 'main'
-	option update_interval '1d'
+	option path '/etc/homeproxy/ruleset/douyin.srs'
 
+# 上游：…/sing-geosite/rule-set/geosite-geolocation-!cn.srs
 config ruleset 'noncn'
 	option label 'NonCN'
 	option enabled '1'
-	option type 'remote'
+	option type 'local'
 	option format 'binary'
-	option url 'https://raw.githubusercontent.com/SagerNet/sing-geosite/refs/heads/rule-set/geosite-geolocation-!cn.srs'
-	option outbound 'main'
-	option update_interval '1d'
+	option path '/etc/homeproxy/ruleset/noncn.srs'
 
+# 上游：…/sing-geoip/rule-set/geoip-cn.srs
 config ruleset 'geoip_cn'
 	option label 'GeoIPCN'
 	option enabled '1'
-	option type 'remote'
+	option type 'local'
 	option format 'binary'
-	option url 'https://raw.githubusercontent.com/SagerNet/sing-geoip/refs/heads/rule-set/geoip-cn.srs'
-	option outbound 'main'
-	option update_interval '1d'
+	option path '/etc/homeproxy/ruleset/geoip_cn.srs'
 
 # ── 路由规则（段的先后顺序 = 匹配优先级，Reject 必须最先）──────────────
 

@@ -1,0 +1,35 @@
+# ═══════════════════════════════════════════════════════════════════════════
+#  HomeProxy 规则集清单（.srs）
+#
+#  格式：  <名字>|<URL>          # 以 # 开头的行和空行会被忽略
+#
+#  · 名字 = uci 里的 ruleset 节名 = 固件里 /etc/homeproxy/ruleset/<名字>.srs
+#    ⇒ 改名字要同步改三处：本文件、files-homeproxy/etc/config/homeproxy、
+#      files-homeproxy/etc/uci-defaults/95-homeproxy-rulesets
+#      （scripts/fetch-homeproxy-rulesets.sh --verify-only 会替你把这三处对齐）
+#  · URL 只用于「构建期刷新」和「刷新仓库兜底副本」，**不再写进固件配置**：
+#    固件里的 ruleset 是 type=local + path，首次启动不联网下载任何规则。
+#  · 上游仓库 SagerNet/sing-geosite 与 sing-geoip 的 rule-set 分支，
+#    是 HomeProxy / sing-box 生态里默认用的二进制 .srs 源。
+# ═══════════════════════════════════════════════════════════════════════════
+
+# 广告域名 —— 对应 routing_rule 'Reject'（action=reject）
+ads|https://raw.githubusercontent.com/SagerNet/sing-geosite/refs/heads/rule-set/geosite-category-ads-all.srs
+
+# 中国大陆域名 —— routing_rule 'Direct'
+cn|https://raw.githubusercontent.com/SagerNet/sing-geosite/refs/heads/rule-set/geosite-cn.srs
+
+# Apple 相关（含国内 App Store / 更新服务器）
+apple|https://raw.githubusercontent.com/SagerNet/sing-geosite/refs/heads/rule-set/geosite-apple.srs
+apple_cn|https://raw.githubusercontent.com/SagerNet/sing-geosite/refs/heads/rule-set/geosite-apple%40cn.srs
+apple_upd|https://raw.githubusercontent.com/SagerNet/sing-geosite/refs/heads/rule-set/geosite-apple-update.srs
+
+# 国内银行 / 抖音
+bank_cn|https://raw.githubusercontent.com/SagerNet/sing-geosite/refs/heads/rule-set/geosite-category-bank-cn.srs
+douyin|https://raw.githubusercontent.com/SagerNet/sing-geosite/refs/heads/rule-set/geosite-douyin.srs
+
+# 境外（geolocation-!cn）—— routing_rule 'Proxy'
+noncn|https://raw.githubusercontent.com/SagerNet/sing-geosite/refs/heads/rule-set/geosite-geolocation-!cn.srs
+
+# 国内 IP 段（二进制 IP 集合）—— 也挂在 'Direct' 上
+geoip_cn|https://raw.githubusercontent.com/SagerNet/sing-geoip/refs/heads/rule-set/geoip-cn.srs
