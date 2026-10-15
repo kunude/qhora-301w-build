@@ -38,7 +38,7 @@ It carried the vendor NSS stack … and is no longer updated or built.*），
 | 工作流 | `build-qhora-301w.yml` / `build-qhora-301w-homeproxy.yml` | `build-qhora-301w-imm-nss.yml` |
 | 基座源码 | `openwrt-nss-edma@nss-edma-rework`（已归档） | **`immortalwrt/immortalwrt`**（活的） |
 | NSS 从哪来 | 基座自带 | `patches/immortalwrt-nss/` 的补丁集，构建时叠进源码树 |
-| 代理栈 | passwall2 / HomeProxy | passwall2（这条线只跑 passwall2，未验证过 HomeProxy） |
+| 代理栈 | passwall2 / HomeProxy | passwall2（HomeProxy 版是下面的第四条线） |
 | NSS feed | `nss-packages@edma-nss` | **同一个**（feed 是独立包仓库，与基座无关） |
 | 其余 | NSS 卸载栈、`configs/`、`files/`、产物结构 —— **三条线完全一致** | |
 
@@ -52,18 +52,76 @@ It carried the vendor NSS stack … and is no longer updated or built.*），
 不会静默编出一份没有 NSS 的固件。那时要么把 `imm_ref` 钉回一个验证过的提交，
 要么按上面那份 README 重新生成补丁。
 
-> ⚠️ 三条线的固件**基座不同，不要混刷**。刷机方式与产物结构一样，但内核 / 驱动 / DTS
-> 的来源不同，建议每条线各留一份可回退的镜像。
+> ⚠️ 固件**基座不同，不要混刷**。刷机方式与产物结构一样，但内核 / 驱动 / DTS
+> 的来源不同（前两条线是 nss-edma fork，后两条是 immortalwrt），
+> 建议每条线各留一份可回退的镜像。
+
+## 第四条线：immortalwrt 基座 + NSS 补丁 + HomeProxy
+
+第三条线只跑 passwall2。想要**活的基座 + 活的 HomeProxy**，就用第四条线 ——
+它把第三条线的基座（`immortalwrt/immortalwrt` + NSS 补丁）与
+`build-qhora-301w-homeproxy.yml` 的代理栈合在一起，**软件集与后者逐字一致**。
+
+| | **imm-nss 线** | **imm-nss-homeproxy 线（本线）** |
+|---|---|---|
+| 工作流 | `build-qhora-301w-imm-nss.yml` | `build-qhora-301w-imm-nss-homeproxy.yml` |
+| 基座 | `immortalwrt/immortalwrt` + `patches/immortalwrt-nss/` | **同一个** |
+| 代理栈 | passwall2 | HomeProxy（`luci-app-homeproxy`） |
+| sing-box | 基座 feed 自带 | 基座 feed 自带（**不降级**，见下） |
+| dnsmasq | `dnsmasq-full`（passwall2 的 nftables 分支 select 进来的） | **`dnsmasq-full`**（见下） |
+| 其余 | NSS 卸载栈、`files/` `files-homeproxy/` 覆盖、产物结构 —— 与各线一致 | |
+
+> **关于 dnsmasq：** 第四条线这一格是 `dnsmasq-full`，但**不是我们加的** ——
+> ImmortalWrt 的 `include/target.mk` 里 `DEFAULT_PACKAGES` 写的就是 `dnsmasq-full`
+> （OpenWrt 官方写的是精简的 `dnsmasq`）。前两条线是从 nss-edma 基座起的，
+> homeproxy 版又关掉了 passwall2 那条会 select `dnsmasq-full` 的链，
+> 所以它们那里是精简 `dnsmasq`。换句话说：**换到 immortalwrt 基座之后，
+> dnsmasq-full 是默认就有的** —— 不需要在 `configs/` 里额外写任何东西。
+
+### 与前两条 homeproxy 线最大的不同：sing-box 不降版本
+
+`build-qhora-301w-homeproxy.yml` 把 sing-box 钉在 **1.12.25**，是因为**旧版** HomeProxy
+生成的配置里写着 sing-box 1.13 已删除的 inbound 字段（`sniff` /
+`sniff_override_destination`），在 1.14 上 `sing-box check` 会 FATAL、
+`/etc/init.d/homeproxy` 据此 `return 1`，服务起不来（详见第五章）。
+
+第四条线的基座是 immortalwrt，HomeProxy 与 sing-box 由**同一个上游**同步维护。
+实测（2026-10-15，immortalwrt master `da63f7d6`）两者已经互相适配：
+
+- `generate_client.uc` 的路由规则已是新版写法
+
+      rules: [
+          { inbound: 'dns-in', action: 'hijack-dns' },
+          { action: 'sniff' }
+      ]
+
+  1.13 删掉的 inbound 字段 `sniff` / `sniff_override_destination` 上游已经删干净；
+- 唯一残留的 `set_system_proxy: false` 是**合法字段**，不是 legacy —— sing-box
+  1.14.3 源码 `option/simple.go:18` 的 `HTTPMixedInboundOptions` 里仍有
+  `SetSystemProxy bool` 带着 `json:"set_system_proxy,omitempty"`；
+  真正触发 FATAL 的是 `option/inbound.go:72-74` 的
+  `SniffEnabled` / `SniffOverrideDestination` / `SniffTimeout`。
+
+所以这条线走 `SINGBOX_MODE=builtin`：**sing-box 停在基座自带的 1.14.x，不降级、
+也不给 HomeProxy 打补丁**（`scripts/patch-homeproxy-for-singbox113.py` 是为旧版
+HomeProxy 写的，其正则已经匹配不上 immortalwrt 当前的结构）。
+
+构建期仍有两道保险丝（`extra-packages.sh` 的 builtin 分支 + 工作流的功能包校验），
+一旦上游把 legacy inbound 字段写回来，构建会**直接失败**，而不是悄悄产出一份
+homeproxy 起不来的固件。
+
+> ⚠️ `builtin` 只对 **immortalwrt 基座**成立。前两条线的基座是 nss-edma，那边
+> HomeProxy 还没迁移，必须继续走 `fixed`（钉 1.12.25）或 `latest`（打补丁）。
 
 ## 目录结构
 
 ```
-.github/workflows/          # 三条构建线
+.github/workflows/          # 四条构建线（前两条 nss-edma 基座；后两条 immortalwrt 基座 + NSS 补丁）
 configs/
   common.config             # NSS 卸载栈 + 通用选项 + 附加功能包
   qhora_301w.config         # 机型：target / 子目标 / 设备 / 内存档位
   homeproxy.config          # 覆盖层：关掉 passwall2 那组、换成 HomeProxy
-  imm-nss.config            # 覆盖层：只给 imm-nss 线（immortalwrt 的符号差异）
+  imm-nss.config            # 覆盖层：只给两条 imm 线（immortalwrt 的符号差异）
 packages/net/{ddns-go,msd_lite}/   # 自带配方（直接引用上游源码，版本构建时解析注入）
 packages/emortal/autocore/         # 纯脚本包，提供 tempinfo / cpuinfo
 patches/kernel/6.18/               # 叠进上游内核源码树的内核补丁（见下）
@@ -463,7 +521,12 @@ cat /sys/class/thermal/thermal_zone*/type     # 固件里有哪些温度传感�
 
 ---
 
-## 五、sing-box 版本（HomeProxy 版必须是 1.12.25）
+## 五、sing-box 版本（前两条 HomeProxy 线必须是 1.12.25）
+
+> 本节说的是**前两条 homeproxy 线**（nss-edma 基座）。第四条线
+> （`build-qhora-301w-imm-nss-homeproxy.yml`）的基座是 immortalwrt，它的
+> HomeProxy 与 sing-box 由同一上游同步维护、已互相适配，走 `SINGBOX_MODE=builtin`
+> 用基座自带的 1.14.x，**不受本节约束** —— 原因见上面「第四条线」那节。
 
 HomeProxy 生成的 client 配置里**仍写着 sing-box 1.13 已删除的 inbound 字段**
 （`sniff` / `sniff_override_destination` / `set_system_proxy`）。在 1.14 上：

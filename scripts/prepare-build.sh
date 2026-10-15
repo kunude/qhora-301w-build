@@ -254,12 +254,20 @@ if [[ "$PROXY_STACK" == "homeproxy" ]]; then
   done
   [[ -e "package/feeds/packages/sing-box" ]] \
     || die "package/feeds/packages/sing-box 不存在，sing-box 没有被 feeds install 接管"
-  # 确认落位的确实是 ImmortalWrt 那份配方（1.12.x），不是官方 1.14.0。
+  # 确认 sing-box 那边处于什么状态。分两类：
+  #   builtin（= 基座自带的组合，immortalwrt 线）：HomeProxy 与 sing-box 由同一个
+  #     上游同步维护、已互相适配，用 1.14.x 本来就是对的 —— 不做 1.12.x 判断；
+  #   其余（fixed / latest，老两条 nss-edma 线）：确认落位的是 ImmortalWrt 那份
+  #     1.12.x 配方，而不是官方 1.14.0。
   sb_ver="$(sed -n 's/^PKG_VERSION:=\s*//p' package/feeds/packages/sing-box/Makefile 2>/dev/null | head -n1)"
-  case "$sb_ver" in
-    1.12.*) log "sing-box 配方版本确认：$sb_ver（ImmortalWrt 那份，与 HomeProxy 匹配）" ;;
-    *) warn "sing-box 配方版本是 ${sb_ver:-未知}，不是 1.12.x —— HomeProxy 可能无法启动（1.13 起删除了它仍在用的 inbound 字段）" ;;
-  esac
+  if [[ "${SINGBOX_MODE:-fixed}" == "builtin" ]]; then
+    log "sing-box 配方版本：${sb_ver:-未知}（SINGBOX_MODE=builtin —— 用基座自带的那份，不换版本、不打补丁）"
+  else
+    case "$sb_ver" in
+      1.12.*) log "sing-box 配方版本确认：$sb_ver（ImmortalWrt 那份，与 HomeProxy 匹配）" ;;
+      *) warn "sing-box 配方版本是 ${sb_ver:-未知}，不是 1.12.x —— HomeProxy 可能无法启动（1.13 起删除了它仍在用的 inbound 字段）" ;;
+    esac
+  fi
 else
   for p in luci-app-ddns-go luci-app-msd_lite luci-app-passwall2; do
     [[ -e "package/feeds/luci/$p" ]] \

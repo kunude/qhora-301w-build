@@ -99,12 +99,17 @@
 #   SINGBOX_EXPECT  homeproxy 版期望的 sing-box 配方版本，默认 1.12.25。
 #                   不符**直接中断构建**（不是警告）。想要 1.12.x 任意补丁版就写
 #                   `SINGBOX_EXPECT=1.12.*`（支持通配）。只在 SINGBOX_MODE=fixed 下生效。
-#   SINGBOX_MODE    homeproxy 版怎么解决「HomeProxy 还在写 1.13 已删字段」：
+#   SINGBOX_MODE    homeproxy 版怎么处理「HomeProxy 生成的配置 ↔ sing-box 版本」
+#                   这一对。三选一：
 #                     fixed （默认）从 immortalwrt/packages 取 SINGBOX_EXPECT 那版
 #                           （1.12.25）覆盖官方配方，HomeProxy 一字不动；
-#                     latest 不覆盖官方配方，改用 openwrt/packages 现有的那份、
-#                           把版本改成 SINGBOX_VERSION，并给 HomeProxy 的
-#                           generate_client.uc 打兼容补丁（实验通道）。
+#                     latest 不覆盖官方配方，沿用现有那份 sing-box、把版本改成
+#                           SINGBOX_VERSION，并给 HomeProxy 的
+#                           generate_client.uc 打兼容补丁；
+#                     builtin 两边都不动 —— 用基座自带的那一对。只对
+#                           **immortalwrt 基座**成立：它的 HomeProxy 与 sing-box
+#                           在同一个上游同步维护、已互相适配（实测依据见下面
+#                           ③-H 的 builtin 分支）。
 #   SINGBOX_VERSION SINGBOX_MODE=latest 时的目标版本（如 1.14.3）。留空则沿用
 #                   官方配方自带版本，只打补丁、不换版本。
 #   PW_REF          passwall 三个仓库的分支，默认 main
@@ -116,14 +121,20 @@
 #      HomeProxy 是**单包自包含**的（主程序 + init + rpcd 后端 + LuCI 视图
 #      全在这一个包），所以引入它就只需要这一个目录，不像 passwall2 那样
 #      要拉一个"界面仓库 + 组件仓库"。
-#   ③ 段完全不跑（不引入 passwall 的两个仓库），改为从 immortalwrt/packages
-#      取 net/sing-box 落位到 feeds/packages/net/，**覆盖官方那份**。
-#      原因见 configs/homeproxy.config 头部：openwrt/packages 的 sing-box 是
-#      1.14.0，而 HomeProxy 生成的配置还在用 1.13 已删除的 inbound 字段，
-#      1.14 上 sing-box check 直接 FATAL、服务起不来；
-#      immortalwrt/packages 是 1.12.25，正是 ImmortalWrt 自己配 HomeProxy 用的版本。
-#      该版本被 SINGBOX_EXPECT（默认 1.12.25）**硬断言**：不一致就中断构建，
-#      避免悄悄编出一份 homeproxy 起不来的固件。
+#   ③ 段完全不跑（不引入 passwall 的两个仓库），sing-box 那边按
+#      SINGBOX_MODE 分三种处理：
+#       fixed  从 immortalwrt/packages 取 net/sing-box 落位到 feeds/packages/net/，
+#              **覆盖官方那份**。原因见 configs/homeproxy.config 头部：
+#              openwrt/packages 的 sing-box 是 1.14.x，而旧版 HomeProxy 生成的
+#              配置还在写 1.13 已删除的 inbound 字段，1.14 上 `sing-box check`
+#              直接 FATAL、服务起不来；immortalwrt/packages 长期是 1.12.25，
+#              正是 ImmortalWrt 自己配 HomeProxy 用的版本。该版本被
+#              SINGBOX_EXPECT（默认 1.12.25）**硬断言**：不一致就中断构建。
+#              ⚠️ 这条路依赖 immortalwrt/packages 里仍有 1.12.25。上游把它抬到
+#                 1.14.3 之后，**基座是 immortalwrt 的线不要再走这里**，
+#                 改用 builtin（基座自带的那一对本来就匹配）。
+#       latest 见下面 ③-H 的通道说明（改 HomeProxy、留新 sing-box）。
+#       builtin 什么都不做：直接用基座自带的那一对。
 #
 # SPDX-License-Identifier: GPL-2.0-only
 set -euo pipefail
@@ -137,8 +148,9 @@ IMM_PKGS="${IMM_PKGS:-https://github.com/immortalwrt/packages.git}"
 # homeproxy 版期望的 sing-box 配方版本。默认钉在 1.12.25 —— ImmortalWrt 自己
 # 配 HomeProxy 用的就是它。支持通配（如 1.12.*）。
 SINGBOX_EXPECT="${SINGBOX_EXPECT:-1.12.25}"
-# homeproxy 版处理「1.13 已删字段」的两条通道，见文件头说明。默认 fixed =
-# 与以前完全一致的行为；latest 是实验通道（改 HomeProxy、留新 sing-box）。
+# homeproxy 版处理「配置 ↔ sing-box 版本」的通道，见文件头说明。默认 fixed =
+# 与以前完全一致的行为；latest 改 HomeProxy、留新 sing-box；builtin 两边都不动
+# （基座自带的那一对，只对 immortalwrt 基座成立）。
 SINGBOX_MODE="${SINGBOX_MODE:-fixed}"
 SINGBOX_VERSION="${SINGBOX_VERSION:-}"
 PW_REF="${PW_REF:-main}"
@@ -151,11 +163,11 @@ case "$PROXY_STACK" in
 esac
 
 case "$SINGBOX_MODE" in
-  fixed|latest) ;;
-  *) echo "不认识的 SINGBOX_MODE：$SINGBOX_MODE（只支持 fixed / latest）" >&2; exit 1 ;;
+  fixed|latest|builtin) ;;
+  *) echo "不认识的 SINGBOX_MODE：$SINGBOX_MODE（只支持 fixed / latest / builtin）" >&2; exit 1 ;;
 esac
-if [[ "$SINGBOX_MODE" == "latest" && "$PROXY_STACK" != "homeproxy" ]]; then
-  echo "SINGBOX_MODE=latest 只对 PROXY_STACK=homeproxy 有意义（当前 $PROXY_STACK）" >&2
+if [[ "$SINGBOX_MODE" != "fixed" && "$PROXY_STACK" != "homeproxy" ]]; then
+  echo "SINGBOX_MODE=$SINGBOX_MODE 只对 PROXY_STACK=homeproxy 有意义（当前 $PROXY_STACK）" >&2
   exit 1
 fi
 
@@ -328,9 +340,57 @@ if [[ "$PROXY_STACK" == "homeproxy" ]]; then
   # 的 sing-box 已是 1.14.x —— 直接编出来会在运行期 FATAL：
   #     legacy inbound fields are deprecated in 1.11.0 and removed in 1.13.0
   # /etc/init.d/homeproxy 据此 return 1，服务永远起不来
-  # （编得出、刷得进、跑不起来；在 192.168.2.1 上实测确认过）。两条出路：
+  # （编得出、刷得进、跑不起来；在 192.168.2.1 上实测确认过）。三条出路：
+  #   ① fixed   钉 immortalwrt/packages 的 1.12.25（默认；依赖上游仍有该版本）
+  #   ② latest  给 HomeProxy 打 1.13+ 兼容补丁、留新 sing-box
+  #   ③ builtin 基座自带的组合本来就已互相适配（immortalwrt 基座走这条）
+  # 走哪条由 SINGBOX_MODE 决定，下面三个分支一一对应。
 
-  if [[ "$SINGBOX_MODE" == "latest" ]]; then
+  if [[ "$SINGBOX_MODE" == "builtin" ]]; then
+    # ── 通道 C：基座自带的那一对，两边都不动 ────────────────────────────
+    # 适用：基座 = immortalwrt。它的 feeds/luci 的 luci-app-homeproxy 与
+    # feeds/packages 的 sing-box 由同一个上游同步维护、**已经互相适配**，
+    # 既不需要我们固定 sing-box 版本，也不需要给 HomeProxy 打补丁。
+    #
+    # 实测依据（2026-10-15，immortalwrt master da63f7d6）：
+    #   · generate_client.uc 的 route.rules 已是新版写法
+    #         { inbound: 'dns-in', action: 'hijack-dns' },
+    #         { action: 'sniff' }
+    #     而 1.13 明确删除的 inbound 字段 sniff / sniff_override_destination
+    #     上游**已经删干净** —— 也就是 scripts/patch-homeproxy-for-singbox113.py
+    #     本来要修的东西上游自己修好了。那个脚本的正则因此匹配不上当前结构
+    #     （会报 "没找到 config.route 的默认 rules 块"），所以这条线**不能**
+    #     走 latest。
+    #   · 唯一残留的 set_system_proxy: false 是**合法字段**，不是 legacy：
+    #     sing-box 1.14.3 源码 option/simple.go:18 里
+    #         type HTTPMixedInboundOptions struct {
+    #             Users          []auth.User           `json:"users,omitempty"`
+    #             DomainResolver *DomainResolveOptions `json:"domain_resolver,omitempty"`
+    #             SetSystemProxy bool                  `json:"set_system_proxy,omitempty"`
+    #         }
+    #     真正触发 FATAL 的是 option/inbound.go:72-74 的
+    #     SniffEnabled / SniffOverrideDestination / SniffTimeout。
+    #   · 所以基座自带的组合可以直接用，sing-box 停在 1.14.3，不降级到 1.12.25。
+    #
+    # fixed 通道之所以对 immortalwrt 基座不再适用：它断言 immortalwrt/packages
+    # 里仍是 1.12.25，而那边现在已经是 1.14.3。
+    [[ -f feeds/packages/net/sing-box/Makefile ]] \
+      || die "feeds/packages/net/sing-box 不存在，feeds update 没跑全？"
+    gin="feeds/luci/applications/luci-app-homeproxy/root/etc/homeproxy/scripts/generate_client.uc"
+    [[ -f "$gin" ]] \
+      || die "找不到 HomeProxy 的 generate_client.uc：$gin（基座的 feeds/luci 里没有 luci-app-homeproxy？）"
+
+    sb_ver="$(pkg_ver_of feeds/packages/net/sing-box/Makefile)"
+    log "代理栈 = homeproxy：SINGBOX_MODE=builtin，沿用基座自带的 HomeProxy + sing-box ${sb_ver}（不改版本、不打补丁）"
+
+    # 保险丝：万一上游哪天把 legacy inbound 字段写回来，这里必须有人喊。
+    if grep -qE '^[ \t]*sniff[ \t]*:[ \t]*true' "$gin"; then
+      die "基座的 generate_client.uc 里又出现了 legacy inbound 字段 sniff（上游回退了？）
+      sing-box ${sb_ver} 会在 /etc/init.d/homeproxy 的 sing-box check 阶段 FATAL。
+      出路：改用 SINGBOX_MODE=latest（给 HomeProxy 打 1.13+ 兼容补丁）。"
+    fi
+    sb_desc="基座自带（$IMM_PKGS@$IMM_REF，HomeProxy 与 sing-box 由上游同步维护）"
+  elif [[ "$SINGBOX_MODE" == "latest" ]]; then
     # ── 通道 B（实验）：留 1.14.x，改 HomeProxy ─────────────────────────
     # 不覆盖官方配方，直接用 openwrt/packages 的 net/sing-box，把版本改成
     # SINGBOX_VERSION 并重算 PKG_HASH（配方取的是 codeload 的
