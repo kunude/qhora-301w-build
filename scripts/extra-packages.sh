@@ -208,6 +208,21 @@ while IFS= read -r -d '' mk; do
   rel="${mk#"$OWN_ROOT"/}"
   rel="${rel%/Makefile}"
   [[ -n "$rel" ]] || die "解析自带配方相对路径失败：$mk"
+  # 基座主树里已经有同路径的包 ⇒ 跳过落位。
+  #
+  # 实例：autocore 在 **ImmortalWrt 基座**里是主树自带的（`package/emortal/autocore`，
+  # 本仓库的配方本来就是从那儿抄来的）。两份同名包同时存在没有意义 ——
+  # feeds install 会打印
+  #     WARNING: Not overriding core package 'autocore'; use -f to force
+  # 并且**不用** feed 那份（主树优先），落位纯属白做，还会让
+  # "引入的包有没有被 feeds install 接管" 那条断言误报。
+  #
+  # 老两条线的基座是 openwrt main，主树里没有 ddns-go / msd_lite / autocore
+  # ⇒ 这个分支永远不进，行为与以前完全一致。
+  if [[ -d "$OPENWRT_DIR/package/$rel" ]]; then
+    log "  跳过（基座主树已自带，用主树那份）：$rel"
+    continue
+  fi
   place "$OWN_ROOT" feeds/packages "$rel" "$rel" "本仓库自带"
   own_count=$((own_count + 1))
 done < <(find "$OWN_ROOT" -type f -name Makefile -print0 | sort -z)

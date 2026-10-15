@@ -31,6 +31,10 @@
 #                    files-homeproxy/（不存在就跳过）。
 #   DDNS_GO_VERSION  钉死 ddns-go 版本，例如 6.17.7（默认跟随上游最新 release）
 #   MSD_LITE_SHA     钉死 msd_lite 的 commit sha（默认跟随上游 master HEAD）
+#   EXTRA_CONFIG     再追加一层 .config 覆盖层（后拼接者覆盖前者）。只有
+#                    immortalwrt 线（scripts/prepare-build-imm-nss.sh）会设它：
+#                    换成 ImmortalWrt 基座后个别符号与 openwrt 不同，那些差异
+#                    只对那条线成立，不能写进 common.config。不设则行为不变。
 #
 set -Eeuo pipefail
 
@@ -140,6 +144,18 @@ case "$PROXY_STACK" in
   *) die "不认识的 PROXY_STACK：$PROXY_STACK（只支持 passwall2 / homeproxy）" ;;
 esac
 
+# 可选：再追加一层覆盖层（同样"后拼接者覆盖前者"）。
+# 只有 immortalwrt 线（scripts/prepare-build-imm-nss.sh）会设它 —— 基座换成
+# ImmortalWrt 之后，个别包名 / 符号取值与 openwrt 不同，那些差异只对那条线
+# 成立，写进 common.config 会连累两条老线，所以单独放一层。
+#
+# ⚠️ 不设 EXTRA_CONFIG 时以下代码一行都不执行 —— 两条老线的行为与以前**完全一致**。
+if [[ -n "${EXTRA_CONFIG:-}" ]]; then
+  [[ -f "$EXTRA_CONFIG" ]] || die "EXTRA_CONFIG 指向的配置文件不存在：$EXTRA_CONFIG"
+  log "追加覆盖层：${EXTRA_CONFIG##*/}"
+  CONFIGS+=( "$EXTRA_CONFIG" )
+fi
+
 # 关于符号校验：不在这里维护一份"我认为重要的符号"清单。
 # 要断言什么，由 CONFIGS 里实际写了的符号决定（见下面的步骤 3）——
 # 清单式的写法会把 DEVICE_PACKAGES 带入的包（如 ipq-wifi-qnap_301w）
@@ -205,10 +221,26 @@ log "feeds install 完成，package/feeds/ 下有："
 ls -1 package/feeds/ 2>/dev/null | sed 's/^/    /' | tee -a "$LOG_FILE" >&3 || true
 
 # 确认这些引入的包真的被 install 认领了（索引没重建的话这一步会漏）。
-for p in ddns-go msd_lite autocore; do
+for p in ddns-go msd_lite; do
   [[ -e "package/feeds/packages/$p" ]] \
     || die "package/feeds/packages/$p 不存在，引入的包没有被 feeds install 接管"
 done
+# autocore 有两种合法来源：
+#   · 老两条线（openwrt main 基座）：主树里没有它 ⇒ 由 extra-packages.sh 落位到
+#     feeds/packages/emortal/autocore，再被 feeds install 接管；
+#   · immortalwrt 线：**基座主树自带**（package/emortal/autocore），而
+#     feeds install 不会用 feed 覆盖主树包（"Not overriding core package"），
+#     所以 feeds 里那份会被跳过 —— 这是正常的，主树那份就是我们要的
+#     （本仓库的配方本来就是从 ImmortalWrt 主树抄来的）。
+# 两种位置都算"就位"，缺了才算错。
+if [[ -e package/feeds/packages/autocore ]]; then
+  :
+elif [[ -e package/emortal/autocore ]]; then
+  log "autocore 来自基座主树（package/emortal/autocore），ImmortalWrt 自带这份"
+else
+  die "autocore 既不在 feed 也不在基座主树里" \
+      "（package/feeds/packages/autocore 与 package/emortal/autocore 都不存在）"
+fi
 
 if [[ "$PROXY_STACK" == "homeproxy" ]]; then
   # ── homeproxy 版 ──────────────────────────────────────────

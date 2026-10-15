@@ -23,19 +23,55 @@
 target / device。两条线**共用同一个 `/usr/bin/sing-box` 与同一套 nftables 透明代理**，
 所以一套固件里只能启用其中一个（固件里本来也只有其中一个）。
 
+## 第三条线：immortalwrt 基座 + NSS 补丁
+
+上面两条线的**基座**都是 [`JuliusBairaktaris/openwrt-nss-edma`](https://github.com/JuliusBairaktaris/openwrt-nss-edma)
+的 `nss-edma-rework` 分支 —— 它本身就是「openwrt main + NSS」，拿来即用。
+但那个分支**已被作者归档**（该分支 README 首行原文：*This branch is archived.
+It carried the vendor NSS stack … and is no longer updated or built.*），
+基座（内核 / DTS / 驱动 / mac80211 / LuCI）从此不再跟着上游走。
+
+第三条线把「基座」与「NSS 改动」拆开：
+
+| | 两条老线 | **imm-nss 线** |
+|---|---|---|
+| 工作流 | `build-qhora-301w.yml` / `build-qhora-301w-homeproxy.yml` | `build-qhora-301w-imm-nss.yml` |
+| 基座源码 | `openwrt-nss-edma@nss-edma-rework`（已归档） | **`immortalwrt/immortalwrt`**（活的） |
+| NSS 从哪来 | 基座自带 | `patches/immortalwrt-nss/` 的补丁集，构建时叠进源码树 |
+| 代理栈 | passwall2 / HomeProxy | passwall2（这条线只跑 passwall2，未验证过 HomeProxy） |
+| NSS feed | `nss-packages@edma-nss` | **同一个**（feed 是独立包仓库，与基座无关） |
+| 其余 | NSS 卸载栈、`configs/`、`files/`、产物结构 —— **三条线完全一致** | |
+
+补丁集的来源（基线提交 / 来源分支 / 末端提交）、内容、**刻意排除的文件**、
+以及**基座往前走之后怎么重新生成**，都写在
+[`patches/immortalwrt-nss/README.md`](patches/immortalwrt-nss/README.md)。
+
+补丁描述的是「NSS 相对 openwrt main 基线需要额外做什么」，所以它与基座是谁家的无关；
+但它绑定在那份基线的上下文上。immortalwrt 改到补丁也要改的那些文件时，构建会在
+「NSS 补丁应用失败」这一步**明确中断**，并逐个列出对不上的文件 ——
+不会静默编出一份没有 NSS 的固件。那时要么把 `imm_ref` 钉回一个验证过的提交，
+要么按上面那份 README 重新生成补丁。
+
+> ⚠️ 三条线的固件**基座不同，不要混刷**。刷机方式与产物结构一样，但内核 / 驱动 / DTS
+> 的来源不同，建议每条线各留一份可回退的镜像。
+
 ## 目录结构
 
 ```
-.github/workflows/          # 两条构建线
+.github/workflows/          # 三条构建线
 configs/
   common.config             # NSS 卸载栈 + 通用选项 + 附加功能包
   qhora_301w.config         # 机型：target / 子目标 / 设备 / 内存档位
   homeproxy.config          # 覆盖层：关掉 passwall2 那组、换成 HomeProxy
+  imm-nss.config            # 覆盖层：只给 imm-nss 线（immortalwrt 的符号差异）
 packages/net/{ddns-go,msd_lite}/   # 自带配方（直接引用上游源码，版本构建时解析注入）
 packages/emortal/autocore/         # 纯脚本包，提供 tempinfo / cpuinfo
 patches/kernel/6.18/               # 叠进上游内核源码树的内核补丁（见下）
+patches/immortalwrt-nss/           # imm-nss 线专用：NSS 补丁集 + 来源说明（见下）
 scripts/
   prepare-build.sh          # 组装 .config、跑 defconfig、校验符号、叠加覆盖文件
+  prepare-build-imm-nss.sh  # imm-nss 线的入口：先移植 NSS，再交给 prepare-build.sh
+  apply-nss-patches.sh      # 把 patches/immortalwrt-nss/ 的补丁打进 immortalwrt 源码树
   extra-packages.sh         # 把 feed 里没有 / 不该用官方那份的包放进 feed 目录树
   resolve-versions.sh       # 构建时解析 ddns-go / msd_lite 的上游最新版本
   check-no-credentials.sh   # 构建期守卫：预置文件里出现凭据/订阅链接就中断
