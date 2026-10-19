@@ -1,0 +1,231 @@
+#!/bin/sh
+# ============================================================================
+#  dae-geo-update —— 更新 dae 用的 geoip.dat / geosite.dat
+#
+#  dae 自己不联网下载 geo 数据：它读的是
+#      /usr/share/dae/geoip.dat   -> ../v2ray/geoip.dat   （软链）
+#      /usr/share/dae/geosite.dat -> ../v2ray/geosite.dat （软链）
+#  而这两个文件来自固件里的 v2ray-geoip / v2ray-geosite 包（编译期打进 rootfs）。
+#  所以要更新数据只有两条路：重编固件，或者用这个脚本就地替换 .dat。
+#
+#  用法：
+#      dae-geo-update                从 v2fly 拉最新并替换（与固件自带数据同源）
+#      dae-geo-update --check        只看：本地多大 / 上游多大，不动文件
+#      dae-geo-update --source loyalsoldier
+#                                    换 Loyalsoldier 那份（分类更全，但 geosite 有
+#                                    11MB，本机实测 dae 建规则要 158MiB 堆、启动
+#                                    从 3.7s 涨到 60s+，而且 domain 规则会整批失配，
+#                                    所以默认不用，除非你加了 --force）
+#      dae-geo-update --only geoip   只更新一个文件
+#      dae-geo-update --cron         装一条每周一 05:10 的定时更新（busybox crond）
+#
+#  安全措施：
+#      下载后用大小 + 内容特征双重校验 → 备份旧文件到 /root/geo-backup/<时间>/
+#      → 同目录重命名（原子替换）→ dae validate → 重启 → 实测一次出网
+#      任何一步失败自动回滚，不会把 dae 留在坏数据上。
+#
+#  注意：/usr/share 属于 apk 包，用 `apk upgrade v2ray-geoip` 会覆盖这里的替换；
+#        sysupgrade 保留配置时 overlay 里的替换会保留，但重刷整镜像会回到固件版本。
+# ============================================================================
+set -u
+
+GEO_DIR=/usr/share/v2ray
+BAK_ROOT=/root/geo-backup
+LOG=/var/log/dae-geo-update.log
+CHECK_URL='https://www.gstatic.com/generate_204'
+
+SRC=v2fly
+ONLY=''
+CHECK_ONLY=0
+WANT_CRON=0
+QUIET=0
+FORCE=0
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+    --check) CHECK_ONLY=1 ;;
+    --source) SRC="${2:-loyalsoldier}"; shift ;;
+    --source=*) SRC="${1#--source=}" ;;
+    --only) ONLY="${2:-}"; shift ;;
+    --only=*) ONLY="${1#--only=}" ;;
+    --cron) WANT_CRON=1 ;;
+    --force) FORCE=1 ;;
+    -q|--quiet) QUIET=1 ;;
+    -h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "未知参数：$1（--help 看用法）" >&2; exit 2 ;;
+    esac
+    shift
+done
+
+say() { [ "$QUIET" -eq 1 ] || echo "$*"; }
+log() { echo "$(date '+%F %T') $*" >>"$LOG"; }
+die() { say "错误：$*"; log "ERROR: $*"; exit 1; }
+
+case "$SRC" in
+loyalsoldier)
+    URL_GEOIP='https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat'
+    URL_GEOSITE='https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat'
+    ;;
+v2fly)
+    URL_GEOIP='https://github.com/v2fly/geoip/releases/latest/download/geoip.dat'
+    URL_GEOSITE='https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat'
+    ;;
+*) die "不认识的源：$SRC（只支持 loyalsoldier / v2fly）" ;;
+esac
+
+# ── --cron：装定时任务 ───────────────────────────────────────────────
+if [ "$WANT_CRON" -eq 1 ]; then
+    line='10 5 * * 1 /usr/bin/dae-geo-update -q'
+    touch /etc/crontabs/root
+    if grep -q 'dae-geo-update' /etc/crontabs/root; then
+        say "定时任务已存在：$(grep 'dae-geo-update' /etc/crontabs/root)"
+    else
+        echo "$line" >>/etc/crontabs/root
+        say "已写入 /etc/crontabs/root：$line"
+    fi
+    /etc/init.d/cron restart >/dev/null 2>&1 || /etc/init.d/cron start >/dev/null 2>&1
+    say "crond：$(pgrep -f crond >/dev/null && echo running || echo stopped)"
+    exit 0
+fi
+
+# ── 上游大小 ────────────────────────────────────────────────────────
+remote_size() {
+    curl -sIL --max-time 30 "$1" 2>/dev/null |
+        awk 'tolower($1)=="content-length:"{v=$2} END{print v+0}'
+}
+
+size_of() { [ -f "$1" ] && wc -c <"$1" | tr -d ' ' || echo 0; }
+human() { awk -v b="$1" 'BEGIN{printf "%.1f MB", b/1048576}'; }
+
+# 从二进制 protobuf 里抽可打印串（busybox 不一定带 strings，用 tr 兜底）
+# 注意 -n 2：geoip.dat 里的国家码只有两个字符（CN/US），strings 默认跳过
+# 长度 <4 的串，不加 -n 2 会一个都搜不到（实测踩过）。
+text_of() {
+    if command -v strings >/dev/null 2>&1; then
+        strings -n 2 "$1"
+    else
+        tr -c '[:print:]' '\n' <"$1"
+    fi
+}
+
+say "源：$SRC"
+for pair in "geoip:$URL_GEOIP" "geosite:$URL_GEOSITE"; do
+    n=${pair%%:*}; u=${pair#*:}
+    [ -n "$ONLY" ] && [ "$ONLY" != "$n" ] && continue
+    say "  $n.dat  本地 $(human "$(size_of "$GEO_DIR/$n.dat")")  上游 $(human "$(remote_size "$u")")"
+    [ "$CHECK_ONLY" -eq 1 ] && continue
+done
+[ "$CHECK_ONLY" -eq 1 ] && exit 0
+
+# ── 下载 + 校验 ─────────────────────────────────────────────────────
+TMP=$(mktemp -d /tmp/dae-geo.XXXXXX) || die "建临时目录失败"
+trap 'rm -rf "$TMP"' EXIT
+
+fetch() { # $1=name $2=url $3=最小字节数
+    n=$1; u=$2; min=$3
+    say "  下载 $n.dat …"
+    i=1
+    while [ "$i" -le 3 ]; do
+        if curl -fsSL --connect-timeout 15 --max-time 300 --retry 2 -o "$TMP/$n.dat" "$u"; then
+            break
+        fi
+        say "    第 $i 次失败，重试…"
+        i=$((i + 1))
+        sleep 3
+    done
+    [ -s "$TMP/$n.dat" ] || die "$n.dat 下载失败（网络或 GitHub 被墙；先确认能出去）"
+
+    sz=$(size_of "$TMP/$n.dat")
+    [ "$sz" -ge "$min" ] || die "$n.dat 只有 $(human "$sz")，小于下限——下回来的可能是错误页"
+
+    # 体积闸：本机（878MB 内存）实测 geosite >6MB 时 dae 建规则吃 158MiB 堆、
+    # 启动 60s+，且 domain 规则整批失配（全落回 fallback）。要试就加 --force。
+    if [ "$n" = "geosite" ] && [ "$sz" -gt 6291456 ] && [ "$FORCE" -ne 1 ]; then
+        die "geosite.dat 有 $(human "$sz")（>6MB），本机跑不动：dae 建规则会吃 158MiB 堆、启动 60s+，且 domain 规则会失配。
+     用例：改用默认的 v2fly 源（约 2MB）；确定要试就加 --force"
+    fi
+
+    # 开头是 '<' 说明拿到的是 HTML 错误页（GitHub 404 / 跳转页），不是 protobuf
+    if head -c 64 "$TMP/$n.dat" | grep -q '^<'; then
+        die "$n.dat 是 HTML 错误页，不是 geo 数据（URL 失效？）"
+    fi
+
+    case "$n" in
+    geosite)
+        text_of "$TMP/$n.dat" | grep -qixE 'google|youtube|netflix' ||
+            die "geosite.dat 里找不到 google/youtube/netflix 分类，文件可能不是 v2ray 格式"
+        ;;
+    geoip)
+        text_of "$TMP/$n.dat" | grep -qx 'CN' ||
+            die "geoip.dat 里没有 CN 段，文件可能不是 v2ray 格式"
+        ;;
+    esac
+    say "    $(human "$sz") 校验通过"
+}
+
+for pair in "geoip:$URL_GEOIP:5000000" "geosite:$URL_GEOSITE:500000"; do
+    n=${pair%%:*}; rest=${pair#*:}; u=${rest%:*}; min=${rest##*:}
+    [ -n "$ONLY" ] && [ "$ONLY" != "$n" ] && continue
+    fetch "$n" "$u" "$min"
+done
+
+# ── 备份 + 原子替换 ─────────────────────────────────────────────────
+BAK="$BAK_ROOT/$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$BAK" || die "建备份目录失败"
+for pair in "geoip:$URL_GEOIP:0" "geosite:$URL_GEOSITE:0"; do
+    n=${pair%%:*}
+    [ -n "$ONLY" ] && [ "$ONLY" != "$n" ] && continue
+    [ -f "$TMP/$n.dat" ] || continue
+    [ -f "$GEO_DIR/$n.dat" ] && cp -a "$GEO_DIR/$n.dat" "$BAK/$n.dat"
+    cp "$TMP/$n.dat" "$GEO_DIR/.$n.dat.new" || die "写入 $GEO_DIR/$n.dat 失败"
+    sync
+    mv -f "$GEO_DIR/.$n.dat.new" "$GEO_DIR/$n.dat" || die "替换 $n.dat 失败"
+    chmod 0644 "$GEO_DIR/$n.dat"
+    say "  已替换 $n.dat（旧文件在 $BAK/$n.dat）"
+done
+log "updated from $SRC, backup=$BAK"
+
+rollback() {
+    say "回滚…"
+    for f in "$BAK"/*.dat; do
+        [ -f "$f" ] && cp -a "$f" "$GEO_DIR/$(basename "$f")"
+    done
+    /etc/init.d/dae restart >/dev/null 2>&1
+    log "ROLLED BACK to $BAK"
+    die "$1"
+}
+
+# ── 让 dae 重新加载 ─────────────────────────────────────────────────
+say "dae validate …"
+if ! dae validate -c /etc/dae/config.dae >/tmp/dae-geo-val.err 2>&1; then
+    cat /tmp/dae-geo-val.err >&2
+    rollback "新数据导致 dae validate 失败"
+fi
+
+say "重启 dae …"
+/etc/init.d/dae restart >/dev/null 2>&1
+i=0
+while [ "$i" -lt 15 ]; do
+    sleep 1
+    pgrep -f '/usr/bin/dae run' >/dev/null && break
+    i=$((i + 1))
+done
+pgrep -f '/usr/bin/dae run' >/dev/null || rollback "dae 重启后没有进程"
+
+say "实测出网（最多 20s）…"
+ok=0
+i=0
+while [ "$i" -lt 4 ]; do
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 12 "$CHECK_URL" 2>/dev/null)
+    [ "$code" = "204" ] && { ok=1; break; }
+    i=$((i + 1))
+    sleep 3
+done
+[ "$ok" -eq 1 ] || rollback "新 geo 数据下出网失败（$CHECK_URL 非 204）"
+
+st=$(grep -E "Total startup time" /var/log/dae/dae.log | tail -1 | sed 's/.*time: //')
+[ -n "$st" ] && log "startup=$st"
+
+log "OK, check=$CHECK_URL/204"
+say "完成：geo 数据已更新，dae 正常出网（$CHECK_URL → 204）${st:+，启动耗时 $st}"
+say "   备份：$BAK （回滚：cp $BAK/*.dat $GEO_DIR/ && /etc/init.d/dae restart）"

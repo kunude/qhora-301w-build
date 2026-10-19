@@ -673,11 +673,14 @@ jobs:
               exit 1
             fi
             echo "::notice title=rootfs::解开 ${nf} 个文件"
-            for f in usr/bin/dae usr/bin/dae-switch etc/config/dae etc/dae/config.dae \
+            for f in usr/bin/dae usr/bin/dae-switch usr/bin/dae-geo-update \
+                     etc/config/dae etc/dae/config.dae \
                      usr/share/dae/geoip.dat usr/share/dae/geosite.dat \
                      etc/uci-defaults/97-ssh-login-fix etc/uci-defaults/98-dae-config-perms \
                      etc/ssh/sshd_config; do
-              if [[ -e "$tmpd/rootfs/$f" ]]; then
+              # geoip.dat / geosite.dat 是软链（dae-geoip -> ../v2ray/...），
+              # 用 -e 会跟随软链判断，软链断了就误报，所以 -L 也算存在
+              if [[ -e "$tmpd/rootfs/$f" || -L "$tmpd/rootfs/$f" ]]; then
                 echo "::notice title=出厂文件::/$f 已在 rootfs 中"
               else
                 echo "::error::rootfs 里缺少 /$f —— files-dae 覆盖层没生效？"

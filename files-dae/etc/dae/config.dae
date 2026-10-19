@@ -47,11 +47,19 @@ global {
     check_tolerance: 50ms
 
     # ── 拨号方式 ────────────────────────────────────────────────────────
-    # domain：把嗅探到的域名交给节点侧解析。抗污染，也避免"节点用 IP 直连
-    # 结果被目标站判定为异常"的问题（Cloudflare/Google 尤其明显）。
-    dial_mode: domain
+    # domain++：把嗅探到的域名交给节点侧解析，并且**按嗅探到的域名做路由**。
+    #
+    # 为什么不用 domain：`domain` 模式下路由在嗅探之前就按 IP 做完了，域名规则
+    # 能否命中取决于"DNS 查询有没有穿过 dae"。而 LAN 里 dnsmasq 有缓存，
+    # 命中缓存时 DNS 根本不发出去，dae 就没有 domain→IP 映射 ⇒ netflix、
+    # openai 这类规则时灵时不灵（实测：同一台机器上有时命中 stream 组，
+    # 有时全部落回 fallback）。
+    # domain++ 会在嗅探后强制按域名重路由，代价是每连接多一点 CPU。
+    dial_mode: domain++
     allow_insecure: false
-    sniffing_timeout: 30ms
+    # 30ms 在这台机器上抓不到 ClientHello（实测 sniffed 全是空），
+    # 300ms 后 netflix / youtube 的 SNI 都能稳定抓到。
+    sniffing_timeout: 300ms
 
     # utls + chrome_auto：Client Hello 伪装成 Chrome，对纯 TLS 的节点更稳
     tls_implementation: utls
@@ -77,7 +85,7 @@ subscription {
     #jms: ''
 
     # 想再加一条订阅（第二个机场/备用）就再加一行，标签自己起
-    #bak: 'https://example.com/api/v1/client/subscribe?token=xxx'
+    #bak: 'https://example.com/api/v1/client/subscribe?token=REPLACE_ME'
 
     # 想再加一条订阅（比如另一个机场）就照着写：
     # bak: 'https://example.com/api/v1/client/subscribe?token=xxx'

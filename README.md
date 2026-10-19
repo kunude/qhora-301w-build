@@ -266,7 +266,8 @@ outbound=ai     policy=fixed           dialer=...c38s2...:443     openai
 |---|---|---|
 | `wan_interface` | `auto` | 本机型 WAN 是 `10g-1` / `wan` / `pppoe-wan`，auto 都能认 |
 | `lan_interface` | `br-lan` | **必须显式写**。dae 上游默认不代理 LAN（`example.dae` 里这行是注释掉的），不写就只有路由器本机走代理，LAN 客户端全是直连，日志里也不会有一句抱怨 |
-| `dial_mode` | `domain` | 域名交给节点侧解析，抗污染、拿到更优 IP |
+| `dial_mode` | **`domain++`** | `domain` 模式是**先按 IP 分流、后嗅探**，域名规则能否命中取决于 "DNS 有没有穿过 dae"；LAN 里 dnsmasq 有缓存，命中缓存时 dae 拿不到映射 ⇒ netflix / openai 规则时灵时不灵。`domain++` 嗅探后强制按域名重路由（实测由"全落 fallback"变成 netflix→stream、openai→ai） |
+| `sniffing_timeout` | **`300ms`** | 30ms 在这台机器上抓不到 ClientHello，日志里 `sniffed=` 全是空；300ms 后 SNI 稳定 |
 | `tls_implementation` | `utls` + `chrome_auto` | Client Hello 伪装成 Chrome，纯 TLS 节点更稳 |
 | `bootstrap_resolver` | `223.5.5.5:53` | 启动早期拉订阅时 dae 自己的 DNS 还没起来 |
 | `sub(jms) -> alidns` + `subnode(subtag: jms) -> alidns` | 订阅与**节点域名**走国内 DNS | 不加 `subnode` 会死循环：解节点域名 → 走代理 → 代理要先知道节点 IP → 日志刷 `bootstrap resolver returned no usable address`。实测加上之后该类告警从 4 条/40s 降到 0 |
@@ -280,6 +281,69 @@ outbound=ai     policy=fixed           dialer=...c38s2...:443     openai
 而表现是 procd 说 `running`、实际一个实例都没有。造镜像时
 `scripts/prepare-build.sh` 会统一 `chmod 0600`，`files-dae/etc/uci-defaults/98-dae-config-perms`
 首启再兜一次；自己手改过配置就补一句 `chmod 600 /etc/dae/config.dae`。
+
+### geo 数据（`geoip.dat` / `geosite.dat`）从哪来、怎么更新
+
+`routing` 里的 `geoip:cn`、`geosite:netflix` 这些不是 dae 自带的，也不是运行时下载的：
+
+```
+v2ray-geodata（feed 里的一个配方，产出两个子包）
+  ├── v2ray-geoip    →  /usr/share/v2ray/geoip.dat
+  └── v2ray-geosite  →  /usr/share/v2ray/geosite.dat
+dae-geoip / dae-geosite（只是软链）
+  └── /usr/share/dae/geoip.dat   -> ../v2ray/geoip.dat
+      /usr/share/dae/geosite.dat -> ../v2ray/geosite.dat
+```
+
+也就是说数据是**编译期打进 rootfs 的**，dae 运行时不联网更新。出厂那份（2026-10-12 构建）
+
+| 文件 | 大小 | 版本 |
+|---|---|---|
+| `geoip.dat` | 22.2 MB | `v2ray-geoip` 202610050438 |
+| `geosite.dat` | 2.2 MB | `v2ray-geosite` 20261009101206 |
+
+要更新有三条路，按推荐顺序：
+
+**① 重编固件（最干净）** —— feed 的 `v2ray-geodata` 每次 `feeds update` 都会拉上游最新，
+CI 每次都是全新树，所以重跑一次工作流就带新数据。缺点是慢（一次完整构建）。
+
+**② 设备上就地替换（秒级）** —— 固件预置了 `dae-geo-update`：
+
+```sh
+dae-geo-update --check              # 只对比：本地多大 / 上游多大，不动文件
+dae-geo-update                      # 从 v2fly 拉最新（与固件同源）并替换 + 重启 dae
+dae-geo-update --only geosite       # 只更新一个
+dae-geo-update --cron               # 装每周一 05:10 的定时更新（busybox crond）
+```
+
+它做的事：下载 → **校验**（大小下限 + 不能用 HTML 错误页 + 找得到 `CN` / `google` 这类
+特征串）→ 备份到 `/root/geo-backup/<时间>/` → 同目录重命名（原子替换）→
+`dae validate` → 重启 dae → 实测 `generate_204` 必须回 204。任何一步失败**自动回滚**。
+
+**③ `apk upgrade`（不推荐，会降级）** —— snapshot 的 `packages.adb` 里
+`v2ray-geoip` 还是 `202607171233`（2026-07-17），比固件里的 `202610050438`（10-05）**更旧**，
+`apk upgrade v2ray-geoip` 等于把数据倒回去。
+
+三个必须知道的坑：
+
+- **`geosite.dat` 别贪大**。Loyalsoldier 那份有 11 MB（分类更全），实测这台机器上 dae 建规则
+  要吃 **158 MiB 堆**、启动从 3.7 s 涨到 **60 s+**，而且 `Routing match set len` 从 18 掉到 16
+  —— 部分 `geosite:` 规则直接没编进去，流量全落回 `fallback`。所以脚本默认用 v2fly（≈2 MB），
+  超过 6 MB 会直接拦下来，真要试得加 `--force`。
+- **换的是 apk 包里的文件**。`/usr/share/v2ray/*.dat` 属于 `v2ray-geoip` / `v2ray-geosite` 包，
+  `apk upgrade` 会把你的替换覆盖回包里的版本；`sysupgrade` 保留配置时 overlay 里的替换保留，
+  但**重刷整镜像会回到固件版本**。
+- **短 tag 要用 `strings -n 2` 查**。`CN`、`hk` 这些只有 2 个字符，`strings` 默认跳过长度 <4 的串，
+  不加 `-n 2` 会一个都搜不到（脚本第一版就栽在这上面）。
+
+验证新数据确实生效：
+
+```sh
+strings -n 2 /usr/share/v2ray/geosite.dat | grep -xE 'NETFLIX|OPENAI'   # tag 是否存在
+grep "Routing match set len" /var/log/dae/dae.log | tail -1              # 18 正常，掉到 16 说明有规则没编进去
+curl -s -o /dev/null -w '%{http_code}\n' --max-time 10 https://www.netflix.com   # 应落到 stream 组
+grep "sniffed=www.netflix.com" /var/log/dae/dae.log | tail -1            # outbound=stream 才对
+```
 
 ### `dae.config` 与另外两份覆盖层的关系
 
@@ -1062,6 +1126,9 @@ dae 专属（第六条线）：
 | `dae` 启动失败，日志里有 `failed to load eBPF` / `BTF` 字样 | 内核没有 `/sys/kernel/btf/vmlinux` | `ls /sys/kernel/btf/vmlinux`；没有 = 刷的不是 dae 线固件 |
 | `dae validate` 不过、服务起不来（但网络正常） | ① 没填订阅（出厂默认就是这个状态）；② 配置语法错 | `dae validate -c /etc/dae/config.dae -l debug` 看具体行；init 脚本 validate 失败会直接 `return 1`，**不会 respawn 循环**，所以不会拖垮网络 |
 | 日志刷 `bootstrap resolver returned no usable address for "c38s1.xxx"` | 死循环：要解节点域名 → DNS 查询走代理 → 代理要先知道节点 IP | `dns.routing.request` 里加 `subnode(subtag: <订阅标签>) -> alidns`，让节点域名直接走国内 DNS（出厂配置已带） |
+| 日志里 `sniffed=` 全是空、域名规则时灵时不灵 | ① `sniffing_timeout` 太小（30ms 抓不到 ClientHello）；② `dial_mode: domain` 是先按 IP 分流后嗅探，dnsmasq 缓存命中时 dae 没有 domain→IP 映射 | 出厂配置已改 `sniffing_timeout: 300ms` + `dial_mode: domain++`；自己改过就照这两行补 |
+| 换了 geo 数据后所有流量都走 `fallback`、`Routing match set len` 从 18 掉到 16 | `geosite.dat` 太大/格式不兼容，dae 静默少编译了一批规则 | `dae-geo-update` 用默认的 v2fly 源重来一遍（它会拦 >6MB 的文件），或从 `/root/geo-backup/` 回滚 |
+| `apk upgrade v2ray-geoip` 之后数据反而变旧 | snapshot 的 packages 索引比固件里的版本还老 | 用 `dae-geo-update`，别用 apk 升这两个包 |
 | 日志刷 `DNS forward to upstream failed ... udp ... i/o timeout` | DNS 用 `tcp+udp://` 时先发 UDP，UDP 经节点容易丢 | 上游改成 `tcp://dns.google:53`（出厂配置已改，实测失败数从 12 条/40s 降到 0） |
 | `/etc/init.d/dae status` 说 `running`，但 `pgrep -af "dae run"` 是空的、`/var/log/dae` 也不存在（procd 的 `active with no instances`） | **`/etc/dae/config.dae` 权限太宽**。`dae validate` 会拒绝 group 可写 / other 可读的文件，报 `permissions 0644 ... are too open; requires ... 0640 or 0600`。**0644 也不行** | `chmod 600 /etc/dae/config.dae && /etc/init.d/dae restart`。造镜像时 `scripts/prepare-build.sh` 已统一收紧，`/etc/uci-defaults/98-dae-config-perms` 首启再兜一次；自己手改过就用这条修 |
 | 路由器本机能翻墙，**LAN 客户端全是直连**（日志里只有 `Bind to WAN`，没有 `Bind to LAN`） | `global` 段没写 `lan_interface`。dae 上游默认**不代理 LAN**（`example.dae` 里这行是注释掉的） | 加上 `lan_interface: br-lan` 再 `restart`；日志应出现 `Bind to LAN: br-lan`。多网口用逗号分隔 |
