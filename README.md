@@ -149,7 +149,7 @@ sing-box 进程建 5330-5333 一组入站，再由 nftables 把 LAN 流量转发
 
 | 前提 | 对应 Kconfig | immortalwrt 通用内核默认 | 缺了会怎样 |
 |---|---|---|---|
-| `/sys/kernel/btf/vmlinux` 存在 | `CONFIG_DEBUG_INFO_BTF` | **关** | eBPF 程序加载失败，`dae validate` 过不了 |
+| `/sys/kernel/btf/vmlinux` 存在 | `CONFIG_DEBUG_INFO_BTF` | **关** | eBPF 程序加载失败，日志报 `failed to load eBPF` |
 | tc 的 bpf 分类器 / 动作 | `CONFIG_NET_CLS_BPF` + `CONFIG_NET_ACT_BPF` | **关** | 隧道模式挂不上挂载点 |
 | `sch_ingress` | `CONFIG_NET_SCH_INGRESS` | **关** | 同上（`kmod-sched-core`） |
 | XDP socket | `CONFIG_XDP_SOCKETS` | **关** | `kmod-xdp-sockets-diag` 直接不生成 |

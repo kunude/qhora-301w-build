@@ -39,6 +39,15 @@ name: Build QHora-301W (ImmortalWrt + NSS + dae)
 #     （BTF 明确 depends on !REDUCED，不关会被静默丢弃 —— 编完才发现没 BTF）。
 #   产物阶段还会直接验 vmlinux 的 .BTF 段大小，不是只看 .config。
 #
+# ── 构建耗时：本线是七条里最长的 ────────────────────────────────
+# dae 的配方是 PKG_BUILD_DEPENDS:=golang/host bpf-headers，而 bpf-headers
+# 需要 host 侧的 LLVM/Clang（CONFIG_BPF_TOOLCHAIN_BUILTIN，默认），
+# 也就是 tools/llvm-bpf 要从 llvm-project 源码现场编一套 clang 出来。
+# 首次运行的长尾就来自这里（下载 ~135MB + 编译），加上 golang/host
+# 与内核 BTF（pahole 要跑一遍整个 vmlinux）—— 第一次没有 ccache 时
+# 耗时明显高于 imm-nss-homeproxy 线，接近 timeout-minutes 也可能。
+# 第二次起 .ccache 命中（CONFIG_CCACHE=y 也覆盖 host 工具），会快很多。
+#
 # ── SSH 登录（本线顺手补上的那个坑）──────────────────────────────
 # 老五条线编出来的固件都有同一个问题：出厂 /etc/shadow 里 root 的密码字段是
 # **空的**（`root:::0:99999:7:::`），而 files/etc/ssh/sshd_config 里

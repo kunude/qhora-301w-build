@@ -376,10 +376,11 @@ fi
 log "$cred_report"
 
 # ── 6. 叠加 files/ 与 files-<PROXY_STACK>/ ──────────────────
-# files/               两个变体共用（主机名、LAN 网段、首页硬件区块…）
-# files-<PROXY_STACK>/ 只给对应变体叠加。目前用于把 passwall2 的出厂
-#                      预置配置（etc/config/passwall2）只放进 passwall2 版，
-#                      免得 HomeProxy 版固件里躺着一份用不上的 passwall2 配置。
+# files/               各变体共用（主机名、LAN 网段、首页硬件区块…）
+# files-<PROXY_STACK>/ 只给对应变体叠加：
+#                      files-passwall2/  → etc/config/passwall2
+#                      files-homeproxy/  → etc/config/homeproxy + 9 个 .srs
+#                      files-dae/        → etc/dae/config.dae + SSH 修复脚本
 # 目录不存在就跳过；先叠共用、后叠变体，变体里的同名文件覆盖共用。
 overlay_variant="$BUILDER_DIR/files-$PROXY_STACK"
 for d in "$BUILDER_DIR/files" "$overlay_variant"; do
