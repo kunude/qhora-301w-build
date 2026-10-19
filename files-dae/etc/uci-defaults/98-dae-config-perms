@@ -1,0 +1,16 @@
+#!/bin/sh
+# dae 首启兜底：配置文件权限收紧成 0600。
+#
+# 为什么需要：
+#   `dae validate` 会拒掉 group 可写 / other 可读的配置文件，
+#   报 "permissions 0644 ... are too open; requires ... 0640 or 0600"。
+#   旧固件（以及在自己手上 chmod 过、或用某些编辑器另存过的文件）很容易变成
+#   0644 / 0664 / 0777，结果就是：
+#       /etc/init.d/dae start   → status 说 running
+#       pgrep dae run           → 什么都没有（procd "active with no instances"）
+#   而日志目录 /var/log/dae 也不存在 —— 看起来像 dae 自己崩了，其实是它压根没启动。
+#
+# 这里只做一件事，且是幂等的：把权限收紧。不动内容，不动 enabled。
+[ -f /etc/dae/config.dae ] || exit 0
+chmod 0600 /etc/dae/config.dae 2>/dev/null || true
+exit 0

@@ -155,7 +155,14 @@ env:
   # 时，那个 commit 在 luci/packages 里根本不存在，稀疏检出会直接失败。
   # 本线用 IMM_REF 的地方只剩 luci（ddns-go / msd_lite / luci-base / luci-mod-status
   # 四个前端），dae 与 luci-app-dae 直接由 feeds 提供。
-  IMM_BASE_REF: ${{ github.event.inputs.imm_ref || 'master' }}
+  # ⚠️ 暂时钉在 da63f7d（2026-10-15，NSS 补丁完整编译验证过的那一版）。
+  # 原因：immortalwrt 的 2248ed7（2026-10-16 "nftables: refresh patches after
+  # version bump"）动了内核模块定义，patches/immortalwrt-nss/ 这份补丁的
+  # 上下文对不上（input.mk / usb.mk / ipq8074-rt-ax89x.dts / qca_ppe_main.c
+  # 四处），`git apply` 与 `patch --fuzz=3` 都拒绝 —— 2026-10-19 的 CI 就卡在这里。
+  # 补丁按新基座重新生成之后，把这里改回 'master' 即可（手动触发时用
+  # imm_ref 输入可以临时覆盖）。
+  IMM_BASE_REF: ${{ github.event.inputs.imm_ref || 'da63f7d6ac4207e534c9b92ba3d2b555a8edce8d' }}
   # 用 github.event.inputs 而不是 inputs：两者在 workflow_dispatch 下等价，
   # 但前者在 push / schedule 事件下也能安全求值（返回空）。
   IMM_REF: ${{ github.event.inputs.imm_feed_ref || 'master' }}
@@ -666,9 +673,10 @@ jobs:
               exit 1
             fi
             echo "::notice title=rootfs::解开 ${nf} 个文件"
-            for f in usr/bin/dae etc/config/dae etc/dae/config.dae \
+            for f in usr/bin/dae usr/bin/dae-switch etc/config/dae etc/dae/config.dae \
                      usr/share/dae/geoip.dat usr/share/dae/geosite.dat \
-                     etc/uci-defaults/97-ssh-login-fix etc/ssh/sshd_config; do
+                     etc/uci-defaults/97-ssh-login-fix etc/uci-defaults/98-dae-config-perms \
+                     etc/ssh/sshd_config; do
               if [[ -e "$tmpd/rootfs/$f" ]]; then
                 echo "::notice title=出厂文件::/$f 已在 rootfs 中"
               else
@@ -676,16 +684,35 @@ jobs:
                 bad=$((bad + 1))
               fi
             done
-            if [[ -f "$tmpd/rootfs/etc/uci-defaults/97-ssh-login-fix" ]] && \
-               [[ ! -x "$tmpd/rootfs/etc/uci-defaults/97-ssh-login-fix" ]]; then
-              echo "::error::97-ssh-login-fix 没有可执行位，首启不会被执行"
-              bad=$((bad + 1))
+            for s in 97-ssh-login-fix 98-dae-config-perms; do
+              if [[ -f "$tmpd/rootfs/etc/uci-defaults/$s" ]] && \
+                 [[ ! -x "$tmpd/rootfs/etc/uci-defaults/$s" ]]; then
+                echo "::error::/etc/uci-defaults/$s 没有可执行位，首启不会被执行"
+                bad=$((bad + 1))
+              fi
+            done
+            # dae 的配置文件权限必须是 0600（0640 也认，别的都不认）。
+            # `dae validate` 会因为 "permissions 0644 ... are too open" 直接失败，
+            # init 脚本 validate 不过就 return 1 —— 表现是 procd 报
+            # "active with no instances"、/var/log/dae 都不建，看起来像 dae 崩了。
+            # 2026-10-19 实机（192.168.100.1）起不来的真正原因就是这个：
+            # 镜像里那份是 0755（Windows 上检出是 0777，git 只记可执行位）。
+            if [[ -f "$tmpd/rootfs/etc/dae/config.dae" ]]; then
+              dae_mode=$(stat -c '%a' "$tmpd/rootfs/etc/dae/config.dae")
+              if [[ "$dae_mode" != "600" && "$dae_mode" != "640" ]]; then
+                echo "::error::/etc/dae/config.dae 权限是 ${dae_mode} —— dae validate 只接受 0640/0600，服务会起不来"
+                bad=$((bad + 1))
+              else
+                echo "::notice title=dae 配置权限::${dae_mode}（validate 通过）"
+              fi
             fi
-            # 骨架配置里不许有有效订阅/节点链接（prepare-build.sh 的第 6a 步已经查过
+            # 出厂配置里不许有有效订阅/节点链接（prepare-build.sh 的第 6a 步已经查过
             # 源文件，这里再查一遍**产物**：覆盖层叠加顺序出问题时源文件和固件会不一致）
+            # 健康检查地址（tcp_check_url / udp_check_dns）是合法内容，先滤掉再查。
             if [[ -f "$tmpd/rootfs/etc/dae/config.dae" ]] && \
                grep -vE '^[[:space:]]*#' "$tmpd/rootfs/etc/dae/config.dae" \
-                 | grep -qE '(vless|vmess|ss|ssr|trojan|hysteria2?|tuic|anytls)://|https?://'; then
+                 | grep -vE '(tcp_check_url|udp_check_dns|bootstrap_resolver|fallback_resolver)[[:space:]]*:' \
+                 | grep -qE '(vless|vmess|ss|ssr|trojan|hysteria2?|tuic|anytls)://|^[[:space:]]*[A-Za-z0-9_]+:[[:space:]]*.?https?://'; then
               echo "::error::/etc/dae/config.dae 里有有效的订阅/节点链接 —— 固件是公开产物"
               bad=$((bad + 1))
             fi

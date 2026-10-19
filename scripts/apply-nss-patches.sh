@@ -136,8 +136,13 @@ for p in "${patches[@]}"; do
   fi
 
   # 两条路都走不通：把「哪个文件对不上」逐个报出来，再给结论。
+  # 这里必须吞掉 git 的退出码（|| true）：补丁打不上时 `git apply --check`
+  # **本来就返回 1**，而这个脚本是 set -e + pipefail —— 不吞掉它，这条赋值
+  # 语句本身就会让脚本静默退出，下面的 die 一个字都打不出来。
+  # 2026-10-19 的 CI 就是这么失败的：日志里只有三条 ::notice，紧接着
+  # "Process completed with exit code 1"，没有任何原因。
   failed_files="$(
-    git apply --check -v "$p" 2>&1 \
+    { git apply --check -v "$p" 2>&1 || true; } \
       | sed -n 's/^error: \(.*\): patch does not apply$/\1/p' \
       | sort -u
   )"

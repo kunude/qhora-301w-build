@@ -401,6 +401,22 @@ fi
 if [[ -d files/etc/uci-defaults ]]; then
   chmod 0755 files/etc/uci-defaults/* 2>/dev/null || true
 fi
+# 覆盖层里的命令（如 dae-switch）也要可执行位。git 只记 0755/0644 两种，
+# 而 Windows 上检出后全是 0777 —— 统一在构建前拍平，别指望仓库里的模式。
+if [[ -d files/usr/bin ]]; then
+  chmod 0755 files/usr/bin/* 2>/dev/null || true
+fi
+
+# dae 的配置文件**必须是 0600**，否则 dae 根本起不来：
+#     $ dae validate -c /etc/dae/config.dae
+#     permissions 0777 for '/etc/dae/config.dae' are too open;
+#     requires the file is NOT writable by the same group and NOT accessible by others
+# 注意 0644 也不行（other 可读），只有 0640 / 0600 过得了。而 git 只记可执行位、
+# Windows 上检出时还是 0777 —— 所以必须在这里统一收紧，别指望仓库里的模式。
+if [[ -d files/etc/dae ]]; then
+  find files/etc/dae -type f -exec chmod 0600 {} + 2>/dev/null || true
+  log "dae 配置权限已收紧为 0600（dae validate 只接受 0640/0600）"
+fi
 
 # ── 6a. dae 覆盖层的两道断言 ───────────────────────────────────
 # files-<PROXY_STACK>/ 是"目录不存在就静默跳过"的，写错目录名不会报错，
@@ -420,12 +436,15 @@ if [[ "$PROXY_STACK" == "dae" ]]; then
     "PROXY_STACK=dae 但缺少 files/etc/uci-defaults/97-ssh-login-fix" \
     "（出厂 root 密码为空 + LuCI 密钥路径不一致，删了它 SSH 就永远登不进去）"
 
+  # 安全闸：允许的是**健康检查地址**（tcp_check_url / udp_check_dns /
+  # bootstrap_resolver 这类公网探测点），禁止的是订阅链接与分享链接。
   if grep -vE '^[[:space:]]*#' "$dae_conf" |
-       grep -qE '(vless|vmess|ss|ssr|trojan|hysteria2?|tuic|anytls)://|https?://'; then
+       grep -vE '(tcp_check_url|udp_check_dns|bootstrap_resolver|fallback_resolver)[[:space:]]*:' |
+       grep -qE '(vless|vmess|ss|ssr|trojan|hysteria2?|tuic|anytls)://|^[[:space:]]*[A-Za-z0-9_]+:[[:space:]]*.?https?://'; then
     die "dae 出厂配置里出现了**有效**的订阅链接或分享链接（固件是公开产物）" \
         "把值删掉、只保留注释掉的示例；真正的节点在设备上填"
   fi
-  log "dae 出厂配置就位：无有效订阅/节点链接（骨架配置），SSH 修复脚本在"
+  log "dae 出厂配置就位：无有效订阅/节点链接（订阅留空，实测该配置能通过 dae validate）"
 fi
 
 # ── 6b. HomeProxy 规则集：编译期刷新到最新版 ──────────────────

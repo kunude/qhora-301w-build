@@ -1,0 +1,95 @@
+#!/bin/sh
+# ============================================================================
+#  dae-switch —— dae 节点切换 / 分组查看
+#
+#  用法：
+#      dae-switch status          看当前每个组用的是哪个节点、路由默认走哪组
+#      dae-switch list            列出订阅里的全部节点及测速
+#      dae-switch use <组名>      把默认出口切到某个组（proxy/pin/stream/ai）
+#      dae-switch pin <序号>      只改 pin 组固定到第 n 个节点（n 从 0 开始）
+#
+#  切换后自动 `dae validate` → `hot_reload`（不断连接）；
+#  校验不过会**自动回滚**，不会把网络搞死。
+# ============================================================================
+CFG=/etc/dae/config.dae
+MARK='DAE_SWITCH_MARK'
+
+die() { echo "错误：$*" >&2; exit 1; }
+usage() {
+    sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+    exit 1
+}
+[ -r "$CFG" ] || die "读不到 $CFG"
+
+cur_fallback() {
+    sed -n "s|^[[:space:]]*fallback:[[:space:]]*\([A-Za-z0-9_]*\).*${MARK}.*|\1|p" "$CFG"
+}
+cur_pin() {
+    awk '/^[[:space:]]*pin[[:space:]]*\{/{f=1} f&&/policy:[[:space:]]*fixed\(/{gsub(/^.*fixed\(|\).*$/,"");print;exit}' "$CFG"
+}
+groups() {
+    sed -n 's/^[[:space:]]*\([A-Za-z0-9_]*\)[[:space:]]*{[[:space:]]*$/\1/p' "$CFG" |
+        grep -vxE 'global|subscription|node|group|routing|dns|upstream|request|response' | tr '\n' ' '
+}
+
+case "$1" in
+status)
+    echo "配置文件    : $CFG"
+    echo "服务状态    : $(/etc/init.d/dae status 2>&1)"
+    echo "默认出口    : $(cur_fallback)   （routing 最后一行 fallback）"
+    echo "pin 组序号  : $(cur_pin)         （fixed(n)，n 从 0 开始）"
+    echo "可用组      : $(groups)"
+    echo
+    echo "--- 各组当前选中的节点（取日志最新一条）---"
+    for g in $(groups); do
+        d=$(grep -E "Group selects dialer|Group re-selects dialer" /var/log/dae/dae.log 2>/dev/null |
+            sed -n "s/.*dialer=\([^ ]*\) group=${g}\( .*\)\?$/\1/p" | tail -1)
+        [ -n "$d" ] && printf '  %-8s %s\n' "$g" "$d"
+    done
+    ;;
+list)
+    echo "--- 订阅里的节点（按组，日志里最近一次测速）---"
+    grep -E "^ +[0-9]+\. \[[a-z]+\] |Group '.*' \[" -A0 /var/log/dae/dae.log 2>/dev/null | tail -40
+    echo
+    echo "--- 订阅行 ---"
+    grep -nE "^[[:space:]]*[A-Za-z0-9_]+:[[:space:]]*'https?://" "$CFG" | sed 's/\(token=\|id=\).*/\1***/'
+    ;;
+use)
+    g="$2"
+    [ -n "$g" ] || die "用法：dae-switch use <组名>"
+    grep -qE "^[[:space:]]*${g}[[:space:]]*\{" "$CFG" || die "没有叫 $g 的组（可用：$(groups)）"
+    old=$(cur_fallback)
+    [ "$old" = "$g" ] && { echo "默认出口已经是 $g，无需切换"; exit 0; }
+    cp -a "$CFG" "$CFG.bak"
+    sed -i "s|^\([[:space:]]*\)fallback:[[:space:]]*[A-Za-z0-9_]*\([[:space:]]*#.*${MARK}\)|\1fallback: $g\2|" "$CFG"
+    [ "$(cur_fallback)" = "$g" ] || { cp -a "$CFG.bak" "$CFG"; die "改 fallback 失败（没找到 ${MARK} 标记行）"; }
+    if ! dae validate -c "$CFG" >/tmp/dae-switch.err 2>&1; then
+        cp -a "$CFG.bak" "$CFG"
+        cat /tmp/dae-switch.err >&2
+        die "校验失败，已回滚到 $old"
+    fi
+    /etc/init.d/dae hot_reload >/dev/null 2>&1 || /etc/init.d/dae restart >/dev/null 2>&1
+    echo "默认出口：$old → $g （已热加载，现有连接不受影响）"
+    ;;
+pin)
+    n="$2"
+    case "$n" in ''|*[!0-9]*) die "用法：dae-switch pin <序号>，序号从 0 开始";; esac
+    cp -a "$CFG" "$CFG.bak"
+    awk -v n="$n" '
+        /^[[:space:]]*pin[[:space:]]*\{/ { inblk=1 }
+        inblk && /policy:[[:space:]]*fixed\(/ { sub(/fixed\([0-9]+\)/, "fixed(" n ")"); inblk=0 }
+        { print }
+    ' "$CFG" > "$CFG.new" && mv "$CFG.new" "$CFG"
+    chmod 600 "$CFG"
+    if ! dae validate -c "$CFG" >/tmp/dae-switch.err 2>&1; then
+        cp -a "$CFG.bak" "$CFG"; chmod 600 "$CFG"
+        cat /tmp/dae-switch.err >&2
+        die "校验失败，已回滚"
+    fi
+    /etc/init.d/dae hot_reload >/dev/null 2>&1 || /etc/init.d/dae restart >/dev/null 2>&1
+    echo "pin 组已固定到第 $n 个节点；想让它生效就 dae-switch use pin"
+    ;;
+*)
+    usage
+    ;;
+esac

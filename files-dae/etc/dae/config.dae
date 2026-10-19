@@ -1,141 +1,235 @@
-# ── dae 出厂配置（骨架）────────────────────────────────────────
+# ============================================================================
+#  dae 配置（QNAP QHora-301W / QWRT）
 #
-# 这是**没有节点**的骨架：`subscription` 与 `node` 两段里只有注释掉的示例，
-# 所以 dae 起不来（validate 会因为没有可用节点而失败），也就是**即使误启用
-# 也不会改变任何流量的去向**。
+#  这个文件是**可运行**的完整配置，不是骨架。三块内容：
+#    ① global        —— 内核/接口/拨号方式
+#    ② subscription  —— 订阅（节点池来源）
+#    ③ group         —— 节点组（决定"用哪个节点出去"，也就是节点切换）
+#    ④ routing       —— 分流（决定"哪些流量走哪个组"）
 #
-# 出厂 /etc/config/dae 里是 `option enabled '0'`，init 脚本的 start_service()
-# 第一句就是 config_get_bool + `[ "$enabled" -eq "1" ] || return 1` ——
-# 没显式启用时连 validate 都不跑；启用了才 `dae validate -c ...`，
-# 不过就直接 return 1，不进 procd 的 respawn 循环，更不会把网络搞断。
+#  出厂状态：subscription 段是空的（没有订阅 → 没有节点 → dae 起不来，
+#  也不会改任何流量去向）。**先填订阅，再启用服务。**
 #
-# 注意：**没填节点时它本来就起不来**（没有可用节点，validate 不过）——
-# 这是故意的，不要为了"让它能起来"而删掉 my_group 或改成 fallback: direct。
+#  改完不用重启服务：
+#      dae validate -c /etc/dae/config.dae && /etc/init.d/dae hot_reload
+#  连内核态 eBPF 一起换、或者要动 `lan_interface` 这类 global 项时才需要：
+#      /etc/init.d/dae restart
 #
-# ── 怎么用 ────────────────────────────────────────────────────
-# 1) 填节点：用 LuCI「服务 → dae → 配置」直接编辑本文件，或 SSH 改；
-#    支持 ss / vmess / vless / trojan / hysteria2 / tuic 等，写法就是链接：
-#        subscription { my_sub: 'https://你的订阅地址' }
-#        node { 'ss://xxxx' }
-# 2) 让路由规则指向你的节点组：本文件已定义 group `my_group`（用全部节点、
-#    按滑动平均延迟选路），routing 段末尾的 `fallback: my_group` 就是它。
-# 3) 启用服务：
-#        uci set dae.config.enabled='1'
-#        uci commit dae
-#        /etc/init.d/dae restart
-#
-# ── 内核前提（本固件的 dae 线已编译进去，换别的固件要自己确认）──
-#    ls /sys/kernel/btf/vmlinux     # 必须存在，否则 CO-RE 程序无法加载
-#    缺这个文件就是内核没开 CONFIG_DEBUG_INFO_BTF，dae 起不来
-#    （报错形如 "failed to load eBPF: ... BTF"）。
-#
-# 参考：https://github.com/daeuniverse/dae/blob/main/docs/en/configuration/
-#
+#  权限必须是 600，否则 dae 会拒绝加载（里面有订阅链接，等于账号密码）：
+#      chmod 600 /etc/dae/config.dae
+# ============================================================================
 
 global {
-    # tproxy 端口只给 eBPF 程序内部用，不是 HTTP/SOCKS 代理端口。
     tproxy_port: 12345
     tproxy_port_protect: true
-
     log_level: info
 
-    # auto = 自动识别 wan 口（本机型是 pppoe-wan / wan）。
-    wan_interface: auto
-    # 代理 LAN：留空表示"该接口的全部流量都进 eBPF 分流"。
-    # 多网口用逗号分隔，例如 lan_interface: br-lan,br-guest
-    #lan_interface: br-lan
+    # ── 接口 ────────────────────────────────────────────────────────────
+    # lan_interface 是**必须**的：不写它，dae 只在 WAN 侧生效，
+    # LAN 里所有设备（手机/电脑/TV）的流量根本进不了 eBPF 分流。
+    # 本机型 LAN 桥是 br-lan（交换机 + 两个 WiFi AP 都在里面）。
+    # 有访客网络再加，逗号分隔：lan_interface: br-lan,br-guest
+    lan_interface: br-lan
 
-    # 让 dae 自己配 ip_forward / send_redirects 等内核参数，
-    # 免得到处找 sysctl 调（与 OpenWrt 的 firewall 不冲突）。
+    # auto = 自动认 WAN（本机型是 wan / pppoe-wan，auto 都能认）
+    wan_interface: auto
+
+    # 自己把 ip_forward / rp_filter 之类调到正确值
     auto_config_kernel_parameter: true
 
-    # domain = 只把域名交给节点侧解析（抗 DNS 污染，且节点侧拿到的 IP 更优）。
-    # 若你的 DNS 不经过 dae，可改 domain+。
+    # ── 节点健康检查 ────────────────────────────────────────────────────
+    # 组内选点的依据就是这里测出来的延迟。30s 一轮，够快也不费流量。
+    tcp_check_url: 'http://cp.cloudflare.com,1.1.1.1'
+    tcp_check_http_method: HEAD
+    udp_check_dns: 'dns.google:53,8.8.8.8'
+    check_interval: 30s
+    # 新节点要快 50ms 以上才抢走流量，避免来回抖动
+    check_tolerance: 50ms
+
+    # ── 拨号方式 ────────────────────────────────────────────────────────
+    # domain：把嗅探到的域名交给节点侧解析。抗污染，也避免"节点用 IP 直连
+    # 结果被目标站判定为异常"的问题（Cloudflare/Google 尤其明显）。
     dial_mode: domain
     allow_insecure: false
     sniffing_timeout: 30ms
 
-    # utls + chrome 指纹，对 SNI 阻断更友好；不想伪装就改回 tls。
+    # utls + chrome_auto：Client Hello 伪装成 Chrome，对纯 TLS 的节点更稳
     tls_implementation: utls
     utls_imitate: chrome_auto
 
-    # 只影响 Hysteria2 之类的带宽自适应协议，按你的线路改。
+    # 启动早期拉订阅时 dae 自己的 DNS 还没起来，先借阿里 DNS
+    bootstrap_resolver: '223.5.5.5:53'
+
+    # Hysteria2 这类协议靠带宽信息调拥塞窗口，填上更稳
     bandwidth_max_tx: '200 mbps'
     bandwidth_max_rx: '1 gbps'
-
-    # 启动早期解析订阅域名用的引导 DNS（此时 dae 自己的 DNS 还没起来）。
-    # 默认会依次试 119.29.29.29 / 223.5.5.5，这里显式写死一个国内可用的。
-    bootstrap_resolver: '223.5.5.5:53'
-    fallback_resolver: '223.5.5.5:53'
 }
 
-# 订阅：填了之后 dae 会把订阅里的节点自动并进节点池。
-# 带 -file 的写法（https-file://）会把订阅落盘到 config_dir/persist.d/，
-# 拉取失败时用落盘那份兜底 —— 移动网络/机场抖动时很有用。
+# ============================================================================
+#  ② 订阅 —— 节点池的唯一来源
+#  加一条订阅就是加一行 `标签: '链接'`；标签就是后面 subtag() 引用的名字。
+#  链接里带着账号，别提交到任何仓库。
+# ============================================================================
 subscription {
-    # my_sub: 'https-file://你的订阅地址'
+    # ↓↓↓ 把你的订阅填在这里，标签名 = 下面 group 里 subtag() 引用的名字 ↓↓↓
+    # 例：jms: 'https://example.com/api/v1/client/subscribe?token=REPLACE_ME'
+    # 出厂**不预置订阅**：固件是公开产物，订阅链接等于账号密码，不进仓库。
+    #jms: ''
+
+    # 想再加一条订阅（第二个机场/备用）就再加一行，标签自己起
+    #bak: 'https://example.com/api/v1/client/subscribe?token=xxx'
+
+    # 想再加一条订阅（比如另一个机场）就照着写：
+    # bak: 'https://example.com/api/v1/client/subscribe?token=xxx'
+
+    # 拉订阅失败时的本地兜底，下次成功会自动更新
+    # jms_cache: 'https-file://example.com/sub?token=REPLACE_ME'   # 拉取失败时的本地兜底
 }
 
-# 手写的单节点，与订阅里的节点合并成一个池子。
+# ============================================================================
+#  ③ 手动节点（可选）
+#  不想用订阅、或订阅里没有想要的节点时，直接贴分享链接：
+#      hk01: 'vless://uuid@1.2.3.4:443?...#香港01'
+#      us01: 'ss://...'
+#  这些节点会并进同一个池子，一样能被下面的组 filter 到。
+# ============================================================================
 node {
-    # 'ss://...'
-    # 'vless://...'
+    # hk01: 'vless://...'
+    # jp01: 'hysteria2://密码@1.2.3.4:443/?sni=example.com#日本01'
 }
 
-# DNS 分流：国内域名走阿里 DNS，其余走 Google（经节点出去）。
+# ============================================================================
+#  ④ 节点组 = "节点切换"的四个档位
 #
-# 这段刻意与上游 example.dae 的推荐写法逐字一致，别自己发明
-# request/response 两段组合 —— 早期版本这里写过
-#     request { fallback: alidns }
-#     response { !qname(geosite:cn) && ip(geoip:private) -> googledns }
-# 两个问题：request 的 fallback 一旦就是 alidns，googledns 永远不会被用到，
-# 整个 response 段是死代码；而且 `!qname(geosite:cn) && ip(geoip:private)`
-# 的语义是"不是国内域名 且 解析结果是内网地址"，纯属反了。
-# 正确的最小写法只有两条：国内域名→alidns，其余→googledns。
+#  policy 有四种：
+#    min_moving_avg  按最近延迟的滑动平均选最优（最稳，日常用这个）
+#    min_avg10       按最近 10 次延迟的均值选（反应快一点）
+#    fixed(n)        钉死池子里第 n 个节点（手动）
+#    random          每条连接随机（多 IP 需求才用）
+#
+#  这里的组名就是 routing 里 -> 后面的名字。改哪条流量走哪个组，改 routing。
+# ============================================================================
+group {
+    # ① 自动：日常默认走这里，永远挑当前最快的节点
+    proxy {
+        filter: subtag(jms) && !name(keyword: 'ExpireAt:')
+        policy: min_moving_avg
+    }
+
+    # ② 手动钉住：fixed(0) = 池里第 1 个节点。
+    #    换节点就把 0 改成 1、2、3…（/var/log/dae/dae.log 启动时会按顺序
+    #    列出所有节点和它们的分组，照着编号改）。
+    pin {
+        filter: subtag(jms)
+        policy: fixed(0)
+    }
+
+    # ③ 流媒体：单独一组，用更严格的探测地址。
+    #    和 proxy 组走同一个池子，但因为延迟独立计算，实际大概率落在
+    #    不同节点上 —— 这就实现了"看片和浏览各走一条线"。
+    stream {
+        filter: subtag(jms)
+        policy: min_avg10
+        tcp_check_url: 'http://www.gstatic.com/generate_204'
+    }
+
+    # ④ 第二出口：给需要"另一个 IP"的场景（AI 站点 / 多账号）用。
+    #    fixed(1) = 池里第 2 个节点，和 proxy 组的最优节点基本不会是同一个。
+    ai {
+        filter: subtag(jms)
+        policy: fixed(1)
+    }
+}
+
+# ============================================================================
+#  ⑤ 分流规则（从上往下匹配，第一条命中就决定去向）
+#
+#  右边可以是：direct（直连）、block（拒绝）、或者上面任何一个组名。
+#  匹配项：domain() 域名、dip() 目的 IP、sip() 源 IP、l4proto() 协议、
+#          dport() 目的端口、pname() 进程名、ip()、qname()（DNS 段专用）
+#  最后一行 fallback 是"其它所有没命中的流量"。
+# ============================================================================
+routing {
+    ### 固定前置，别动 ###
+    # 本机网络管理器直连，否则 dae 绑 WAN 做连通性自检会被自己代理掉
+    pname(NetworkManager) -> direct
+    # 广播/组播/链路本地绝不进代理，否则 LAN 内的发现协议会被打断
+    dip(224.0.0.0/3, 'ff00::/8') -> direct
+    # 内网地址直连（NAS、打印机、路由器管理页）
+    dip(geoip:private) -> direct
+
+    ### 拦截 ###
+    # 广告与追踪
+    domain(geosite:category-ads-all) -> block
+    # 关掉 QUIC：UDP 443 一旦被节点劣化，表现为"网页能开、视频卡成马赛克"
+    # 或"有的站通 Google 不通"。禁掉后浏览器 1 秒内回落 TCP，体验反而更好。
+    # 如果你的节点 UDP 很稳、想要 HTTP/3，把下一行注释掉即可。
+    l4proto(udp) && dport(443) -> block
+
+    ### 走 ai 组（第二个出口 IP）###
+    domain(geosite:openai) -> ai
+    domain(suffix: claude.ai) -> ai
+    domain(suffix: anthropic.com) -> ai
+    domain(suffix: gemini.google.com) -> ai
+    domain(geosite:google-gemini) -> ai
+
+    ### 走 stream 组（流媒体专线）###
+    domain(geosite:netflix) -> stream
+    domain(geosite:disney) -> stream
+    domain(geosite:hbo) -> stream
+    domain(geosite:primevideo) -> stream
+    domain(geosite:youtube) -> stream
+    domain(geosite:spotify) -> stream
+    domain(geosite:twitch) -> stream
+
+    ### 走 pin 组（钉死的那个节点，调试/固定 IP 用）###
+    # 默认不放流量。想临时全走固定节点，把下面这行的注释去掉即可，
+    # 或者用 `dae-switch use pin`。
+    #fallback: pin
+
+    ### 直连 ###
+    # 国内 IP 与国内域名。顺序无所谓，两条都留着更保险：
+    # 有些站用国外 CDN 的 IP 但属于国内域名，反之亦然。
+    dip(geoip:cn) -> direct
+    domain(geosite:cn) -> direct
+    # 局域网常见域名后缀
+    domain(suffix: .lan) -> direct
+    domain(suffix: .local) -> direct
+    domain(suffix: .home.arpa) -> direct
+
+    ### 其余全部走自动选优 ###
+    fallback: proxy  # DAE_SWITCH_MARK
+}
+
+# ============================================================================
+#  ⑥ DNS
+#  域名分流能成立的前提：DNS 查询本身必须穿过 dae。所以上游 DNS 里
+#  国内域名问阿里、其余问 Google（经节点出去，绕开污染）。
+# ============================================================================
 dns {
     upstream {
-        alidns: 'udp://dns.alidns.com:53'
-        googledns: 'tcp+udp://dns.google:53'
+        googledns: 'tcp://dns.google:53'
+        alidns: 'udp://223.5.5.5:53'
     }
     routing {
         request {
-            # 国内域名用阿里 DNS 解析（快、且不需要出墙）。
+            # 国内域名用国内 DNS
             qname(geosite:cn) -> alidns
-            # 其余一律交给 Google（流量经节点出去，顺带躲开污染）。
+            # 拉订阅本身也走国内 DNS，避免"订阅域名被污染 → 拉不到节点"
+            sub(jms) -> alidns
+            # 节点自己的域名也走国内 DNS 直接解。
+            # 不加这条会出现死循环：要解析 c38s1.xxx.com → 查 DNS 要走代理 →
+            # 代理要先知道 c38s1 的 IP → 再解析…日志里刷
+            # "bootstrap resolver returned no usable address"。
+            subnode(subtag: jms) -> alidns
             fallback: googledns
         }
+        response {
+            # Google 的答案直接采信
+            upstream(googledns) -> accept
+            # 国内 DNS 返回内网地址 + 又不是国内域名 → 典型的投毒，重查
+            ip(geoip:private) && !qname(geosite:cn) -> googledns
+            fallback: accept
+        }
     }
-}
-
-# 节点组。my_group 不设 filter = 使用节点池里的全部节点。
-# 其它可选策略：random / min / min_avg10 / fixed(0)
-group {
-    my_group {
-        policy: min_moving_avg
-    }
-}
-
-routing {
-    ### 预设规则（顺序即优先级，命中即停）
-
-    # 本机的网络管理器直连，避免 dae 绑定 WAN 时的连通性自检被自己代理掉。
-    pname(NetworkManager) -> direct
-
-    # 广播 / 组播 / 链路本地：绝对不能进代理（否则会把 LAN 内的发现协议打断）。
-    dip(224.0.0.0/3, 'ff00::/8') -> direct
-
-    # 内网地址直连（含 192.168.x / 10.x / 172.16-31.x）。
-    dip(geoip:private) -> direct
-
-    ### 分流
-
-    # 关掉 QUIC（HTTP/3）：浏览器会立刻回落到 TCP，避免"有的站通、Google 不通"
-    # 那类 UDP 443 问题，同时也省 CPU（h3 的收发开销明显高于 TCP）。
-    l4proto(udp) && dport(443) -> block
-
-    dip(geoip:cn) -> direct
-    domain(geosite:cn) -> direct
-
-    # 上面都不匹配 → 走节点组。
-    fallback: my_group
 }

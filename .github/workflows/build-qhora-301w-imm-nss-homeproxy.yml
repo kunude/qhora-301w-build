@@ -151,7 +151,13 @@ env:
   #                  （extra-packages.sh 稀疏检出 HomeProxy / sing-box 用）
   # 两者拆开是必要的：它们分属三个不同的仓库，把 imm_ref 钉到某个基座 commit
   # 时，那个 commit 在 luci/packages 里根本不存在，稀疏检出会直接失败。
-  IMM_BASE_REF: ${{ github.event.inputs.imm_ref || 'master' }}
+  # ⚠️ 暂时钉在 da63f7d（2026-10-15，NSS 补丁完整编译验证过的那一版）。
+  # 原因：immortalwrt 的 2248ed7（2026-10-16 "nftables: refresh patches after
+  # version bump"）动了内核模块定义，patches/immortalwrt-nss/ 这份补丁的
+  # 上下文对不上（input.mk / usb.mk / ipq8074-rt-ax89x.dts / qca_ppe_main.c
+  # 四处），`git apply` 与 `patch --fuzz=3` 都拒绝。
+  # 补丁按新基座重新生成之后，把这里改回 'master' 即可。
+  IMM_BASE_REF: ${{ github.event.inputs.imm_ref || 'da63f7d6ac4207e534c9b92ba3d2b555a8edce8d' }}
   # 用 github.event.inputs 而不是 inputs：两者在 workflow_dispatch 下等价，
   # 但前者在 push / schedule 事件下也能安全求值（返回空）。
   IMM_REF: ${{ github.event.inputs.imm_feed_ref || 'master' }}

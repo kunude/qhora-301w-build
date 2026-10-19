@@ -184,40 +184,102 @@ CONFIG_KERNEL_XDP_SOCKETS=y
    `/usr/bin/dae`、`/etc/config/dae`、`/etc/dae/config.dae`、
    `/etc/uci-defaults/97-ssh-login-fix`，并检查修复脚本有可执行位。
 
-### 出厂配置：`/etc/dae/config.dae` 是一份**没有节点**的骨架
+### 出厂配置：`/etc/dae/config.dae` 是**一份完整可运行的配置**（订阅留空）
 
 出厂 `/etc/config/dae` 里是 `option enabled '0'`，`/etc/init.d/dae` 的
 `start_service()` 第一句就是 `config_get_bool enabled ... "0"` +
-`[ "$enabled" -eq "1" ] || return 1` —— **没显式启用时连配置都不解析**；
-启用后才跑 `dae validate -c <配置>`，不过就直接 `return 1`（不进 procd 的
-respawn 循环）。骨架里 `subscription` 与 `node` 两段只有注释掉的示例，
-`my_group` 没有任何可用节点 ⇒ 即使启用，dae 也起不来，
-**不会改变任何流量的去向**。这是故意的：别为了"让它能起来"
-把 `fallback: my_group` 改成 `direct`，那等于把代理悄悄关掉还看不出来。
+`[ "$enabled" -eq "1" ] || return 1` —— **没显式启用时连配置都不解析**。
+
+启用后才会跑 `dae validate -c <配置>`。出厂这份配置本身是**语法完整、能通过
+validate 的**（2026-10-19 在 192.168.100.1 上实测 `RC=0`），唯一留空的是
+`subscription` —— 没有订阅就没节点，所以 dae 起不来、**不会改变任何流量去向**。
+这是故意的：固件是公开产物，订阅链接等于账号密码，不进仓库。
 
 用之前只做两件事：
 
 ```sh
-# 1) 填节点（也可以直接用 LuCI「服务 → dae → 配置」编辑同一个文件）
+# 1) 填订阅（也可以直接用 LuCI「服务 → dae → 配置」编辑同一个文件）
 vi /etc/dae/config.dae
-#     subscription { my_sub: 'https-file://你的订阅地址' }
-#     node { 'ss://...' }
+#     subscription {
+#         jms: 'https://你的机场/api/v1/client/subscribe?token=xxx'
+#     }
 
-# 2) 启用
-uci set dae.config.enabled='1'; uci commit dae; /etc/init.d/dae restart
-grep -i dae /var/log/dae/dae.log
+# 2) 校验 + 启用
+dae validate -c /etc/dae/config.dae && \
+  uci set dae.config.enabled='1' && uci commit dae && /etc/init.d/dae restart
+dae-switch status                          # 看每个组选中了哪个节点
 ```
 
-骨架里已经调好的几处（都是踩过坑的）：
+也可以用 `node { }` 直接贴分享链接（`ss://` / `vless://` / `hysteria2://` …），
+和订阅混用没问题，会并进同一个池子。
+
+### 节点切换：四个组，一个命令
+
+配置里预置了四个组，`policy` 决定"这个组怎么挑节点"：
+
+| 组 | policy | 用途 |
+|---|---|---|
+| `proxy` | `min_moving_avg` | 默认出口，按最近延迟的滑动平均挑最优 |
+| `stream` | `min_avg10`（探测地址换成 gstatic） | 流媒体专线；延迟独立计算，所以大概率落在与 `proxy` 不同的节点 |
+| `ai` | `fixed(1)` | 第二出口 IP（AI 站点 / 多账号），固定池里第 2 个节点 |
+| `pin` | `fixed(0)` | 手动钉死一个节点，调试 / 需要固定 IP 时用 |
+
+切换不靠改 policy，靠 `dae-switch`（`/usr/bin/dae-switch`，随固件预置）：
+
+```sh
+dae-switch status          # 当前默认出口、pin 序号、各组选中的节点
+dae-switch list            # 订阅里的节点清单 + 最近测速
+dae-switch use stream      # 默认出口切成 stream 组（改 routing 的 fallback）
+dae-switch pin 3           # pin 组固定到第 4 个节点（序号从 0 开始）
+dae-switch use pin         # 再让默认出口走 pin，就等于"锁死在这个节点"
+```
+
+`use` / `pin` 都会**先备份 → 改 → `dae validate` → `hot_reload`**，校验不过
+自动回滚；`hot_reload` 走 `dae reload <pid>`，是热加载，不断已有连接。
+
+### 节点分流：哪些流量走哪个组
+
+`routing` 段从上往下匹配，第一条命中就定去向：
+
+| 规则 | 去向 | 说明 |
+|---|---|---|
+| `domain(geosite:category-ads-all)` | `block` | 广告 / 追踪 |
+| `domain(geosite:openai)` / `claude.ai` / `anthropic.com` / `gemini` | `ai` | AI 站点走第二出口，避免"同一 IP 被风控" |
+| `geosite:netflix` / `disney` / `hbo` / `primevideo` / `youtube` / `spotify` / `twitch` | `stream` | 流媒体专线 |
+| `l4proto(udp) && dport(443)` | `block` | 关 QUIC，浏览器秒回落 TCP |
+| `dip(geoip:cn)` / `domain(geosite:cn)` / `.lan` `.local` | `direct` | 国内与内网直连 |
+| `fallback` | `proxy` | 其余全部走自动选优 |
+
+实测（2026-10-19，192.168.100.1 的 dae 日志）：
+
+```
+outbound=proxy  policy=min_moving_avg  dialer=...c38s1...:17170   x.com
+outbound=stream policy=min_avg10       dialer=...c38s4...:443     youtube
+outbound=ai     policy=fixed           dialer=...c38s2...:443     openai
+```
+
+三个组确实落在三个不同节点上。
+
+配置里已经调好的几处（都是踩过坑的）：
 
 | 项 | 值 | 为什么 |
 |---|---|---|
-| `wan_interface` | `auto` | 本机型 WAN 是 `wan` / `pppoe-wan`，auto 都能认 |
+| `wan_interface` | `auto` | 本机型 WAN 是 `10g-1` / `wan` / `pppoe-wan`，auto 都能认 |
+| `lan_interface` | `br-lan` | **必须显式写**。dae 上游默认不代理 LAN（`example.dae` 里这行是注释掉的），不写就只有路由器本机走代理，LAN 客户端全是直连，日志里也不会有一句抱怨 |
 | `dial_mode` | `domain` | 域名交给节点侧解析，抗污染、拿到更优 IP |
+| `tls_implementation` | `utls` + `chrome_auto` | Client Hello 伪装成 Chrome，纯 TLS 节点更稳 |
 | `bootstrap_resolver` | `223.5.5.5:53` | 启动早期拉订阅时 dae 自己的 DNS 还没起来 |
+| `sub(jms) -> alidns` + `subnode(subtag: jms) -> alidns` | 订阅与**节点域名**走国内 DNS | 不加 `subnode` 会死循环：解节点域名 → 走代理 → 代理要先知道节点 IP → 日志刷 `bootstrap resolver returned no usable address`。实测加上之后该类告警从 4 条/40s 降到 0 |
+| `googledns: 'tcp://dns.google:53'` | DNS 走 TCP | 用 `tcp+udp` 时 UDP 到 8.8.4.4 经节点经常超时（日志 `DNS forward to upstream failed`，实测 12 条/40s），改纯 TCP 后归零 |
 | `l4proto(udp) && dport(443) -> block` | 关 QUIC | 浏览器立刻回落 TCP，避开"有的站通、Google 不通"那类 UDP 443 问题 |
 | `pname(NetworkManager) -> direct` | 直连 | 否则 dae 绑 WAN 时的连通性自检会被自己代理掉 |
 | `dip(224.0.0.0/3, 'ff00::/8') -> direct` | 直连 | 广播/组播/链路本地绝不能进代理，否则 LAN 内发现协议被打断 |
+
+还有一条不在配置里、但同样致命的：**`/etc/dae/config.dae` 的权限必须是 0600**
+（0640 也认，0644 都不认）。`dae validate` 会检查权限，太宽就拒绝启动，
+而表现是 procd 说 `running`、实际一个实例都没有。造镜像时
+`scripts/prepare-build.sh` 会统一 `chmod 0600`，`files-dae/etc/uci-defaults/98-dae-config-perms`
+首启再兜一次；自己手改过配置就补一句 `chmod 600 /etc/dae/config.dae`。
 
 ### `dae.config` 与另外两份覆盖层的关系
 
@@ -264,7 +326,8 @@ files-passwall2/            # 只叠进 passwall2 版：etc/config/passwall2
 files-homeproxy/            # 只叠进 HomeProxy 版：etc/config/homeproxy、
                             #   etc/homeproxy/ruleset/*.srs（9 个预置规则集）、
                             #   etc/uci-defaults/95-homeproxy-rulesets（升级时 remote→local）
-files-dae/                  # 只叠进 dae 版：etc/dae/config.dae（无节点骨架）、
+files-dae/                  # 只叠进 dae 版：etc/dae/config.dae（完整配置，订阅留空）、
+                            #   usr/bin/dae-switch（节点切换命令）、
                             #   etc/uci-defaults/97-ssh-login-fix（首启修 SSH，见下）
 ```
 
@@ -273,8 +336,10 @@ files-dae/                  # 只叠进 dae 版：etc/dae/config.dae（无节点
 `scripts/check-no-credentials.sh` 扫 `files*/etc/config/`，命中就**中断构建**。
 dae 线另有一道：`prepare-build.sh` 的第 6a 步会读 `files/etc/dae/config.dae`，
 剥掉注释行后如果还能匹配到 `vless://` `vmess://` `ss://` `trojan://` `hysteria2://`
-`tuic://` `anytls://` 或 `http(s)://`，直接中断（只查这两种形态，是为了不误伤
-`tcp+udp://dns.google:53` 这类合法的 DNS 上游写法）。
+`tuic://` `anytls://` 或 `标签: 'http(s)://…'` 这种订阅行，直接中断。
+（`tcp_check_url` / `udp_check_dns` / `bootstrap_resolver` 这几行在检查前会被滤掉 ——
+它们本来就是公网探测地址，不滤会误伤 `http://cp.cloudflare.com`；
+DNS 上游的 `tcp://dns.google:53` 也不在匹配范围内。）
 
 ### 内核补丁：`patches/kernel/6.18/`
 
@@ -777,7 +842,9 @@ cat /sys/class/thermal/thermal_zone*/type     # 固件里有哪些温度传感�
 | 钉死 ddns-go / msd_lite 版本 | `Run workflow` 时填 `ddns_go_version` / `msd_lite_sha`，或改 `packages/net/*/Makefile` 的兜底值 |
 | 系统默认配置（主机名、**LAN 网段**、无线、服务开关） | 往 `files/` 按路径放文件，首启脚本在 `files/etc/uci-defaults/`；LAN 网段在 `99-qhora-301w` |
 | 改 passwall2 / HomeProxy 出厂预置 | `files-passwall2/etc/config/passwall2` / `files-homeproxy/etc/config/homeproxy`（**改完把 `address` 之类留空**，别把凭据提交上去） |
-| 改 dae 出厂骨架 / 加内核 BPF 选项 | `files-dae/etc/dae/config.dae` / `configs/dae.config`（BTF 那几行是硬前提，别减） |
+| 改 dae 出厂配置（组 / 分流 / 全局项） | `files-dae/etc/dae/config.dae`（**订阅留空**；节点组与 routing 都在这个文件里） |
+| 改 dae 的节点切换命令 | `files-dae/usr/bin/dae-switch`（换成固件里的 `/usr/bin/dae-switch`，`prepare-build.sh` 会 `chmod 0755`） |
+| 加内核 BPF 选项 | `configs/dae.config`（BTF 那几行是硬前提，别减） |
 | 确认预置里没夹带凭据 | 构建会自动跑 `scripts/check-no-credentials.sh`；也可手动 `BUILDER_DIR=$PWD bash scripts/check-no-credentials.sh` |
 | 换源码仓库 / 分支 | 工作流 `env.UPSTREAM_REPOSITORY` / `UPSTREAM_REF` / `NSS_FEED`，或 `Run workflow` 时的 `upstream_ref` |
 
@@ -993,8 +1060,12 @@ dae 专属（第六条线）：
 | 构建在「验真 vmlinux 的 .BTF 段」处 `::error::` 中断 | 内核没真编出 BTF | 检查 `configs/dae.config` 里 `CONFIG_KERNEL_DEBUG_INFO_REDUCED=n` 是否被别的覆盖层改回 `y`（BTF `depends on !REDUCED`，会被静默丢弃） |
 | 构建报 `defconfig 丢弃了 N 个配置请求的符号`，且都是 `KERNEL_*` | 那个符号在当前基座内核版本里没 prompt | 对照 `target/linux/generic/config-6.18` 与 `config/Config-kernel.in` 逐项核 |
 | `dae` 启动失败，日志里有 `failed to load eBPF` / `BTF` 字样 | 内核没有 `/sys/kernel/btf/vmlinux` | `ls /sys/kernel/btf/vmlinux`；没有 = 刷的不是 dae 线固件 |
-| `dae validate` 不过、服务起不来（但网络正常） | ① 没填节点（骨架默认就是这个状态）；② 配置语法错 | `dae validate -c /etc/dae/config.dae -l debug` 看具体行；init 脚本 validate 失败会直接 `return 1`，**不会 respawn 循环**，所以不会拖垮网络 |
-| 填了节点、启用后全部断网 | 节点连不上（订阅没拉到 / 节点已失效），而 routing 已 `fallback: my_group` | 先 `dae validate` 再启用；`/var/log/dae/dae.log` 里看节点握手。**别把 fallback 改成 `direct`**，那只是把问题藏起来 |
+| `dae validate` 不过、服务起不来（但网络正常） | ① 没填订阅（出厂默认就是这个状态）；② 配置语法错 | `dae validate -c /etc/dae/config.dae -l debug` 看具体行；init 脚本 validate 失败会直接 `return 1`，**不会 respawn 循环**，所以不会拖垮网络 |
+| 日志刷 `bootstrap resolver returned no usable address for "c38s1.xxx"` | 死循环：要解节点域名 → DNS 查询走代理 → 代理要先知道节点 IP | `dns.routing.request` 里加 `subnode(subtag: <订阅标签>) -> alidns`，让节点域名直接走国内 DNS（出厂配置已带） |
+| 日志刷 `DNS forward to upstream failed ... udp ... i/o timeout` | DNS 用 `tcp+udp://` 时先发 UDP，UDP 经节点容易丢 | 上游改成 `tcp://dns.google:53`（出厂配置已改，实测失败数从 12 条/40s 降到 0） |
+| `/etc/init.d/dae status` 说 `running`，但 `pgrep -af "dae run"` 是空的、`/var/log/dae` 也不存在（procd 的 `active with no instances`） | **`/etc/dae/config.dae` 权限太宽**。`dae validate` 会拒绝 group 可写 / other 可读的文件，报 `permissions 0644 ... are too open; requires ... 0640 or 0600`。**0644 也不行** | `chmod 600 /etc/dae/config.dae && /etc/init.d/dae restart`。造镜像时 `scripts/prepare-build.sh` 已统一收紧，`/etc/uci-defaults/98-dae-config-perms` 首启再兜一次；自己手改过就用这条修 |
+| 路由器本机能翻墙，**LAN 客户端全是直连**（日志里只有 `Bind to WAN`，没有 `Bind to LAN`） | `global` 段没写 `lan_interface`。dae 上游默认**不代理 LAN**（`example.dae` 里这行是注释掉的） | 加上 `lan_interface: br-lan` 再 `restart`；日志应出现 `Bind to LAN: br-lan`。多网口用逗号分隔 |
+| 填了节点、启用后全部断网 | 节点连不上（订阅没拉到 / 节点已失效），而 routing 已 `fallback: proxy` | 先 `dae validate` 再启用；`/var/log/dae/dae.log` 里看节点握手。**别把 fallback 改成 `direct`**，那只是把问题藏起来。想快速试单节点：`dae-switch pin 0 && dae-switch use pin` |
 | LuCI 里没有「服务 → dae」 | `luci-app-dae` 没编进去 | `apk list --installed \| grep dae`；缺就说明刷的是别的线 |
 | 某些网站打不开、但 TCP 站点正常 | 该站走 HTTP/3（UDP 443） | 骨架里已 `l4proto(udp) && dport(443) -> block`；自己改过配置的要保留这条 |
 | `dae-geoip` / `dae-geosite` 装了但规则里 `geoip:cn` 不生效 | `/usr/share/dae/` 下没有数据文件 | `ls -l /usr/share/dae/` 应看到两个指向 `/usr/share/v2ray/*.dat` 的软链；`v2ray-geoip`/`v2ray-geosite` 没装则软链悬空 |
