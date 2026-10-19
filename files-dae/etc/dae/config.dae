@@ -1,8 +1,16 @@
 # ── dae 出厂配置（骨架）────────────────────────────────────────
 #
-# 这是**没有节点**的骨架：规则全走直连，即使误启动也不会改变任何流量的去向。
-# dae 的 init 脚本会先跑 `dae validate -c /etc/dae/config.dae`，验证不过就
-# 直接 return 1（不会 respawn 循环），所以骨架不合格也不会拖垮网络。
+# 这是**没有节点**的骨架：`subscription` 与 `node` 两段里只有注释掉的示例，
+# 所以 dae 起不来（validate 会因为没有可用节点而失败），也就是**即使误启用
+# 也不会改变任何流量的去向**。
+#
+# 出厂 /etc/config/dae 里是 `option enabled '0'`，init 脚本的 start_service()
+# 第一句就是 config_get_bool + `[ "$enabled" -eq "1" ] || return 1` ——
+# 没显式启用时连 validate 都不跑；启用了才 `dae validate -c ...`，
+# 不过就直接 return 1，不进 procd 的 respawn 循环，更不会把网络搞断。
+#
+# 注意：**没填节点时它本来就起不来**（没有可用节点，validate 不过）——
+# 这是故意的，不要为了"让它能起来"而删掉 my_group 或改成 fallback: direct。
 #
 # ── 怎么用 ────────────────────────────────────────────────────
 # 1) 填节点：用 LuCI「服务 → dae → 配置」直接编辑本文件，或 SSH 改；
@@ -75,20 +83,26 @@ node {
 }
 
 # DNS 分流：国内域名走阿里 DNS，其余走 Google（经节点出去）。
+#
+# 这段刻意与上游 example.dae 的推荐写法逐字一致，别自己发明
+# request/response 两段组合 —— 早期版本这里写过
+#     request { fallback: alidns }
+#     response { !qname(geosite:cn) && ip(geoip:private) -> googledns }
+# 两个问题：request 的 fallback 一旦就是 alidns，googledns 永远不会被用到，
+# 整个 response 段是死代码；而且 `!qname(geosite:cn) && ip(geoip:private)`
+# 的语义是"不是国内域名 且 解析结果是内网地址"，纯属反了。
+# 正确的最小写法只有两条：国内域名→alidns，其余→googledns。
 dns {
     upstream {
+        alidns: 'udp://dns.alidns.com:53'
         googledns: 'tcp+udp://dns.google:53'
-        alidns: 'udp://223.5.5.5:53'
     }
     routing {
         request {
-            fallback: alidns
-        }
-        response {
-            # 节点侧解析出来的国内地址不足以说明"该直连"，这里只做"是否被污染"的判断
-            upstream(googledns) -> accept
-            !qname(geosite:cn) && ip(geoip:private) -> googledns
-            fallback: accept
+            # 国内域名用阿里 DNS 解析（快、且不需要出墙）。
+            qname(geosite:cn) -> alidns
+            # 其余一律交给 Google（流量经节点出去，顺带躲开污染）。
+            fallback: googledns
         }
     }
 }

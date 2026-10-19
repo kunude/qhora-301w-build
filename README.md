@@ -186,10 +186,14 @@ CONFIG_KERNEL_XDP_SOCKETS=y
 
 ### 出厂配置：`/etc/dae/config.dae` 是一份**没有节点**的骨架
 
-`dae` 的 init 脚本第一步就是 `dae validate -c <配置>`，验证不过直接
-`return 1`（不会进 respawn 循环）。所以骨架不合格**也不会拖垮网络**，
-但为了保险，这份骨架的 `routing` 段末尾是 `fallback: my_group`，而 `my_group`
-在没有节点时没有任何可用节点 —— 等于"全直连"。**即使误启用也不改流量去向。**
+出厂 `/etc/config/dae` 里是 `option enabled '0'`，`/etc/init.d/dae` 的
+`start_service()` 第一句就是 `config_get_bool enabled ... "0"` +
+`[ "$enabled" -eq "1" ] || return 1` —— **没显式启用时连配置都不解析**；
+启用后才跑 `dae validate -c <配置>`，不过就直接 `return 1`（不进 procd 的
+respawn 循环）。骨架里 `subscription` 与 `node` 两段只有注释掉的示例，
+`my_group` 没有任何可用节点 ⇒ 即使启用，dae 也起不来，
+**不会改变任何流量的去向**。这是故意的：别为了"让它能起来"
+把 `fallback: my_group` 改成 `direct`，那等于把代理悄悄关掉还看不出来。
 
 用之前只做两件事：
 
@@ -989,8 +993,8 @@ dae 专属（第六条线）：
 | 构建在「验真 vmlinux 的 .BTF 段」处 `::error::` 中断 | 内核没真编出 BTF | 检查 `configs/dae.config` 里 `CONFIG_KERNEL_DEBUG_INFO_REDUCED=n` 是否被别的覆盖层改回 `y`（BTF `depends on !REDUCED`，会被静默丢弃） |
 | 构建报 `defconfig 丢弃了 N 个配置请求的符号`，且都是 `KERNEL_*` | 那个符号在当前基座内核版本里没 prompt | 对照 `target/linux/generic/config-6.18` 与 `config/Config-kernel.in` 逐项核 |
 | `dae` 启动失败，日志里有 `failed to load eBPF` / `BTF` 字样 | 内核没有 `/sys/kernel/btf/vmlinux` | `ls /sys/kernel/btf/vmlinux`；没有 = 刷的不是 dae 线固件 |
-| `dae validate` 不过、服务起不来（但网络正常） | 配置语法错 | `dae validate -c /etc/dae/config.dae -l debug` 看具体行；init 脚本 validate 失败会直接 `return 1`，**不会 respawn 循环**，所以不会拖垮网络 |
-| 启用后全部断网 | 节点池里没有可用节点，而 routing 已 `fallback: my_group` | 先填节点再启用；或临时把最后一行改成 `fallback: direct` 验证规则本身 |
+| `dae validate` 不过、服务起不来（但网络正常） | ① 没填节点（骨架默认就是这个状态）；② 配置语法错 | `dae validate -c /etc/dae/config.dae -l debug` 看具体行；init 脚本 validate 失败会直接 `return 1`，**不会 respawn 循环**，所以不会拖垮网络 |
+| 填了节点、启用后全部断网 | 节点连不上（订阅没拉到 / 节点已失效），而 routing 已 `fallback: my_group` | 先 `dae validate` 再启用；`/var/log/dae/dae.log` 里看节点握手。**别把 fallback 改成 `direct`**，那只是把问题藏起来 |
 | LuCI 里没有「服务 → dae」 | `luci-app-dae` 没编进去 | `apk list --installed \| grep dae`；缺就说明刷的是别的线 |
 | 某些网站打不开、但 TCP 站点正常 | 该站走 HTTP/3（UDP 443） | 骨架里已 `l4proto(udp) && dport(443) -> block`；自己改过配置的要保留这条 |
 | `dae-geoip` / `dae-geosite` 装了但规则里 `geoip:cn` 不生效 | `/usr/share/dae/` 下没有数据文件 | `ls -l /usr/share/dae/` 应看到两个指向 `/usr/share/v2ray/*.dat` 的软链；`v2ray-geoip`/`v2ray-geosite` 没装则软链悬空 |

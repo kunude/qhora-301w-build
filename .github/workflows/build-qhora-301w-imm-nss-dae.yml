@@ -587,22 +587,43 @@ jobs:
 
           # ── ③ 内核 BTF：dae 的 CO-RE 硬前提 ────────────────────────
           # 只看 .config 不够。这里直接验产物：vmlinux 里必须真的存在 .BTF 段，
-          # 而且不能是个空壳（本内核实测 4-6MB，>1MB 是个安全下限）。
+          # 而且不能是个空壳（本内核实测 3.7MB，>1MB 是个安全下限）。
+          #
+          # 两个坑（本地实测踩过，别改回去）：
+          #  ① vmlinux 的路径必须精确。build_dir 底下还有
+          #     bpf-headers/*/tools/perf/util/bpf_skel/vmlinux 这种 4KB 的
+          #     假 vmlinux（perf 的 skeleton 用的），用 `find -name vmlinux
+          #     -print -quit` 会先撞上它，然后永远报"没有 .BTF 段"。
+          #     真正的那个在 build_dir/target-*/linux-qualcommax_*/linux-*/ 下。
+          #  ② 不能用 host 的 objcopy。linux-6.18.55/vmlinux 是 aarch64 ELF，
+          #     runner 上的 x86_64 binutils 直接报
+          #         objcopy: Unable to recognise the architecture of the input file
+          #     ⇒ 以一个非 0 返回码失败，被当成"没有 BTF"。
+          #     readelf 是 arch-agnostic 的，解析的是段表本身，所以改用 readelf。
           btfi=$(grep -m1 '^CONFIG_KERNEL_DEBUG_INFO_BTF=' openwrt/.config || true)
           red=$(grep -m1 '^CONFIG_KERNEL_DEBUG_INFO_REDUCED=' openwrt/.config || true)
           echo "::notice title=内核 BTF 配置::${btfi:-（未设置）} / ${red:-（未设置）}"
 
-          vmlinux=$(find openwrt/build_dir -path '*linux-qualcommax*' -name vmlinux -print -quit 2>/dev/null || true)
-          [[ -n "$vmlinux" ]] || { echo "::error::找不到 vmlinux，无法核对 BTF"; exit 1; }
+          vmlinux=$(ls -1 openwrt/build_dir/target-*/linux-qualcommax_*/linux-*/vmlinux 2>/dev/null | head -1)
+          [[ -n "$vmlinux" ]] || { echo "::error::找不到 vmlinux（build_dir/target-*/linux-qualcommax_*/linux-*/），无法核对 BTF"; exit 1; }
+          echo "::notice title=vmlinux::$(stat -c %s "$vmlinux") 字节"
 
-          btf_size=0
-          if objcopy -O binary --only-section=.BTF "$vmlinux" /tmp/vmlinux.btf 2>/dev/null; then
-            btf_size=$(stat -c %s /tmp/vmlinux.btf 2>/dev/null || echo 0)
+          # 段表里 .BTF 那一行的 Size 列（hex）。awk 里按字段位置取：
+          #   [11]  .BTF  PROGBITS  Address  Offset  Size  ...
+          # 注意 [ 1] 这种一位数编号会把字段错开，所以不能用 $2==".BTF"，
+          # 得遍历所有字段找精确等于 .BTF 的那个（顺带排除 .BTF_ids / .BTF.ext）。
+          btf_hex=$(readelf -S -W "$vmlinux" 2>/dev/null \
+            | awk '{for(i=1;i<=NF;i++) if($i==".BTF"){print $(i+4); exit}}' || true)
+          if [[ -n "$btf_hex" ]]; then
+            btf_size=$((16#$btf_hex))
+          else
+            btf_size=0
           fi
           echo "::notice title=vmlinux .BTF 段::${btf_size} 字节"
           if [[ "${btf_size:-0}" -lt 1048576 ]]; then
             echo "::error::vmlinux 里没有可用的 .BTF 段（${btf_size} 字节）—— dae 加载 eBPF 时会失败"
             echo "::error::查 configs/dae.config 的 CONFIG_KERNEL_DEBUG_INFO_BTF / _DEBUG_INFO_REDUCED"
+            echo "::error::（REDUCED 必须是 n：BTF 的 Kconfig 依赖是 depends on !KERNEL_DEBUG_INFO_REDUCED）"
             exit 1
           fi
           echo "::notice title=BTF 就绪::内核带 ${btf_size} 字节 BTF，dae 的 CO-RE 前提成立"
@@ -611,17 +632,42 @@ jobs:
           # files-dae/ 是变体覆盖层：PROXY_STACK 写错、或目录名拼错时它会被
           # **静默跳过**，编出来的固件看起来一样，但 dae 没有骨架配置、
           # SSH 那个补丁也不在。所以从 sysupgrade 里把 rootfs 解出来点名核对。
-          unsq=$(find openwrt/staging_dir -name unsquashfs -perm -u+x -print -quit 2>/dev/null || true)
+          #
+          # 注意 host 工具名叫 **unsquashfs4**（不是 unsquashfs）——
+          # OpenWrt 的 squashfs-tools 配方产出的二进制带 4 后缀，
+          # `find staging_dir -name unsquashfs` 是找不到的（本地实测踩过）。
+          unsq=$(find openwrt/staging_dir/host/bin -maxdepth 1 -name 'unsquashfs*' -perm -u+x -print -quit 2>/dev/null || true)
           if [[ -z "$unsq" ]]; then
-            echo "::warning::找不到 host 版 unsquashfs，跳过出厂文件核对"
+            unsq=$(command -v unsquashfs 2>/dev/null || true)
+          fi
+          if [[ -z "$unsq" ]]; then
+            echo "::warning::既没有 host 版 unsquashfs4 也没有系统 unsquashfs，跳过出厂文件核对"
           else
+            echo "::notice title=解包工具::$unsq"
             tmpd=$(mktemp -d)
             sysup=$(find "$out" -name "*${DEVICE}*squashfs-sysupgrade.bin" -print -quit)
+            [[ -n "$sysup" ]] || { echo "::error::找不到 sysupgrade 镜像，无法核对出厂文件"; exit 1; }
             tar -xf "$sysup" -C "$tmpd"
+            # sysupgrade tar 里的布局**不一定**是根目录平铺：
+            # 新版是 sysupgrade-qnap_301w/{CONTROL,root,kernel}，
+            # 老版直接是 CONTROL/root/kernel。所以不能写死 "$tmpd/root"，
+            # 得先找出来（否则 unsquashfs 只会说一句
+            # "Could not open .../root, because No such file or directory"，
+            # 然后所有出厂文件都报缺失 —— 本地实测踩过）。
+            sqroot=$(find "$tmpd" -maxdepth 2 -name root -type f -print -quit)
+            [[ -n "$sqroot" ]] || { echo "::error::sysupgrade tar 里找不到 squashfs 的 root 分区镜像"; exit 1; }
+            echo "::notice title=squashfs 镜像::$(basename "$(dirname "$sqroot")")/root"
             # unsquashfs 在非 root 下建不了 /dev/console 节点，会返回非 0，
             # 但文件已经解出来了 —— 所以别用返回值判断成败，直接查文件。
-            "$unsq" -q -d "$tmpd/rootfs" "$tmpd/root" >/dev/null 2>&1 || true
+            "$unsq" -q -d "$tmpd/rootfs" "$sqroot" >/dev/null 2>&1 || true
+            nf=$(find "$tmpd/rootfs" 2>/dev/null | wc -l)
+            if [[ "$nf" -lt 100 ]]; then
+              echo "::error::rootfs 只解出 ${nf} 个文件 —— unsquashfs 没能解开镜像（工具版本不匹配？）"
+              exit 1
+            fi
+            echo "::notice title=rootfs::解开 ${nf} 个文件"
             for f in usr/bin/dae etc/config/dae etc/dae/config.dae \
+                     usr/share/dae/geoip.dat usr/share/dae/geosite.dat \
                      etc/uci-defaults/97-ssh-login-fix etc/ssh/sshd_config; do
               if [[ -e "$tmpd/rootfs/$f" ]]; then
                 echo "::notice title=出厂文件::/$f 已在 rootfs 中"
@@ -635,9 +681,42 @@ jobs:
               echo "::error::97-ssh-login-fix 没有可执行位，首启不会被执行"
               bad=$((bad + 1))
             fi
+            # 骨架配置里不许有有效订阅/节点链接（prepare-build.sh 的第 6a 步已经查过
+            # 源文件，这里再查一遍**产物**：覆盖层叠加顺序出问题时源文件和固件会不一致）
+            if [[ -f "$tmpd/rootfs/etc/dae/config.dae" ]] && \
+               grep -vE '^[[:space:]]*#' "$tmpd/rootfs/etc/dae/config.dae" \
+                 | grep -qE '(vless|vmess|ss|ssr|trojan|hysteria2?|tuic|anytls)://|https?://'; then
+              echo "::error::/etc/dae/config.dae 里有有效的订阅/节点链接 —— 固件是公开产物"
+              bad=$((bad + 1))
+            fi
+            # 反向确认：这条线不该带 sing-box / homeproxy / passwall2。
+            # 判据用 **manifest（已安装包清单）**，不查 /etc/config/：
+            # 构建树被复用时会留下上一次构建的孤儿配置文件（本地实测：一棵
+            # 以前编过 passwall2/homeproxy 的树上，rootfs 里会残留这两个
+            # /etc/config 文件，但它们不在任何 .list 里、也不在 manifest 里）。
+            # CI 每次都是全新的树，但用 manifest 判定在任何树上都准确。
+            man=$(ls -1 "$out"/*.manifest 2>/dev/null | head -1)
+            if [[ -z "$man" ]]; then
+              echo "::error::找不到 *.manifest，无法确认已安装包清单"
+              bad=$((bad + 1))
+            else
+              if grep -qE '^(sing-box|luci-app-homeproxy|homeproxy|luci-app-passwall2|passwall2)([[:space:]]|$)' "$man"; then
+                echo "::error::manifest 里还有 sing-box / homeproxy / passwall2 —— 代理栈没换干净（dae.config 的 =n 没生效？）"
+                grep -nE '^(sing-box|luci-app-homeproxy|luci-app-passwall2)' "$man" | sed 's/^/  /'
+                bad=$((bad + 1))
+              else
+                echo "::notice title=已安装包::manifest 里没有 sing-box / homeproxy / passwall2"
+              fi
+            fi
+            for f in usr/bin/sing-box; do
+              if [[ -e "$tmpd/rootfs/$f" ]]; then
+                echo "::error::rootfs 里出现了 /$f —— 代理栈没换干净"
+                bad=$((bad + 1))
+              fi
+            done
             rm -rf "$tmpd"
             [[ "$bad" -eq 0 ]] || { echo "::error::出厂文件核对失败（$bad 项）"; exit 1; }
-            echo "::notice title=出厂文件::dae 骨架配置 + SSH 修复脚本都在，且 uci-defaults 可执行"
+            echo "::notice title=出厂文件::dae 骨架 + geo 数据 + SSH 修复脚本都在，且 uci-defaults 可执行"
           fi
 
       - name: 上传镜像（artifact）
