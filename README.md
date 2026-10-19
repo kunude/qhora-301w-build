@@ -116,16 +116,132 @@ homeproxy 起不来的固件。
 > 顺带说明：`immortalwrt/luci` 的生成器**已经迁移**到新版写法，所以 `fixed` 那条线实际
 > 拿到的是"迁移后的生成器 + 1.12.25"—— 实测这个组合 `check` 通过，成立（见第五章的对照表）。
 
+## 第六条线：immortalwrt 基座 + NSS 补丁 + dae
+
+第五条线是第四条的**副本**（软件集逐字一致，只改了触发方式），所以这里跳过它。
+第六条线才是又一个**软件集不同**的线：基座与第三条/第四条相同（`immortalwrt/immortalwrt`
++ `patches/immortalwrt-nss/`），代理栈从 HomeProxy 换成 **dae** —— 一个跑在
+**eBPF（CO-RE）**上的透明代理。
+
+| | **imm-nss-homeproxy 线** | **imm-nss-dae 线（本线）** |
+|---|---|---|
+| 工作流 | `build-qhora-301w-imm-nss-homeproxy.yml` | `build-qhora-301w-imm-nss-dae.yml` |
+| 代理前端 | `luci-app-homeproxy` | `luci-app-dae` + `luci-i18n-dae-zh-cn` |
+| 代理核心 | `sing-box`（基座 feed 自带） | `dae`（`feeds/packages/net/dae`，2.0.x） |
+| 分流在哪做 | **用户态**：sing-box 跑一堆入站 + nftables 转发 | **内核态**：eBPF 程序直接在 socket 层分流 |
+| 地理数据 | `.srs` 规则集（9 条，预置进固件） | `v2ray-geoip` / `v2ray-geosite`（`dae-geoip`/`dae-geosite` 只是软链） |
+| 额外内核模块 | `kmod-nft-tproxy` | `kmod-sched-core` / `kmod-sched-bpf` / `kmod-veth` / `kmod-xdp-sockets-diag` |
+| 其余 | NSS 卸载栈、`files/` `files-dae/` 覆盖、产物结构 —— 与各线一致 | |
+
+### 为什么值得单独一条线
+
+这**不是**"换个代理前端"。HomeProxy 是 sing-box 的 UCI 外壳：UCI → JSON → 用户态
+sing-box 进程建 5330-5333 一组入站，再由 nftables 把 LAN 流量转发过去。也就是说
+**连直连流量也要在用户态绕一圈**。dae 把这些搬进内核：
+
+- 分流判断由 eBPF 程序在 socket 收发时就做完，命中直连的包**根本不出内核**；
+- 不建 conntrack、不起 TPROXY 回环，BT/PT 这类几万连接并发的场景差距最明显；
+- 用户态只留一个轻量的控制面（拉订阅、算节点延迟、下发规则）。
+
+代价是它对内核有**三条硬前提**，缺一条的表现是"编得出、刷得进、跑不起来"。
+
+### 三条内核硬前提（以及为什么单独写一份 `configs/dae.config`）
+
+| 前提 | 对应 Kconfig | immortalwrt 通用内核默认 | 缺了会怎样 |
+|---|---|---|---|
+| `/sys/kernel/btf/vmlinux` 存在 | `CONFIG_DEBUG_INFO_BTF` | **关** | eBPF 程序加载失败，`dae validate` 过不了 |
+| tc 的 bpf 分类器 / 动作 | `CONFIG_NET_CLS_BPF` + `CONFIG_NET_ACT_BPF` | **关** | 隧道模式挂不上挂载点 |
+| `sch_ingress` | `CONFIG_NET_SCH_INGRESS` | **关** | 同上（`kmod-sched-core`） |
+| XDP socket | `CONFIG_XDP_SOCKETS` | **关** | `kmod-xdp-sockets-diag` 直接不生成 |
+
+2026-10-19 在 `192.168.35.1`（ImmortalWrt SNAPSHOT `r0-da63f7d`，kernel 6.18.55）上实测：
+`ls /sys/kernel/btf/vmlinux` 报 `No such file or directory`，`/proc/config.gz` 也不存在，
+基座的 `target/linux/generic/config-6.18` 里就写着 `# CONFIG_DEBUG_INFO_BTF is not set`、
+`# CONFIG_NET_CLS_BPF is not set`、`# CONFIG_NET_SCH_INGRESS is not set`、
+`# CONFIG_XDP_SOCKETS is not set`。
+
+所以 `configs/dae.config` 里显式打开这些（**不要照抄 `homeproxy.config`**，它把
+`v2ray-geoip` / `v2ray-geosite` 写成 `=n`）：
+
+```
+CONFIG_KERNEL_DEBUG_INFO=y
+CONFIG_KERNEL_DEBUG_INFO_REDUCED=n     # ← 关键，见下
+CONFIG_KERNEL_DEBUG_INFO_BTF=y
+CONFIG_KERNEL_BPF_EVENTS=y
+CONFIG_KERNEL_XDP_SOCKETS=y
+```
+
+> ⚠️ `DEBUG_INFO_REDUCED` 必须显式关掉。Kconfig 里 BTF 的依赖是
+> `depends on KERNEL_DEBUG_INFO && !KERNEL_DEBUG_INFO_REDUCED`，
+> 有些基座默认把它设成 `y`（为了压内核体积）—— 那样 `=y` 的 BTF 会被
+> **静默丢弃**，编译一路绿灯，编完才发现没有 `.BTF` 段。
+
+因为这种失败模式太安静，本线在产物阶段加了两道**验真**（不只是 grep `.config`）：
+
+1. 构建期：`objcopy -O binary --only-section=.BTF` 把 `vmlinux` 的 `.BTF` 段抽出来，
+   小于 1 MB 直接 `::error::` 中断构建；
+2. 打包期：解开 sysupgrade tar → `unsquashfs` 进临时目录，逐个点名
+   `/usr/bin/dae`、`/etc/config/dae`、`/etc/dae/config.dae`、
+   `/etc/uci-defaults/97-ssh-login-fix`，并检查修复脚本有可执行位。
+
+### 出厂配置：`/etc/dae/config.dae` 是一份**没有节点**的骨架
+
+`dae` 的 init 脚本第一步就是 `dae validate -c <配置>`，验证不过直接
+`return 1`（不会进 respawn 循环）。所以骨架不合格**也不会拖垮网络**，
+但为了保险，这份骨架的 `routing` 段末尾是 `fallback: my_group`，而 `my_group`
+在没有节点时没有任何可用节点 —— 等于"全直连"。**即使误启用也不改流量去向。**
+
+用之前只做两件事：
+
+```sh
+# 1) 填节点（也可以直接用 LuCI「服务 → dae → 配置」编辑同一个文件）
+vi /etc/dae/config.dae
+#     subscription { my_sub: 'https-file://你的订阅地址' }
+#     node { 'ss://...' }
+
+# 2) 启用
+uci set dae.config.enabled='1'; uci commit dae; /etc/init.d/dae restart
+grep -i dae /var/log/dae/dae.log
+```
+
+骨架里已经调好的几处（都是踩过坑的）：
+
+| 项 | 值 | 为什么 |
+|---|---|---|
+| `wan_interface` | `auto` | 本机型 WAN 是 `wan` / `pppoe-wan`，auto 都能认 |
+| `dial_mode` | `domain` | 域名交给节点侧解析，抗污染、拿到更优 IP |
+| `bootstrap_resolver` | `223.5.5.5:53` | 启动早期拉订阅时 dae 自己的 DNS 还没起来 |
+| `l4proto(udp) && dport(443) -> block` | 关 QUIC | 浏览器立刻回落 TCP，避开"有的站通、Google 不通"那类 UDP 443 问题 |
+| `pname(NetworkManager) -> direct` | 直连 | 否则 dae 绑 WAN 时的连通性自检会被自己代理掉 |
+| `dip(224.0.0.0/3, 'ff00::/8') -> direct` | 直连 | 广播/组播/链路本地绝不能进代理，否则 LAN 内发现协议被打断 |
+
+### `dae.config` 与另外两份覆盖层的关系
+
+`configs/dae.config` 是在 `homeproxy.config` 的基础上整块换掉代理栈：
+关掉 passwall2 全家 + `sing-box`，打开 dae 那一组。**`common.config` 与
+`qhora_301w.config` 一行没动**，`imm-nss.config` 也照旧叠在最后。构建时的拼装顺序是
+
+```
+common.config  →  qhora_301w.config  →  dae.config  →  imm-nss.config
+```
+
+`scripts/extra-packages.sh` 里 dae 分支**一个仓库都不拉** —— `dae`、`luci-app-dae`、
+`dae-geoip`/`dae-geosite` 全在 immortalwrt 官方 feed 里，`v2ray-geoip`/`v2ray-geosite`
+由 `feeds/packages/net/v2ray-geodata` 一个配方产出两个子包（所以 `dae.config` 里可以直接写 `=y`，
+不用像 homeproxy 那样另建目录）。
+
 ## 目录结构
 
 ```
-.github/workflows/          # 六条构建线：nss-edma 基座 4 条（passwall2 / HomeProxy 钉 1.12.25 /
-                            #   HomeProxy 新版 sing-box / 上面那条的副本）+ immortalwrt 基座 + NSS 2 条
+.github/workflows/          # 七条构建线：nss-edma 基座 4 条（passwall2 / HomeProxy 钉 1.12.25 /
+                            #   HomeProxy 新版 sing-box / 上面那条的副本）
+                            #   + immortalwrt 基座 3 条（passwall2 / HomeProxy / dae）
 configs/
   common.config             # NSS 卸载栈 + 通用选项 + 附加功能包
   qhora_301w.config         # 机型：target / 子目标 / 设备 / 内存档位
   homeproxy.config          # 覆盖层：关掉 passwall2 那组、换成 HomeProxy
-  imm-nss.config            # 覆盖层：只给两条 imm 线（immortalwrt 的符号差异）
+  dae.config                # 覆盖层：关掉 passwall2 那组、换成 dae（含内核 BTF/BPF 项）
+  imm-nss.config            # 覆盖层：只给三条 imm 线（immortalwrt 的符号差异）
   homeproxy-rulesets.list   # HomeProxy 规则集清单（名字 ↔ 上游 URL，9 条）
 packages/net/{ddns-go,msd_lite}/   # 自带配方（直接引用上游源码，版本构建时解析注入）
 packages/emortal/autocore/         # 纯脚本包，提供 tempinfo / cpuinfo
@@ -139,16 +255,22 @@ scripts/
   resolve-versions.sh       # 构建时解析 ddns-go / msd_lite 的上游最新版本
   check-no-credentials.sh   # 构建期守卫：预置文件里出现凭据/订阅链接就中断
   fetch-homeproxy-rulesets.sh # 拉取/校验 9 个 .srs 规则集（构建期刷新 + 刷新仓库副本）
-files/                      # 两个变体共用的覆盖文件（uci-defaults、首页硬件区块等）
+files/                      # 各变体共用的覆盖文件（uci-defaults、首页硬件区块等）
 files-passwall2/            # 只叠进 passwall2 版：etc/config/passwall2
 files-homeproxy/            # 只叠进 HomeProxy 版：etc/config/homeproxy、
                             #   etc/homeproxy/ruleset/*.srs（9 个预置规则集）、
                             #   etc/uci-defaults/95-homeproxy-rulesets（升级时 remote→local）
+files-dae/                  # 只叠进 dae 版：etc/dae/config.dae（无节点骨架）、
+                            #   etc/uci-defaults/97-ssh-login-fix（首启修 SSH，见下）
 ```
 
 **预置文件里只有「策略」，没有「凭据」。** 节点地址 / 端口 / 密码 / UUID / REALITY 公钥 /
 订阅链接一律不进仓库 —— 固件是公开产物，写进去等于公开。每次构建都会跑
 `scripts/check-no-credentials.sh` 扫 `files*/etc/config/`，命中就**中断构建**。
+dae 线另有一道：`prepare-build.sh` 的第 6a 步会读 `files/etc/dae/config.dae`，
+剥掉注释行后如果还能匹配到 `vless://` `vmess://` `ss://` `trojan://` `hysteria2://`
+`tuic://` `anytls://` 或 `http(s)://`，直接中断（只查这两种形态，是为了不误伤
+`tcp+udp://dns.google:53` 这类合法的 DNS 上游写法）。
 
 ### 内核补丁：`patches/kernel/6.18/`
 
@@ -324,9 +446,47 @@ uci set nss.general.enabled='0'; uci commit nss; reboot
 第一句就是 `if (!hash || !*hash) return true;` —— **密码哈希为空就放行**。两者叠加
 就是你看到的现象：网页空密码能进，SSH 永远 `Permission denied, please try again`。
 
+2026-10-19 在 `192.168.35.1` 上实测，还有**第三个**更要命的原因：出厂 `/etc/shadow`
+里 root 那行是
+
+```
+root:::0:99999:7:::
+```
+
+密码字段**根本是空的**（root 从未设过密码）。`PermitEmptyPasswords` 上游默认 `no`，
+所以即使把 `PermitRootLogin` 放开，**空密码照样登不进来**。这三条叠在一起，
+SSH 密码登录没有任何一条路能走通。
+
+还有**第四个**（只影响免密登录）：LuCI 的「系统 → 管理权 → SSH 密钥」页把公钥写进
+`/etc/dropbear/authorized_keys`（见
+`feeds/luci/modules/luci-mod-system/htdocs/luci-static/resources/view/system/sshkeys.js:150`），
+而本固件**没有 dropbear**，OpenSSH 读的是 `AuthorizedKeysFile .ssh/authorized_keys`
+（= `/root/.ssh/authorized_keys`）⇒ 在网页里加的公钥**永远不生效**。
+
 固件现已用 `files/etc/ssh/sshd_config` 覆盖这份配置（只改 3 处：顶部加
 `Include /etc/ssh/sshd_config.d/*.conf`、`PermitRootLogin yes`、
-`PasswordAuthentication yes`）。**刷了更早 build 的设备要手动补一次**：
+`PasswordAuthentication yes`）。
+
+#### 已经有自动修复：`files-dae/etc/uci-defaults/97-ssh-login-fix`
+
+第六（dae）线起，上面这几件事由 `/etc/uci-defaults/97-ssh-login-fix` 在**首启时一次做完**，
+刷完就能直接 `ssh root@192.168.35.1`：
+
+| 做了什么 | 怎么做的 |
+|---|---|
+| 给空密码的 root 写入出厂密码 | 只在 `/etc/shadow` 里确实是 `root::` 时才 `sed` 成 `root:$5$…`（`password`）；**已经设过密码的绝不覆盖** |
+| 修正公钥路径 | `/root` 750、`/root/.ssh` 700、`authorized_keys` 600，并把 `/etc/dropbear/authorized_keys` **软链**到它 |
+| 确保 sshd 开机自启 | `/etc/init.d/sshd enable` |
+
+执行时机是 `/etc/init.d/boot`（`START=10`），早于 `sshd`（50）和代理服务（99），
+所以首次开机就是最终状态，不用重启第二遍。**刷完第一件事仍然是 `passwd` 改掉它，
+或者干脆改用公钥。**
+
+> 另外六条线目前**没有**这个脚本（它只放在 `files-dae/`，避免动到已发过的构建）。
+> 想让它们也自动修，把 `files-dae/etc/uci-defaults/97-ssh-login-fix` 复制到
+> `files/etc/uci-defaults/` 即可 —— 那个文件不带任何代理栈相关的内容，七条线通用。
+
+**刷了更早 build 的设备要手动补一次**：
 
 ```sh
 # ① 确认主配置里有 Include 那行（更早的 build 没有）
@@ -343,7 +503,8 @@ PasswordAuthentication yes
 EOF
 chmod 0600 /etc/ssh/sshd_config.d/10-root-login.conf
 
-# ③ root 必须有密码 —— `PermitEmptyPasswords` 是上游默认的 no，空密码照样进不来
+# ③ root 必须有密码 —— 出厂是空的，而 `PermitEmptyPasswords` 默认 no，空密码照样进不来
+grep '^root:' /etc/shadow          # 输出 root:::0:99999:7::: 就是没密码
 passwd                            # 等价于 LuCI 的 `系统 → 管理权`
 
 # ④ 重启并核对**生效值**（-T 打印的是合并后的最终配置）
@@ -370,6 +531,11 @@ sshd -T | grep -Ei 'permitrootlogin|passwordauth|permitempty'   # 期望 yes / y
 暴露面一致。想更稳就走公钥 —— `prohibit-password` 本来就允许 root 用公钥登录，把
 `id_ed25519.pub` 追加到 `/root/.ssh/authorized_keys`（`chmod 700 /root/.ssh`、
 `chmod 600 /root/.ssh/authorized_keys`）即可。
+
+> ⚠️ 走公钥时**别用 LuCI 那个「SSH 密钥」页** —— 它写的是
+> `/etc/dropbear/authorized_keys`，本固件没有 dropbear，写了不生效。
+> 要么直接改 `/root/.ssh/authorized_keys`，要么先按上面的表格把
+> `/etc/dropbear/authorized_keys` 软链过去（`97-ssh-login-fix` 已经做了这一步）。
 
 ### passwall2 出厂预置（仅 passwall2 版）
 
@@ -574,7 +740,7 @@ bash scripts/fetch-homeproxy-rulesets.sh --dest files-homeproxy/etc/homeproxy/ru
 | **ddns-go** | 开机自启 | Web `http://<路由器IP>:9876` 添加 DDNS 记录；数据在 `/etc/ddns-go/config.yaml` |
 | **msd_lite** | 开机自启 | 客户端按 `http://<路由器IP>:7088/udp/<组播地址>:<端口>` 取流。**收组播的网卡要在 `服务 → msd_lite` 里选**（出厂留空，填错的表现是端口能连但拉不到流） |
 | **WireGuard** | 仅装好 | 无常驻服务；到 `网络 → 接口` 新建一个 `wg` 协议接口即可 |
-| **passwall2 / HomeProxy** | 已预置，未启用 | 见上两节 |
+| **passwall2 / HomeProxy / dae** | 已预置，未启用 | 见各自章节（dae 版固件里只有 dae，没有另外两个） |
 | **statistics** | 开机自启 | `状态 → 统计` 有 CPU / **温度** / 内存 / 接口流量 / 无线曲线。温度采集由 uci-defaults 默认打开 |
 | **首页 CPU / 温度** | 装好即生效 | `状态 → 总览` 的「系统」块里**顶部**就有 `CPU usage (%)` 与 `Temperature`；内存由标准「内存」块紧随其后。走的是 ImmortalWrt 原生实现，**不依赖 collectd**（与统计页的历史曲线是两回事） |
 | **autocore** | 装好即生效 | 提供 `/sbin/tempinfo`（`CPU: 52.3°C, WiFi: 61.0°C`）与 `/sbin/cpuinfo` —— 上面那两行的数据源 |
@@ -587,8 +753,8 @@ LuCI 默认简体中文。`状态 → NSS Offload` 那一页是英文 —— 它
 ```sh
 /etc/init.d/ddns-go status ; /etc/init.d/msd_lite status
 ls /etc/rc.d/ | grep -E 'ddns-go|msd_lite'    # 有 S99 链接 = 开机自启生效
-/etc/init.d/passwall2 status ; /etc/init.d/homeproxy status
-sing-box version ; sslocal --version          # 两个核心二进制在不在
+/etc/init.d/passwall2 status ; /etc/init.d/homeproxy status ; /etc/init.d/dae status
+sing-box version ; sslocal --version ; dae version   # 核心二进制在不在
 /etc/init.d/luci_statistics status
 cat /sys/class/thermal/thermal_zone*/type     # 固件里有哪些温度传感器
 ```
@@ -607,6 +773,7 @@ cat /sys/class/thermal/thermal_zone*/type     # 固件里有哪些温度传感�
 | 钉死 ddns-go / msd_lite 版本 | `Run workflow` 时填 `ddns_go_version` / `msd_lite_sha`，或改 `packages/net/*/Makefile` 的兜底值 |
 | 系统默认配置（主机名、**LAN 网段**、无线、服务开关） | 往 `files/` 按路径放文件，首启脚本在 `files/etc/uci-defaults/`；LAN 网段在 `99-qhora-301w` |
 | 改 passwall2 / HomeProxy 出厂预置 | `files-passwall2/etc/config/passwall2` / `files-homeproxy/etc/config/homeproxy`（**改完把 `address` 之类留空**，别把凭据提交上去） |
+| 改 dae 出厂骨架 / 加内核 BPF 选项 | `files-dae/etc/dae/config.dae` / `configs/dae.config`（BTF 那几行是硬前提，别减） |
 | 确认预置里没夹带凭据 | 构建会自动跑 `scripts/check-no-credentials.sh`；也可手动 `BUILDER_DIR=$PWD bash scripts/check-no-credentials.sh` |
 | 换源码仓库 / 分支 | 工作流 `env.UPSTREAM_REPOSITORY` / `UPSTREAM_REF` / `NSS_FEED`，或 `Run workflow` 时的 `upstream_ref` |
 
@@ -815,16 +982,37 @@ HomeProxy 工作流的「校验功能包」清单里也点名核对它 —— �
   需要 `sshd_config` 里有 `Subsystem sftp /usr/libexec/sftp-server`（本固件带的覆盖版
   有这行；`openssh-sftp-server` 也已编入）。临时可用 `scp -O` 退回旧协议。
 
+dae 专属（第六条线）：
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| 构建在「验真 vmlinux 的 .BTF 段」处 `::error::` 中断 | 内核没真编出 BTF | 检查 `configs/dae.config` 里 `CONFIG_KERNEL_DEBUG_INFO_REDUCED=n` 是否被别的覆盖层改回 `y`（BTF `depends on !REDUCED`，会被静默丢弃） |
+| 构建报 `defconfig 丢弃了 N 个配置请求的符号`，且都是 `KERNEL_*` | 那个符号在当前基座内核版本里没 prompt | 对照 `target/linux/generic/config-6.18` 与 `config/Config-kernel.in` 逐项核 |
+| `dae` 启动失败，日志里有 `failed to load eBPF` / `BTF` 字样 | 内核没有 `/sys/kernel/btf/vmlinux` | `ls /sys/kernel/btf/vmlinux`；没有 = 刷的不是 dae 线固件 |
+| `dae validate` 不过、服务起不来（但网络正常） | 配置语法错 | `dae validate -c /etc/dae/config.dae -l debug` 看具体行；init 脚本 validate 失败会直接 `return 1`，**不会 respawn 循环**，所以不会拖垮网络 |
+| 启用后全部断网 | 节点池里没有可用节点，而 routing 已 `fallback: my_group` | 先填节点再启用；或临时把最后一行改成 `fallback: direct` 验证规则本身 |
+| LuCI 里没有「服务 → dae」 | `luci-app-dae` 没编进去 | `apk list --installed \| grep dae`；缺就说明刷的是别的线 |
+| 某些网站打不开、但 TCP 站点正常 | 该站走 HTTP/3（UDP 443） | 骨架里已 `l4proto(udp) && dport(443) -> block`；自己改过配置的要保留这条 |
+| `dae-geoip` / `dae-geosite` 装了但规则里 `geoip:cn` 不生效 | `/usr/share/dae/` 下没有数据文件 | `ls -l /usr/share/dae/` 应看到两个指向 `/usr/share/v2ray/*.dat` 的软链；`v2ray-geoip`/`v2ray-geosite` 没装则软链悬空 |
+
 ---
 
 ## 七、本地编译（不用 CI）
 
 ```sh
+# ① nss-edma 基座（第一/二条线）
 git clone -b nss-edma-rework https://github.com/JuliusBairaktaris/openwrt-nss-edma openwrt
-cd openwrt
 
+# ② immortalwrt 基座（第三/四/六条线）：先移植 NSS，再走同一个 prepare-build.sh
+git clone --depth 1 https://github.com/immortalwrt/immortalwrt openwrt
+cd openwrt
+OPENWRT_DIR="$PWD" BUILDER_DIR="../qhora-301w-build" \
+  bash ../qhora-301w-build/scripts/prepare-build-imm-nss.sh
+cd ..
+
+cd openwrt
 export GH_TOKEN=<你的 GitHub token>     # 可选但建议：避免撞未认证 API 限额（60 次/小时）
-PROXY_STACK=passwall2 \                 # 或 homeproxy
+PROXY_STACK=passwall2 \                 # 或 homeproxy / dae（dae 必须用 immortalwrt 基座）
 OPENWRT_DIR="$PWD" BUILDER_DIR="../qhora-301w-build" \
   bash ../qhora-301w-build/scripts/prepare-build.sh
 

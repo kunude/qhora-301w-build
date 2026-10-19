@@ -1,0 +1,68 @@
+#!/bin/sh
+#
+# 首次启动：把 SSH 修到「真的能登进来」的状态。
+#
+# ── 为什么需要这个脚本（实测于 192.168.35.1，ImmortalWrt SNAPSHOT）──────
+# 固件里没有 dropbear，走的是 openssh-server（见 configs/common.config 的 SSH 段），
+# 而 OpenWrt 打包的 openssh **不会**给 root 设密码 —— 出厂 /etc/shadow 里那一行是
+#     root:::0:99999:7:::
+# 密码字段是**空的**。而 files/etc/ssh/sshd_config 里 PermitEmptyPasswords 保持
+# 上游默认的 no ⇒ **密码登录永远失败**，现象就是 SSH 一直 Permission denied。
+#
+# 更迷惑的是 LuCI 那边却「能进」：rpcd 的 session.c 里
+#     rpc_login_test_password(): if (!hash || !*hash) return true;
+# 哈希为空就放行。于是表现为「网页能进、SSH 进不去」——
+# 这正是之前被误判成"SSH 坏了"的那个现象。
+#
+# 第二个坑：LuCI 的「系统 → 管理权 → SSH 密钥」页把公钥写进
+#     /etc/dropbear/authorized_keys        （luci-mod-system/…/sshkeys.js:150）
+# 而 OpenSSH 读的是
+#     /root/.ssh/authorized_keys           （sshd_config 的 AuthorizedKeysFile）
+# 两个路径**不是同一个文件** ⇒ 在 LuCI 里加的公钥永远不会生效，
+# 想用密钥免密登录也一直是失败。下面用软链把两者接起来。
+#
+# ── 改密码 ────────────────────────────────────────────────────
+# 出厂密码是 password（与 DEVICE 上现有的一致）。要改：
+#     passwd root
+# 或者换掉下面的 ROOT_HASH（$5$ 是 SHA-256 crypt，可用
+#     openssl passwd -5 -salt <salt> <新密码>
+# 生成）。本脚本只在密码**为空**时才动手，已经设过密码就什么都不做，
+# 所以保留配置升级时你改过的密码不会被覆盖，也不必删本脚本。
+#
+
+ROOT_HASH='$5$qhora301w$lAJ/901mzmW0rFpCJm7mFmrWCA8lI6LdjyHaslw1p3A'   # = password
+
+[ -f /etc/shadow ] || exit 0
+
+# ── 1. root 空密码 → 写入出厂密码 ─────────────────────────────
+# 只认"字段确实为空"这一种情况：已经设过密码（$1$/$5$/$6$/!/*）一律不动，
+# 保留配置升级时你自己改过的密码不会被覆盖。
+if grep -q '^root::' /etc/shadow; then
+	sed -i "s|^root::|root:${ROOT_HASH}:|" /etc/shadow
+	chmod 600 /etc/shadow
+	logger -t ssh-fix "root 密码为空，已写入出厂密码"
+fi
+
+# ── 2. 把 LuCI 的密钥路径接到 OpenSSH 真正读的地方 ─────────────
+# /root 必须是 750 或更严：sshd 的 StrictModes 会拒绝 group/other 可写
+# 的家目录，否则连 authorized_keys 都不看。
+chmod 750 /root 2>/dev/null || true
+mkdir -p /root/.ssh
+chmod 700 /root/.ssh
+[ -f /root/.ssh/authorized_keys ] || : >/root/.ssh/authorized_keys
+chmod 600 /root/.ssh/authorized_keys
+
+mkdir -p /etc/dropbear
+if [ ! -e /etc/dropbear/authorized_keys ]; then
+	ln -s /root/.ssh/authorized_keys /etc/dropbear/authorized_keys
+fi
+
+# ── 3. 确保 sshd 开机自启 ────────────────────────────────────
+# openssh-server 已经装了，但 rc.d 里的链接缺失时（例如某些精简构建）会
+# 出现"这次能登、重启就连不上"。enable 是幂等的。
+if [ -x /etc/init.d/sshd ]; then
+	/etc/init.d/sshd enable >/dev/null 2>&1 || true
+fi
+
+logger -t ssh-fix "SSH 登录前置条件已就绪（root 密码 / 密钥路径 / 自启）"
+exit 0

@@ -1,0 +1,127 @@
+# ── dae 出厂配置（骨架）────────────────────────────────────────
+#
+# 这是**没有节点**的骨架：规则全走直连，即使误启动也不会改变任何流量的去向。
+# dae 的 init 脚本会先跑 `dae validate -c /etc/dae/config.dae`，验证不过就
+# 直接 return 1（不会 respawn 循环），所以骨架不合格也不会拖垮网络。
+#
+# ── 怎么用 ────────────────────────────────────────────────────
+# 1) 填节点：用 LuCI「服务 → dae → 配置」直接编辑本文件，或 SSH 改；
+#    支持 ss / vmess / vless / trojan / hysteria2 / tuic 等，写法就是链接：
+#        subscription { my_sub: 'https://你的订阅地址' }
+#        node { 'ss://xxxx' }
+# 2) 让路由规则指向你的节点组：本文件已定义 group `my_group`（用全部节点、
+#    按滑动平均延迟选路），routing 段末尾的 `fallback: my_group` 就是它。
+# 3) 启用服务：
+#        uci set dae.config.enabled='1'
+#        uci commit dae
+#        /etc/init.d/dae restart
+#
+# ── 内核前提（本固件的 dae 线已编译进去，换别的固件要自己确认）──
+#    ls /sys/kernel/btf/vmlinux     # 必须存在，否则 CO-RE 程序无法加载
+#    缺这个文件就是内核没开 CONFIG_DEBUG_INFO_BTF，dae 起不来
+#    （报错形如 "failed to load eBPF: ... BTF"）。
+#
+# 参考：https://github.com/daeuniverse/dae/blob/main/docs/en/configuration/
+#
+
+global {
+    # tproxy 端口只给 eBPF 程序内部用，不是 HTTP/SOCKS 代理端口。
+    tproxy_port: 12345
+    tproxy_port_protect: true
+
+    log_level: info
+
+    # auto = 自动识别 wan 口（本机型是 pppoe-wan / wan）。
+    wan_interface: auto
+    # 代理 LAN：留空表示"该接口的全部流量都进 eBPF 分流"。
+    # 多网口用逗号分隔，例如 lan_interface: br-lan,br-guest
+    #lan_interface: br-lan
+
+    # 让 dae 自己配 ip_forward / send_redirects 等内核参数，
+    # 免得到处找 sysctl 调（与 OpenWrt 的 firewall 不冲突）。
+    auto_config_kernel_parameter: true
+
+    # domain = 只把域名交给节点侧解析（抗 DNS 污染，且节点侧拿到的 IP 更优）。
+    # 若你的 DNS 不经过 dae，可改 domain+。
+    dial_mode: domain
+    allow_insecure: false
+    sniffing_timeout: 30ms
+
+    # utls + chrome 指纹，对 SNI 阻断更友好；不想伪装就改回 tls。
+    tls_implementation: utls
+    utls_imitate: chrome_auto
+
+    # 只影响 Hysteria2 之类的带宽自适应协议，按你的线路改。
+    bandwidth_max_tx: '200 mbps'
+    bandwidth_max_rx: '1 gbps'
+
+    # 启动早期解析订阅域名用的引导 DNS（此时 dae 自己的 DNS 还没起来）。
+    # 默认会依次试 119.29.29.29 / 223.5.5.5，这里显式写死一个国内可用的。
+    bootstrap_resolver: '223.5.5.5:53'
+    fallback_resolver: '223.5.5.5:53'
+}
+
+# 订阅：填了之后 dae 会把订阅里的节点自动并进节点池。
+# 带 -file 的写法（https-file://）会把订阅落盘到 config_dir/persist.d/，
+# 拉取失败时用落盘那份兜底 —— 移动网络/机场抖动时很有用。
+subscription {
+    # my_sub: 'https-file://你的订阅地址'
+}
+
+# 手写的单节点，与订阅里的节点合并成一个池子。
+node {
+    # 'ss://...'
+    # 'vless://...'
+}
+
+# DNS 分流：国内域名走阿里 DNS，其余走 Google（经节点出去）。
+dns {
+    upstream {
+        googledns: 'tcp+udp://dns.google:53'
+        alidns: 'udp://223.5.5.5:53'
+    }
+    routing {
+        request {
+            fallback: alidns
+        }
+        response {
+            # 节点侧解析出来的国内地址不足以说明"该直连"，这里只做"是否被污染"的判断
+            upstream(googledns) -> accept
+            !qname(geosite:cn) && ip(geoip:private) -> googledns
+            fallback: accept
+        }
+    }
+}
+
+# 节点组。my_group 不设 filter = 使用节点池里的全部节点。
+# 其它可选策略：random / min / min_avg10 / fixed(0)
+group {
+    my_group {
+        policy: min_moving_avg
+    }
+}
+
+routing {
+    ### 预设规则（顺序即优先级，命中即停）
+
+    # 本机的网络管理器直连，避免 dae 绑定 WAN 时的连通性自检被自己代理掉。
+    pname(NetworkManager) -> direct
+
+    # 广播 / 组播 / 链路本地：绝对不能进代理（否则会把 LAN 内的发现协议打断）。
+    dip(224.0.0.0/3, 'ff00::/8') -> direct
+
+    # 内网地址直连（含 192.168.x / 10.x / 172.16-31.x）。
+    dip(geoip:private) -> direct
+
+    ### 分流
+
+    # 关掉 QUIC（HTTP/3）：浏览器会立刻回落到 TCP，避免"有的站通、Google 不通"
+    # 那类 UDP 443 问题，同时也省 CPU（h3 的收发开销明显高于 TCP）。
+    l4proto(udp) && dport(443) -> block
+
+    dip(geoip:cn) -> direct
+    domain(geosite:cn) -> direct
+
+    # 上面都不匹配 → 走节点组。
+    fallback: my_group
+}

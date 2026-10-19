@@ -1,0 +1,752 @@
+name: Build QHora-301W (ImmortalWrt + NSS + dae)
+
+# 第六条线：**基座 = immortalwrt/immortalwrt** + NSS 补丁 + **dae 代理栈**。
+#
+# ── 与另外五条线的关系 ──────────────────────────────────────────
+#
+#   build-qhora-301w.yml                     nss-edma 基座 + passwall2
+#   build-qhora-301w-homeproxy.yml           nss-edma 基座 + HomeProxy
+#   build-qhora-301w-homeproxy-sb114.yml     实验线（sing-box 版本矩阵）
+#   build-qhora-301w-imm-nss.yml             immortalwrt 基座 + NSS补丁 + passwall2
+#   build-qhora-301w-imm-nss-homeproxy.yml   immortalwrt 基座 + NSS补丁 + HomeProxy
+#   本工作流                                 immortalwrt 基座 + NSS补丁 + dae
+#
+# 软件集 = imm-nss-homeproxy 那份的"代理栈"整块替换：
+#   luci-app-homeproxy + sing-box + kmod-nft-tproxy + ucode-mod-digest/math
+#     ↓
+#   dae + luci-app-dae + dae-geoip/geosite + v2ray-geoip/geosite
+#     + kmod-sched-core / kmod-sched-bpf / kmod-veth / kmod-xdp-sockets-diag
+# 其余（NSS 九个包、msd_lite、ddns-go、WireGuard、statistics、autocore、
+# files/ 覆盖、target/subtarget/device）原样不动。
+#
+# ── 为什么值得单独一条线（dae 与 HomeProxy 的本质差别）────────────
+#   HomeProxy 是 sing-box 的 UCI 外壳：UCI → JSON → 用户态 sing-box 跑
+#   5330-5333 一堆入站 + nftables 转发。直连流量也要过一遍用户态。
+#   dae 是 eBPF(CO-RE) 实现：流量在**内核态**分流，直连几乎零开销，
+#   不建 conntrack、不起 TPROXY 循环 —— BT/PT 这类高并发场景优势明显。
+#
+#   代价是三条内核硬前提，缺一条就"编得出、刷得进、跑不起来"：
+#     ① /sys/kernel/btf/vmlinux 必须存在（CO-RE 必需）
+#     ② tc 的 bpf 分类器/动作（kmod-sched-bpf）+ sch_ingress（kmod-sched-core）
+#     ③ XDP_SOCKETS（kmod-xdp-sockets-diag 的 DEPENDS 就是它）
+#   immortalwrt 的通用内核配置里这三项**全是关的** —— 2026-10-19 在
+#   192.168.35.1 上实测：`ls /sys/kernel/btf/vmlinux` 报 No such file or directory，
+#   `zcat /proc/config.gz` 也没有（更直接的是 generic/config-6.18 里写着
+#   `# CONFIG_DEBUG_INFO_BTF is not set`、`# CONFIG_NET_CLS_BPF is not set`）。
+#   所以本线在 configs/dae.config 里显式打开：
+#     CONFIG_KERNEL_DEBUG_INFO=y / _DEBUG_INFO_BTF=y / _BPF_EVENTS=y
+#     CONFIG_KERNEL_XDP_SOCKETS=y，并**关掉** CONFIG_KERNEL_DEBUG_INFO_REDUCED
+#     （BTF 明确 depends on !REDUCED，不关会被静默丢弃 —— 编完才发现没 BTF）。
+#   产物阶段还会直接验 vmlinux 的 .BTF 段大小，不是只看 .config。
+#
+# ── SSH 登录（本线顺手补上的那个坑）──────────────────────────────
+# 老五条线编出来的固件都有同一个问题：出厂 /etc/shadow 里 root 的密码字段是
+# **空的**（`root:::0:99999:7:::`），而 files/etc/ssh/sshd_config 里
+# PermitEmptyPasswords 是上游默认的 no ⇒ **密码登录必然失败**。
+# 而 LuCI 却能进 —— rpcd 的 rpc_login_test_password() 在哈希为空时直接
+# return true。于是现象是"网页能进、SSH 一直 Permission denied"。
+# 第二个坑：LuCI 的「SSH 密钥」页把公钥写进 /etc/dropbear/authorized_keys
+# （luci-mod-system/…/sshkeys.js:150），而 OpenSSH 读的是 /root/.ssh/authorized_keys
+# ⇒ 在网页里加的公钥永远不生效，免密登录也一直是失败。
+# files-dae/etc/uci-defaults/97-ssh-login-fix 在首启把这三件事一次做完：
+#   ① root 密码为空时才写入出厂密码（已设过的绝不覆盖）
+#   ② /etc/dropbear/authorized_keys 软链到 /root/.ssh/authorized_keys
+#   ③ 确保 sshd 开机自启
+# 老五条线也要修的话，把那个文件复制到 files/etc/uci-defaults/ 即可。
+#
+# 触发方式：
+#   · 手动：Actions -> 左侧本工作流 -> Run workflow（可勾选是否创建 Release）
+#   · 推送：本文件 / configs/dae.config / configs/imm-nss.config 有改动时
+#     （**故意不监听 scripts/ patches/ files-dae/**：那些目录一改，
+#      上面那条 imm-nss 线也会触发，两条全量编译会互相排队几小时。）
+#   · 定时：每周日 22:00 UTC（周一 06:00 东八区），与另外几条线错开
+#
+# 产物（actions artifact，勾选 Release 时同时挂到 release）：
+#   immortalwrt-qualcommax-ipq807x-qnap_301w-squashfs-sysupgrade.bin   日常升级用
+#   immortalwrt-qualcommax-ipq807x-qnap_301w-initramfs-uImage.itb      首次安装用（U-Boot TFTP）
+#   immortalwrt-qualcommax-ipq807x-qnap_301w-squashfs-factory.bin      eMMC 整盘写入用
+#   sha256sums / config.buildinfo / profiles.json                      校验与构建溯源
+
+on:
+  workflow_dispatch:
+    inputs:
+      imm_ref:
+        description: "ImmortalWrt 基座的 ref（分支 / 标签 / commit，留空 = master）"
+        required: false
+        default: ""
+      imm_feed_ref:
+        description: "ImmortalWrt luci/packages 的 ref（留空 = master；一般不用填）"
+        required: false
+        default: ""
+      imm_luci:
+        description: "immortalwrt/luci 仓库地址（留空 = 官方；提供 luci-app-dae）"
+        required: false
+        default: ""
+      imm_pkgs:
+        description: "immortalwrt/packages 仓库地址（留空 = 官方；提供 dae 本体）"
+        required: false
+        default: ""
+      release:
+        description: "构建成功后创建 GitHub Release 并附带镜像"
+        type: boolean
+        default: false
+      # 下面两个留空就跟随上游最新版本（默认行为）。
+      # 想编某个确定版本、或者要可复现的固件时，在这里填死。
+      ddns_go_version:
+        description: "钉死 ddns-go 版本，如 6.17.7（留空 = 跟随上游最新 release）"
+        required: false
+        default: ""
+      msd_lite_sha:
+        description: "钉死 msd_lite 的 commit sha（留空 = 跟随上游 master HEAD）"
+        required: false
+        default: ""
+      # 勾选后**不恢复任何构建缓存**（dl 源码包 + ccache），完全从零编译。
+      # 只影响本次运行：跑完仍会保存新的源码包缓存供下次复用。
+      clean_build:
+        description: "从头编译：忽略 dl 与 ccache 缓存"
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    # 只监听"只属于本线"的文件。
+    # 监听 scripts/ patches/ files-dae/ 会让它与 imm-nss 线同时触发全量编译。
+    paths:
+      - ".github/workflows/build-qhora-301w-imm-nss-dae.yml"
+      - "configs/dae.config"
+      - "configs/imm-nss.config"
+      # ⚠️ files-dae/** 与 scripts/** 故意**不**监听（会让 imm-nss 线一起进
+      #    全量编译）；改了出厂配置（files-dae/etc/dae/config.dae）或脚本，
+      #    手动 Run workflow 即可。
+  schedule:
+    # GitHub 的 cron 用 UTC。22:00 UTC = 次日 06:00 东八区。
+    # imm-nss 线 17:00、imm-nss-homeproxy 线 20:00，本线 22:00，彼此错开。
+    #
+    # 定时跑的意义：基座是活的 immortalwrt，内核也在往前走 —— 而 dae 依赖的
+    # BTF / BPF 相关内核符号正好是最容易被上游改动的部分。定时构建就是
+    # 「NSS 补丁 + dae 的内核前提跟不跟得上基座」的唯一自动探测手段。
+    - cron: "0 22 * * 0"
+
+# 用**独立**的 concurrency group。共用一个 group 时，另一条线的 run 会让本线
+# 新进来的 run 被 GitHub 直接判成 cancelled（老 homeproxy 线撞过这个坑）。
+concurrency:
+  group: build-qhora-301w-imm-nss-dae-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # ── 基座源码：活的 ImmortalWrt ──────────────────────────────
+  IMM_REPOSITORY: immortalwrt/immortalwrt
+  # 基座的 ref。**与下面的 IMM_REF 是两个不同的东西**：
+  #   IMM_BASE_REF = immortalwrt/immortalwrt 这个仓库的 ref（checkout 基座用）
+  #   IMM_REF      = immortalwrt/luci 与 immortalwrt/packages 的 ref
+  #                  （extra-packages.sh 稀疏检出 HomeProxy / sing-box 用）
+  # 两者拆开是必要的：它们分属三个不同的仓库，把 imm_ref 钉到某个基座 commit
+  # 时，那个 commit 在 luci/packages 里根本不存在，稀疏检出会直接失败。
+  # 本线用 IMM_REF 的地方只剩 luci（ddns-go / msd_lite / luci-base / luci-mod-status
+  # 四个前端），dae 与 luci-app-dae 直接由 feeds 提供。
+  IMM_BASE_REF: ${{ github.event.inputs.imm_ref || 'master' }}
+  # 用 github.event.inputs 而不是 inputs：两者在 workflow_dispatch 下等价，
+  # 但前者在 push / schedule 事件下也能安全求值（返回空）。
+  IMM_REF: ${{ github.event.inputs.imm_feed_ref || 'master' }}
+  IMM_LUCI: ${{ github.event.inputs.imm_luci }}
+  IMM_PKGS: ${{ github.event.inputs.imm_pkgs }}
+  # NSS 驱动 / ECM / qdisc / 固件所在的独立 feed —— 与另外三条线**同一个**。
+  # feed 是独立的包仓库，与"换不换基座"无关，所以这里一个字都不用改。
+  # 缺了它 ATH11K_NSS_SUPPORT 的依赖不满足，连 defconfig 都会失败。
+  NSS_FEED: "src-git nss https://github.com/JuliusBairaktaris/nss-packages.git;edma-nss"
+
+  # ── 目标机型 ────────────────────────────────────────────────
+  TARGET: qualcommax
+  SUBTARGET: ipq807x
+  DEVICE: qnap_301w
+  DEVICE_LABEL: QHora-301W
+  OPENWRT_DIR: ${{ github.workspace }}/openwrt
+  BUILDER_DIR: ${{ github.workspace }}/builder
+
+  # ── 代理栈 ──────────────────────────────────────────────────
+  # dae：多拼一份 configs/dae.config —— 它做两件事：
+  #   ① 把 common.config 的 passwall2 全家按掉（与 homeproxy.config 同一套 =n）；
+  #   ② 打开 dae + 它依赖的 kmod + 三个内核符号（BTF / BPF_EVENTS / XDP_SOCKETS）。
+  # dae 本体在 feeds/packages/net/dae，luci-app-dae 在 feeds/luci/applications，
+  # 都是基座自带 feed ⇒ extra-packages.sh 的 dae 分支**一个仓库都不拉**。
+  # 注意这里没有 SINGBOX_MODE：那个变量只对 PROXY_STACK=homeproxy 有意义
+  # （extra-packages.sh 里有一条守卫会直接拒绝其它组合）。
+  PROXY_STACK: dae
+
+jobs:
+  build:
+    name: Build ImmortalWrt@${{ github.event.inputs.imm_ref || 'master' }} -> QHora-301W (NSS + dae)
+    # 与上游作者自己的 CI 同一档环境，避免踩 base image 的坑。
+    runs-on: ubuntu-26.04
+    # GitHub 托管 runner 单个 job 硬上限 6 小时，这里留 5 分钟收尾。
+    timeout-minutes: 355
+    permissions:
+      # 勾选 release 时需要有写权限。仓库设置里
+      # Settings -> Actions -> General -> Workflow permissions 需要允许读写。
+      contents: write
+
+    steps:
+      # ── 释放磁盘 ──────────────────────────────────────────────
+      # 全量编译（工具链 + 内核 + 全部软件包）大约需要 25-35GB，
+      # runner 根分区默认不够，先删掉用不到的预装 SDK。
+      - name: 释放磁盘空间
+        run: |
+          set -euo pipefail
+          df -h / | tail -1
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /usr/local/share/boost \
+            /opt/hostedtoolcache/CodeQL || true
+          sudo apt-get clean
+          df -h / | tail -1
+
+      # ── 系统依赖 ──────────────────────────────────────────────
+      - name: 安装构建依赖
+        run: |
+          set -euo pipefail
+          # OpenWrt 自建 flex/bison 等 host 工具，所以宿主机只需要最小集合。
+          # 这个列表与上游 Qualcommax_NSS_Builder 的 CI 保持一致，是验证过的组合。
+          # 不需要 rsync —— prepare-build.sh 叠加覆盖文件用的是 cp -a。
+          # patch    NSS 补丁的兜底应用方式（git apply 失败时用）。
+          # python3  extra-packages.sh 的 latest 通道要它打 HomeProxy 兼容补丁；
+          #          runner 预装了，这里显式声明，免得换了 base image 才炸。
+          sudo apt-get update || true
+          sudo apt-get install -y \
+            bzip2 g++ gawk gcc git glibc-source libncurses-dev make patch python3
+
+      # ── 拉取源码 ──────────────────────────────────────────────
+      # fetch-depth 1：本线的补丁应用不依赖历史（用 git apply / patch -p1，
+      # 不做三方合并），浅克隆足够，还能省掉一大截下载时间。
+      - name: 检出 ImmortalWrt 基座源码
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.IMM_REPOSITORY }}
+          ref: ${{ env.IMM_BASE_REF }}
+          fetch-depth: 1
+          path: openwrt
+
+      - name: 检出本仓库（配置与脚本）
+        uses: actions/checkout@v7
+        with:
+          path: builder
+
+      # ── 组装构建环境 ──────────────────────────────────────────
+      # 先确认 runner 上真有 feeds/make 依赖的工具：scripts/feeds 是 Perl 脚本、
+      # 索引器要 make，缺任何一项都会在后面以很晦涩的方式失败。
+      - name: 环境预检
+        run: |
+          set -euo pipefail
+          # scripts/feeds 是 Perl 脚本、索引器要 make；
+          # resolve-versions.sh 还要 curl/tar/sha256sum 去解析上游版本并算 hash；
+          # apply-nss-patches.sh 需要 patch 做兜底应用。
+          # 缺任何一项都会在后面以很晦涩的方式失败，所以先查一遍。
+          for c in perl make git gcc g++ gawk bzip2 curl tar sha256sum patch python3; do
+            command -v "$c" >/dev/null 2>&1 ||
+              { echo "::error::runner 上缺少必需工具：$c"; exit 1; }
+          done
+          perl -v | sed -n '2p'
+          make --version | head -1
+          echo "必需工具齐备"
+
+      # ── NSS 移植 + 准备构建环境 ───────────────────────────────
+      # 第 0 步（imm 线独有）：apply-nss-patches.sh 把 NSS 补丁打进 immortalwrt 源码树；
+      # 第 1–7 步与另外三条线完全相同（feeds / 第三方包 / .config / 符号校验 /
+      # 凭据守卫 / 覆盖文件 / 内核补丁注入），只是 PROXY_STACK=dae。
+      - name: NSS 移植 + 准备构建环境（feeds + dae + .config + 覆盖文件）
+        env:
+          # 用来查 GitHub API 解析 ddns-go / msd_lite 的上游最新版本。
+          # 不给 token 也能跑，但未认证限额只有 60 次/小时，容易被别处撞掉。
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 留空 = 跟随上游最新版本（默认）。push / schedule 事件下这两个表达式
+          # 求值为空字符串，所以那两个触发方式天然就是"跟随最新"。
+          DDNS_GO_VERSION: ${{ github.event.inputs.ddns_go_version }}
+          MSD_LITE_SHA: ${{ github.event.inputs.msd_lite_sha }}
+          # 本线只用 immortalwrt/luci 那四个前端（ddns-go / msd_lite /
+          # luci-base / luci-mod-status）；dae 与 luci-app-dae 由 feeds 直供。
+          # 全部留空 = 用 extra-packages.sh 的默认值。
+          IMM_REF: ${{ github.event.inputs.imm_feed_ref || 'master' }}
+          IMM_LUCI: ${{ github.event.inputs.imm_luci }}
+          IMM_PKGS: ${{ github.event.inputs.imm_pkgs }}
+        run: bash "$BUILDER_DIR/scripts/prepare-build-imm-nss.sh"
+
+      # 日志要仓库 admin 权限才能从 API 下载，所以把它回放到控制台，
+      # 失败时这一步也会执行（always），日志一定看得到。
+      - name: 回放构建准备日志
+        if: always()
+        run: |
+          f="$GITHUB_WORKSPACE/prepare-build.log"
+          if [ -f "$f" ]; then
+            echo "::group::prepare-build.sh 日志（尾部 150 行）"
+            tail -n 150 "$f"
+            echo "::endgroup::"
+          else
+            echo "没有生成 prepare-build.log（可能是 NSS 补丁那一步就失败了，见上一步输出）"
+          fi
+
+      # ── 可复现构建 ────────────────────────────────────────────
+      # 注意：下面两个 KBUILD_BUILD_* 只对**非内核**组件生效。内核版本串里的
+      # user@host 由 include/kernel.mk 以 make 变量覆盖环境变量，必须写在
+      # configs/common.config 的 CONFIG_KERNEL_BUILD_USER / _DOMAIN 里。
+      - name: 设置可复现构建环境变量
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+          git log -1 --format='  base commit : %H %ci%n  subject     : %s'
+          {
+            echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)"
+            echo "TZ=UTC"
+            echo "LC_ALL=C"
+            echo "KBUILD_BUILD_USER=builder"
+            echo "KBUILD_BUILD_HOST=github-actions"
+          } >>"$GITHUB_ENV"
+
+      # ── 下载源码包 ────────────────────────────────────────────
+      # 上游镜像偶尔抽风，重试三次。下载好的包在多次运行之间缓存复用。
+      # cache key 带 imm-dae- 前缀：不与另外几条线的 dl 缓存互相顶掉
+      # （各线的包集合不同）。
+      - name: 恢复源码包缓存
+        if: github.event.inputs.clean_build != 'true'
+        uses: actions/cache/restore@v6
+        with:
+          path: openwrt/dl
+          # 带上 run_attempt：整个 run 重跑时不会撞上已存在的 key
+          key: dl-imm-dae-${{ github.run_id }}-${{ github.run_attempt }}
+          # 退一步也可以复用 imm-nss 线的 dl（基座与 NSS 部分完全相同，
+          # 只差 dae 那几个包的源码包）
+          restore-keys: |
+            dl-imm-dae-
+            dl-imm-
+
+      - name: 下载源码包
+        id: download
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+          mkdir -p dl
+          before=$(find dl -maxdepth 1 -type f | wc -l)
+          for attempt in 1 2 3; do
+            if make download -j"$(nproc)"; then break; fi
+            if [[ $attempt -ge 3 ]]; then echo "::error::源码包下载连续失败三次"; exit 1; fi
+            echo "::warning::第 $attempt 次下载失败，重试"
+            sleep 10
+          done
+          if [[ "$(find dl -maxdepth 1 -type f | wc -l)" -gt "$before" ]]; then
+            echo "grew=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "grew=false" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: 保存源码包缓存
+        if: steps.download.outputs.grew == 'true'
+        # 缓存只是加速手段，存不进去（配额满、key 冲突）不该让整个构建失败
+        continue-on-error: true
+        uses: actions/cache/save@v6
+        with:
+          path: openwrt/dl
+          key: dl-imm-dae-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # ── ccache ────────────────────────────────────────────────
+      # 缓存 key 里带上工具链目录树的哈希和 binutils/gcc/libc 的配置：
+      # 任何一项变了都从空缓存开始，避免命中错误的目标文件。
+      # 前缀带 imm-dae-：与另外几条线的 ccache 分开，各线的宏/补丁集不同，
+      # 混用只会浪费容量。
+      - name: 计算 ccache key
+        id: ccache
+        run: |
+          set -euo pipefail
+          tree=$(git -C openwrt rev-parse HEAD:toolchain)
+          sum=$({
+            echo "$tree"
+            grep -E '^CONFIG_(BINUTILS|GCC|LIBC|MUSL|GLIBC)_' openwrt/.config
+            gcc --version; as --version
+          } | sha256sum | cut -c1-16)
+          echo "prefix=ccache-qhora301w-imm-dae-$sum-" >>"$GITHUB_OUTPUT"
+
+      - name: 恢复 ccache
+        if: github.event.inputs.clean_build != 'true'
+        uses: actions/cache@v6
+        with:
+          path: openwrt/.ccache
+          key: ${{ steps.ccache.outputs.prefix }}${{ github.run_id }}
+          restore-keys: ${{ steps.ccache.outputs.prefix }}
+
+      # ── 编译 ──────────────────────────────────────────────────
+      # 首次运行没有缓存会慢很多；如果撞到 6 小时上限，直接重跑一次，
+      # ccache 和 dl 缓存都会复用。
+      - name: 编译
+        working-directory: openwrt
+        env:
+          CCACHE_COMPILERCHECK: content
+          CCACHE_MAXSIZE: 5G
+          # 构建日志留给下面两步做回放和注解上报。
+          # 放 RUNNER_TEMP 而不是工作区，免得混进 artifact 或被 git 看到。
+          BUILD_LOG: ${{ runner.temp }}/build.log
+        run: |
+          # 这里**故意不加 -e**：make 失败要自己接住，好决定是否单线程重跑，
+          # 并把完整日志留下来给后面两步上报。
+          set -uo pipefail
+          : >"$BUILD_LOG"
+
+          # 走 tee 之后 $? 是 tee 的退出码，make 自己的要用 PIPESTATUS[0] 取。
+          make -j"$(nproc)" 2>&1 | tee -a "$BUILD_LOG"
+          rc=${PIPESTATUS[0]}
+
+          if (( rc != 0 )); then
+            echo "::warning::并行编译失败（make 退出码 $rc），改用单线程 -j1 V=s 重跑以拿到完整报错"
+            make -j1 V=s 2>&1 | tee -a "$BUILD_LOG"
+            rc=${PIPESTATUS[0]}
+          fi
+
+          staging_dir/host/bin/ccache -s 2>&1 | tee -a "$BUILD_LOG" || true
+
+          if (( rc != 0 )); then
+            echo "编译失败：make 最终退出码 $rc。完整日志见下一步「回放编译日志」。"
+            exit "$rc"
+          fi
+          echo "编译通过"
+
+      # 编译**失败**的唯一远程可见通道是注解：作业日志要仓库 admin 权限才能从
+      # API 下载（公开仓库一样 403），而 ::error:: 会变成 check-run annotation，
+      # 那个是公开可读的。所以把"哪个包挂了 / 报错行"发成注解。
+      - name: 回放编译日志
+        if: always()
+        env:
+          BUILD_LOG: ${{ runner.temp }}/build.log
+        run: |
+          if [[ ! -s "$BUILD_LOG" ]]; then
+            echo "没有构建日志（可能编译步骤之前就失败了）"
+            exit 0
+          fi
+          echo "::group::构建日志共 $(wc -l <"$BUILD_LOG") 行，回放最后 250 行"
+          tail -n 250 "$BUILD_LOG"
+          echo "::endgroup::"
+
+      - name: 上报编译失败原因
+        if: failure()
+        env:
+          BUILD_LOG: ${{ runner.temp }}/build.log
+        run: |
+          [[ -s "$BUILD_LOG" ]] || exit 0
+
+          # OpenWrt 挂在某个包上时会打印固定格式： "ERROR: package/<路径> failed to build."
+          failed=$(grep -oE 'ERROR: package/[^ ]+ failed to build' "$BUILD_LOG" \
+                   | sed 's|^ERROR: package/||; s| failed to build$||' \
+                   | sort -u | tr '\n' ' ' || true)
+          # 最常见的几种真实报错行（尾部若干条，前面的多半是噪音）
+          hints=$(grep -nE 'Error [0-9]+$|error:|Error [0-9]+:|undefined reference|cannot find -l|No rule to make target|fatal error|CMake Error' \
+                  "$BUILD_LOG" | tail -n 8 || true)
+
+          if [[ -n "$failed" ]]; then
+            echo "::error title=编译失败的包::${failed}"
+          fi
+          if [[ -n "$hints" ]]; then
+            # 注解里的换行要写成 %0A，而 % 本身必须写成 %25（否则会被当转义前缀）
+            msg=$(printf '%s\n' "$hints" | sed 's/%/%25/g; s/\r//g' | awk '{printf "%s%%0A", $0}')
+            echo "::error title=编译报错行（尾部 8 条）::${msg}"
+          fi
+          if [[ -z "$failed$hints" ]]; then
+            echo "::error title=编译失败::没从日志里认出固定格式的报错，请看上一步的控制台回放"
+          fi
+
+      # ── 收集产物 ──────────────────────────────────────────────
+      - name: 收集并校验产物
+        run: |
+          set -euo pipefail
+          out="openwrt/bin/targets/${TARGET}/${SUBTARGET}"
+          [[ -d "$out" ]] || { echo "::error::输出目录不存在：$out"; exit 1; }
+
+          ls -lh "$out"
+
+          # 必须有 sysupgrade；没有就说明设备压根没编进去。
+          compgen -G "$out/*${DEVICE}*squashfs-sysupgrade.bin" >/dev/null ||
+            { echo "::error::$out 下没有 ${DEVICE} 的 sysupgrade 镜像"; exit 1; }
+
+          # 把产物清单也发成注解：check-run annotations 是公开可读的，
+          # 而作业日志和 artifact 内容都必须登录才能看 —— 这样远程（包括无人值守
+          # 的自动化脚本）也能核对到底编出了哪些镜像、各多大。
+          # 整段包在 if 里，避免 set -e 把「grep 没匹配到」当成失败。
+          # 注意 grep 的模式里要有 .manifest：rootfs 清单的文件名是
+          # openwrt-<board>-<subtarget>[-profile].manifest，不一定含设备名。
+          if listing=$(cd "$out" && ls -lh . 2>/dev/null |
+                         grep -E "${DEVICE}|sha256sums|config\.buildinfo|profiles\.json|\.manifest|\.bom\.cdx\.json" |
+                         awk '{print $5"  "$9}'); then
+            while IFS= read -r line; do
+              [ -n "$line" ] || continue
+              echo "::notice title=QHora-301W 产物::$line"
+            done <<<"$listing"
+          fi
+
+          {
+            echo "## QHora-301W 构建产物（ImmortalWrt + NSS + dae）"
+            echo
+            echo '```'
+            (cd "$out" && ls -lh . | grep -E "${DEVICE}|sha256sums|config\.buildinfo|profiles\.json|\.manifest" || true)
+            echo '```'
+            echo
+            echo "- 基座：\`${IMM_REPOSITORY}@${IMM_BASE_REF}\`，提交 \`$(git -C openwrt rev-parse --short HEAD)\`"
+            echo "- NSS 补丁集：\`patches/immortalwrt-nss/\`（来源见该目录 README.md）"
+            echo "- 代理栈：dae（\`dae\` + \`luci-app-dae\`，eBPF 内核态分流；内核已开 BTF）"
+            if [[ -f "$out/config.buildinfo" ]]; then
+              echo "- NSS 固件档位：\`$(grep -m1 '^CONFIG_NSS_FIRMWARE_VERSION' "$out/config.buildinfo" || true)\`"
+            fi
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      # ── 校验功能包真的进了固件 ────────────────────────────────
+      # 配置里写 CONFIG_PACKAGE_x=y 只证明"被选中"，不证明"编出来了"。
+      # 这里从三个互相独立的角度核对：
+      #   ① 包文件（apk 后端是 .apk，opkg 后端是 .ipk）；
+      #   ② rootfs 的 .manifest —— 最终固件的包清单；
+      #   ③ 内核 vmlinux 的 .BTF 段 —— dae 的 CO-RE 前提。这一条最容易被忽略：
+      #      .config 里写了 =y 也可能被 KERNEL_DEBUG_INFO_REDUCED 挡掉，
+      #      编出来的内核照样没有 BTF，固件刷进去 dae 一启动就失败。
+      - name: 校验功能包是否真的编进固件
+        run: |
+          set -euo pipefail
+          out="openwrt/bin/targets/${TARGET}/${SUBTARGET}"
+
+          # NSS 那一组是这条线存在的理由，列在最前面。
+          # nss-tools 提供 /usr/sbin/nss-up、nss-status 与 'nss' 开机服务；
+          # luci-app-nss / luci-app-nssqos 是配套页面；nssqos 是 DSCP 标记。
+          # 缺任何一个都说明补丁集没生效。
+          NSS_WANT="nss-tools luci-app-nss nssqos luci-app-nssqos \
+                    kmod-qca-nss-drv kmod-qca-nss-ecm kmod-qca-ppe-nss \
+                    kmod-qca-nss-drv-pppoe kmod-qca-nss-drv-bridge-mgr"
+
+          # dae 那一组，逐个都是"缺了就起不来 / 分流不完整"的硬需求：
+          #   dae                      主程序（eBPF 对象编进二进制里）
+          #   luci-app-dae             设置 / 配置编辑 / 日志三个页面
+          #   dae-geoip / dae-geosite  把 v2ray 的 geo 数据软链到 /usr/share/dae/
+          #   v2ray-geoip / geosite    真正的数据文件（上面两个包的 DEPENDS）
+          #   kmod-sched-core          sch_ingress（clsact qdisc —— dae 挂程序的地方）
+          #   kmod-sched-bpf           cls_bpf + act_bpf（内核侧分流动作）
+          #   kmod-veth                dae 配方 DEPENDS 里点名
+          #   kmod-xdp-sockets-diag    DEPENDS 是 @KERNEL_XDP_SOCKETS，符号没开就不会被编
+          #
+          # 这里**故意没有** sing-box / homeproxy / kmod-nft-tproxy / dnsmasq-full：
+          # dae 不走 TPROXY、不生成 sing-box 配置、不劫持 dnsmasq，那几个都用不上。
+          WANT="msd_lite luci-app-msd_lite luci-i18n-msd_lite-zh-cn \
+                ddns-go luci-app-ddns-go luci-i18n-ddns-go-zh-cn \
+                wireguard-tools luci-proto-wireguard kmod-wireguard \
+                dae luci-app-dae luci-i18n-dae-zh-cn \
+                dae-geoip dae-geosite v2ray-geoip v2ray-geosite \
+                kmod-sched-core kmod-sched-bpf kmod-veth kmod-xdp-sockets-diag \
+                luci-app-statistics luci-i18n-statistics-zh-cn \
+                collectd-mod-thermal rrdtool1 autocore"
+
+          # ── ① 先搞清楚这个分支用的是 apk 还是 opkg ─────────────────
+          backend=$(grep -m1 -E '^CONFIG_USE_APK=' openwrt/.config 2>/dev/null || true)
+          apk_n=$(find openwrt/bin/packages -maxdepth 3 -name '*.apk' 2>/dev/null | wc -l || true)
+          ipk_n=$(find openwrt/bin/packages -maxdepth 3 -name '*.ipk' 2>/dev/null | wc -l || true)
+          echo "::notice title=包后端::${backend:-（.config 里没有 CONFIG_USE_APK，按默认 =y 走 apk）}；bin/packages 下 .apk=$apk_n 个 / .ipk=$ipk_n 个"
+
+          # ── ② rootfs 清单 ──────────────────────────────────────────
+          manifest=$(find "$out" -maxdepth 1 -name '*.manifest' -print -quit 2>/dev/null || true)
+          if [[ -n "$manifest" ]]; then
+            echo "::notice title=rootfs 清单::$(basename "$manifest") —— $(wc -l < "$manifest") 行"
+          else
+            echo "::warning::$out 下没有 .manifest，只能核对包文件"
+          fi
+
+          bad=0
+          for p in $NSS_WANT $WANT; do
+            pkg=$(find openwrt/bin/packages openwrt/bin/targets \
+                    \( -name "${p}-*.apk" -o -name "${p}_*.ipk" \) \
+                    -print -quit 2>/dev/null || true)
+
+            hit=0
+            if [[ -n "$manifest" ]] && grep -qE "^${p}[[:space:]]" "$manifest"; then hit=1; fi
+
+            if [[ -n "$pkg" && "$hit" -eq 1 ]]; then
+              echo "::notice title=功能包 OK::$p → $(basename "$pkg")，已在 rootfs 清单里"
+            elif [[ -n "$pkg" ]]; then
+              echo "::warning::$p 编出来了（$(basename "$pkg")）但不在 rootfs 清单里"
+            elif [[ "$hit" -eq 1 ]]; then
+              echo "::error::$p 在 rootfs 清单里，却找不到它的包文件"
+              bad=$((bad + 1))
+            else
+              echo "::error::$p 既没有包文件也不在 rootfs 清单里 —— 它没有被编译"
+              bad=$((bad + 1))
+            fi
+          done
+
+          [[ "$bad" -eq 0 ]] || { echo "::error::有 $bad 个要求的功能包没有被编译"; exit 1; }
+          echo "要求的功能包全部已编译并进入 rootfs"
+
+          # ── ③ 内核 BTF：dae 的 CO-RE 硬前提 ────────────────────────
+          # 只看 .config 不够。这里直接验产物：vmlinux 里必须真的存在 .BTF 段，
+          # 而且不能是个空壳（本内核实测 4-6MB，>1MB 是个安全下限）。
+          btfi=$(grep -m1 '^CONFIG_KERNEL_DEBUG_INFO_BTF=' openwrt/.config || true)
+          red=$(grep -m1 '^CONFIG_KERNEL_DEBUG_INFO_REDUCED=' openwrt/.config || true)
+          echo "::notice title=内核 BTF 配置::${btfi:-（未设置）} / ${red:-（未设置）}"
+
+          vmlinux=$(find openwrt/build_dir -path '*linux-qualcommax*' -name vmlinux -print -quit 2>/dev/null || true)
+          [[ -n "$vmlinux" ]] || { echo "::error::找不到 vmlinux，无法核对 BTF"; exit 1; }
+
+          btf_size=0
+          if objcopy -O binary --only-section=.BTF "$vmlinux" /tmp/vmlinux.btf 2>/dev/null; then
+            btf_size=$(stat -c %s /tmp/vmlinux.btf 2>/dev/null || echo 0)
+          fi
+          echo "::notice title=vmlinux .BTF 段::${btf_size} 字节"
+          if [[ "${btf_size:-0}" -lt 1048576 ]]; then
+            echo "::error::vmlinux 里没有可用的 .BTF 段（${btf_size} 字节）—— dae 加载 eBPF 时会失败"
+            echo "::error::查 configs/dae.config 的 CONFIG_KERNEL_DEBUG_INFO_BTF / _DEBUG_INFO_REDUCED"
+            exit 1
+          fi
+          echo "::notice title=BTF 就绪::内核带 ${btf_size} 字节 BTF，dae 的 CO-RE 前提成立"
+
+          # ── ④ 出厂文件真的叠进了 rootfs ───────────────────────────
+          # files-dae/ 是变体覆盖层：PROXY_STACK 写错、或目录名拼错时它会被
+          # **静默跳过**，编出来的固件看起来一样，但 dae 没有骨架配置、
+          # SSH 那个补丁也不在。所以从 sysupgrade 里把 rootfs 解出来点名核对。
+          unsq=$(find openwrt/staging_dir -name unsquashfs -perm -u+x -print -quit 2>/dev/null || true)
+          if [[ -z "$unsq" ]]; then
+            echo "::warning::找不到 host 版 unsquashfs，跳过出厂文件核对"
+          else
+            tmpd=$(mktemp -d)
+            sysup=$(find "$out" -name "*${DEVICE}*squashfs-sysupgrade.bin" -print -quit)
+            tar -xf "$sysup" -C "$tmpd"
+            # unsquashfs 在非 root 下建不了 /dev/console 节点，会返回非 0，
+            # 但文件已经解出来了 —— 所以别用返回值判断成败，直接查文件。
+            "$unsq" -q -d "$tmpd/rootfs" "$tmpd/root" >/dev/null 2>&1 || true
+            for f in usr/bin/dae etc/config/dae etc/dae/config.dae \
+                     etc/uci-defaults/97-ssh-login-fix etc/ssh/sshd_config; do
+              if [[ -e "$tmpd/rootfs/$f" ]]; then
+                echo "::notice title=出厂文件::/$f 已在 rootfs 中"
+              else
+                echo "::error::rootfs 里缺少 /$f —— files-dae 覆盖层没生效？"
+                bad=$((bad + 1))
+              fi
+            done
+            if [[ -f "$tmpd/rootfs/etc/uci-defaults/97-ssh-login-fix" ]] && \
+               [[ ! -x "$tmpd/rootfs/etc/uci-defaults/97-ssh-login-fix" ]]; then
+              echo "::error::97-ssh-login-fix 没有可执行位，首启不会被执行"
+              bad=$((bad + 1))
+            fi
+            rm -rf "$tmpd"
+            [[ "$bad" -eq 0 ]] || { echo "::error::出厂文件核对失败（$bad 项）"; exit 1; }
+            echo "::notice title=出厂文件::dae 骨架配置 + SSH 修复脚本都在，且 uci-defaults 可执行"
+          fi
+
+      - name: 上传镜像（artifact）
+        # 用 always()：即使后面某一步（比如功能包校验）失败，产物也必须传上去。
+        # 否则一旦校验报错，连固件本身都拿不到了 —— 老 homeproxy 线 run #6 就吃了
+        # 这个亏：校验误报 → 这一步被 skip → artifact 总数为 0。
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: openwrt-${{ env.DEVICE }}-imm-nss-dae-${{ github.run_number }}
+          path: |
+            openwrt/bin/targets/qualcommax/ipq807x/*qnap_301w*
+            openwrt/bin/targets/qualcommax/ipq807x/*.manifest
+            openwrt/bin/targets/qualcommax/ipq807x/sha256sums
+            openwrt/bin/targets/qualcommax/ipq807x/config.buildinfo
+            openwrt/bin/targets/qualcommax/ipq807x/profiles.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      # ── 可选：发 Release ──────────────────────────────────────
+      # 版本取自 rootfs 清单（*.manifest，每行 "<包> - <版本>"）—— 固件里**实际
+      # 装进去**的版本，比读配方文件可靠（配方版本 ≠ 最终包版本）。
+      - name: 生成 Release 说明（编译日期 / 各组件版本）
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.release == 'true'
+        run: |
+          set -uo pipefail
+          out="openwrt/bin/targets/${TARGET}/${SUBTARGET}"
+          manifest=$(find "$out" -maxdepth 1 -name '*.manifest' -print -quit 2>/dev/null || true)
+
+          # 取版本；没收录（本版没编进去）就如实写"未收录"，不编数字
+          ver_of() {
+            local v=""
+            if [[ -n "$manifest" ]]; then
+              v="$(sed -n "s/^$1[[:space:]]\+-[[:space:]]\+//p" "$manifest" | head -n1)"
+            fi
+            printf '%s' "${v:-未收录}"
+          }
+
+          DATE_UTC="$(date -u '+%Y-%m-%d %H:%M UTC')"
+          DATE_CN="$(date -u -d '+8 hours' '+%Y-%m-%d %H:%M')"
+          BASE_COMMIT="$(git -C openwrt log -1 --format='%h · %cs' 2>/dev/null || echo '?')"
+          OW_VER="$(sed -n 's/^RELEASE:=//p' openwrt/include/version.mk 2>/dev/null | head -n1)"
+
+          PKGS="dae luci-app-dae dae-geoip dae-geosite v2ray-geoip v2ray-geosite \
+                kmod-sched-core kmod-sched-bpf kmod-veth kmod-xdp-sockets-diag \
+                msd_lite luci-app-msd_lite ddns-go luci-app-ddns-go \
+                wireguard-tools luci-proto-wireguard \
+                luci-app-statistics collectd-mod-thermal rrdtool1 autocore \
+                nss-tools luci-app-nss nssqos luci-app-nssqos \
+                kmod-qca-nss-drv kmod-qca-nss-ecm kmod-qca-ppe-nss"
+
+          {
+            printf '# QHora-301W · ImmortalWrt + NSS 固件（dae 版）\n\n'
+            printf '| | |\n|---|---|\n'
+            printf '| **编译日期** | %s（北京时间 %s） |\n' "$DATE_UTC" "$DATE_CN"
+            printf '| **基座源码** | `%s` @ `%s`，提交 `%s` |\n' "$IMM_REPOSITORY" "$IMM_BASE_REF" "$BASE_COMMIT"
+            printf '| **NSS 支持** | `patches/immortalwrt-nss/`（补丁，来源见该目录 README） |\n'
+            printf '| **OpenWrt** | %s |\n' "${OW_VER:-未知}"
+            printf '| **代理栈** | dae（eBPF 内核态分流；`luci-app-dae` 管理） |\n'
+            printf '| **构建配方** | `kunude/qhora-301w-build` @ `%s`，run #%s |\n\n' "${{ github.sha }}" "${{ github.run_number }}"
+
+            printf '## 组件版本（取自固件 rootfs 清单）\n\n'
+            printf '| 组件 | 版本 |\n|---|---|\n'
+            for p in $PKGS; do printf '| `%s` | %s |\n' "$p" "$(ver_of "$p")"; done
+            printf '\n'
+            printf '> 本线的内核**已打开 BTF**（`CONFIG_DEBUG_INFO_BTF=y`，并关掉\n'
+            printf '> `DEBUG_INFO_REDUCED`）—— 这是 dae 的 CO-RE 硬前提。构建期会直接\n'
+            printf '> 从 vmlinux 里把 `.BTF` 段抓出来验大小，验不过就不出固件。\n'
+            printf '> 老五条线的内核**没有** BTF，dae 装上去也起不来，别混刷。\n\n'
+
+            cat <<'MD'
+          ## 文件
+
+          | 文件 | 用途 |
+          |---|---|
+          | `*-initramfs-uImage.itb` | **首次安装**：U-Boot 里用 TFTP 引导，再 sysupgrade |
+          | `*-squashfs-sysupgrade.bin` | 日常升级（已在跑 OpenWrt 时） |
+          | `*-squashfs-factory.bin` | eMMC 整盘写入 |
+
+          刷机前先用 `sha256sums` 校验。默认 LAN `192.168.35.1`，NSS 硬件卸载开机自启
+          （`nss-status` 查看状态）。出厂已配好分流 / DNS / 订阅开关，**只需填节点或订阅链接**。
+
+          > ⚠️ 本固件不含 passwall2，也不含 sing-box / HomeProxy：dae 在**内核态**
+          > 用 eBPF 分流，不起用户态代理进程、不劫持 dnsmasq、不需要 nft tproxy。
+          > 要 passwall2 / HomeProxy 版请用另外两条 imm 线。
+
+          ## 用之前先做两件事
+
+          1. **填节点**：LuCI → 服务 → dae → 配置，把订阅或节点链接贴进
+             `/etc/dae/config.dae` 的 `subscription {}` / `node {}` 段，
+             然后把「启用」打开（等价于 `uci set dae.config.enabled=1` 后重启服务）。
+             出厂配置是一份**没有节点、全走直连**的骨架，误启动也不会改流量走向。
+          2. **改 root 密码**：出厂 SSH 密码是 `password`（首启自动写入，
+             解决"空密码 + PermitEmptyPasswords=no ⇒ SSH 永远登不进去"）。
+             刷完第一件事就是 `passwd root`。LuCI 里加的公钥现在真的生效了
+             （`/etc/dropbear/authorized_keys` 已软链到 `/root/.ssh/authorized_keys`）。
+
+          > ⚠️ 本固件与前两条线（nss-edma fork 基座）**不是同一个基座**：内核、驱动、DTS
+          > 都来自 ImmortalWrt。刷机方式与产物结构一致，但不要在两边的固件之间来回
+          > 只刷 sysupgrade 而不看版本——基座不同，建议保留一份可回退的镜像。
+          MD
+          } > "$GITHUB_WORKSPACE/release-notes.md"
+
+          echo "已生成 release-notes.md（$(wc -l < "$GITHUB_WORKSPACE/release-notes.md") 行）"
+
+      - name: 计算 Release 标签
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.release == 'true'
+        id: tag
+        run: echo "tag=qhora-301w-imm-nss-dae-$(date -u +%Y%m%d)-${{ github.run_number }}" >>"$GITHUB_OUTPUT"
+
+      - name: 创建 Release
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.release == 'true'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: QHora-301W ImmortalWrt + NSS (dae) ${{ steps.tag.outputs.tag }}
+          draft: false
+          prerelease: false
+          body_path: release-notes.md
+          files: |
+            openwrt/bin/targets/qualcommax/ipq807x/*qnap_301w*

@@ -29,7 +29,7 @@
 # 可选：
 #   NSS_FEED         NSS feed 的 src-git 行，默认指向 edma-nss 分支
 #   GH_TOKEN         查 GitHub API 用，避免未认证限额（Actions 里默认注入）
-#   PROXY_STACK      代理栈：passwall2（默认）| homeproxy
+#   PROXY_STACK      代理栈：passwall2（默认）| homeproxy | dae
 #                    homeproxy 时额外拼接 configs/homeproxy.config（覆盖层），
 #                    并把 feed 断言换成 homeproxy 那一组；默认值下本文件
 #                    的行为与以前完全一致。传给 extra-packages.sh 的是同一个变量。
@@ -159,7 +159,8 @@ CONFIGS=(
 case "$PROXY_STACK" in
   passwall2) ;;
   homeproxy) CONFIGS+=( "$BUILDER_DIR/configs/homeproxy.config" ) ;;
-  *) die "不认识的 PROXY_STACK：$PROXY_STACK（只支持 passwall2 / homeproxy）" ;;
+  dae)       CONFIGS+=( "$BUILDER_DIR/configs/dae.config" ) ;;
+  *) die "不认识的 PROXY_STACK：$PROXY_STACK（只支持 passwall2 / homeproxy / dae）" ;;
 esac
 
 # 可选：再追加一层覆盖层（同样"后拼接者覆盖前者"）。
@@ -287,6 +288,27 @@ if [[ "$PROXY_STACK" == "homeproxy" ]]; then
       *) warn "sing-box 配方版本是 ${sb_ver:-未知}，不是 1.12.x —— HomeProxy 可能无法启动（1.13 起删除了它仍在用的 inbound 字段）" ;;
     esac
   fi
+elif [[ "$PROXY_STACK" == "dae" ]]; then
+  # ── dae 版 ────────────────────────────────────────────────
+  # dae 与 luci-app-dae 都在**基座自带 feed** 里：extra-packages.sh 的 dae 分支
+  # 一个仓库都没拉，所以这里只核对"feeds install 之后它们真的在 package/feeds/ 下"
+  # —— 少了就说明 feed 没更新到含 dae 的版本（dae 2023 年就进了 immortalwrt/packages，
+  # 真缺了通常是 imm_pkgs 被钉到了很旧的 ref）。
+  for p in luci-app-ddns-go luci-app-msd_lite luci-app-dae; do
+    [[ -e "package/feeds/luci/$p" ]] \
+      || die "package/feeds/luci/$p 不存在，引入的包没有被 feeds install 接管"
+  done
+  for p in dae v2ray-geodata; do
+    [[ -e "package/feeds/packages/$p" ]] \
+      || die "package/feeds/packages/$p 不存在（dae 本体或它依赖的 geo 数据配方缺失）"
+  done
+  # dae 是 eBPF(CO-RE) 程序：内核没有 BTF 时它**编得出来、刷得进去、跑不起来**。
+  # 这一层只能看配置，真正的证据在产物阶段（vmlinux 的 .BTF 段大小）。
+  btf_req="$(grep -c '^CONFIG_KERNEL_DEBUG_INFO_BTF=y' "${CONFIGS[@]}" 2>/dev/null | awk -F: '{s+=$2} END{print s+0}')"
+  [[ "${btf_req:-0}" -ge 1 ]] \
+    || die "配置里没有 CONFIG_KERNEL_DEBUG_INFO_BTF=y —— dae 的 CO-RE 前提不成立" \
+           "（检查 configs/dae.config 的内核段）"
+  log "dae 与 luci-app-dae 已就位；内核 BTF 已请求（产物阶段会验 vmlinux 的 .BTF 段）"
 else
   for p in luci-app-ddns-go luci-app-msd_lite luci-app-passwall2; do
     [[ -e "package/feeds/luci/$p" ]] \
@@ -377,6 +399,32 @@ fi
 # uci-defaults 里的脚本需要可执行位才会在首次启动时运行。
 if [[ -d files/etc/uci-defaults ]]; then
   chmod 0755 files/etc/uci-defaults/* 2>/dev/null || true
+fi
+
+# ── 6a. dae 覆盖层的两道断言 ───────────────────────────────────
+# files-<PROXY_STACK>/ 是"目录不存在就静默跳过"的，写错目录名不会报错，
+# 只会编出一份**没有骨架配置**的固件 —— 刷进去 dae 一启动就因为找不到
+# /etc/dae/config.dae 而失败。所以在叠加之后点名核对。
+#
+# 第二道是安全闸：dae 的配置里天生就要填订阅/节点链接，而这个仓库和固件
+# 都是公开的。骨架里只允许出现注释掉的示例，不允许出现有效的链接。
+# （注意 dns 段的 'tcp+udp://dns.google:53' 是合法内容，所以只查 http(s)://
+#   与分享链接协议头，不查任意 "://"。）
+if [[ "$PROXY_STACK" == "dae" ]]; then
+  dae_conf="files/etc/dae/config.dae"
+  [[ -f "$dae_conf" ]] || die \
+    "PROXY_STACK=dae 但覆盖层里没有 $dae_conf" \
+    "（files/ 与 files-dae/ 都没提供 dae 出厂配置，检查覆盖目录名）"
+  [[ -f files/etc/uci-defaults/97-ssh-login-fix ]] || die \
+    "PROXY_STACK=dae 但缺少 files/etc/uci-defaults/97-ssh-login-fix" \
+    "（出厂 root 密码为空 + LuCI 密钥路径不一致，删了它 SSH 就永远登不进去）"
+
+  if grep -vE '^[[:space:]]*#' "$dae_conf" |
+       grep -qE '(vless|vmess|ss|ssr|trojan|hysteria2?|tuic|anytls)://|https?://'; then
+    die "dae 出厂配置里出现了**有效**的订阅链接或分享链接（固件是公开产物）" \
+        "把值删掉、只保留注释掉的示例；真正的节点在设备上填"
+  fi
+  log "dae 出厂配置就位：无有效订阅/节点链接（骨架配置），SSH 修复脚本在"
 fi
 
 # ── 6b. HomeProxy 规则集：编译期刷新到最新版 ──────────────────
