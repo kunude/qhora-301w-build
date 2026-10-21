@@ -345,6 +345,55 @@ curl -s -o /dev/null -w '%{http_code}\n' --max-time 10 https://www.netflix.com  
 grep "sniffed=www.netflix.com" /var/log/dae/dae.log | tail -1            # outbound=stream 才对
 ```
 
+### dae 版本：每次构建都取上游最新 release
+
+feed 里的 dae 配方是**写死**的：
+
+```make
+PKG_VERSION:=2.0.0
+PKG_SOURCE_URL:=https://github.com/daeuniverse/dae/releases/download/v$(PKG_VERSION)/dae-full-src.zip?
+```
+
+也就是说「拉最新 feeds」**不等于**「编最新 dae」——2026-10-22 实测：feed 还是 `2.0.0`，
+上游已经 `2.1.1`。所以这条线在 prepare 阶段多了一步 `scripts/resolve-dae-version.sh`：
+
+```
+查 releases/latest → 拿到 tag（v2.1.1）
+  → 下载 dae-full-src.zip 到 openwrt/dl/dae-2.1.1.zip
+  → sha256 算出来写回 PKG_HASH（构建时 download 会校验这一份）
+  → 原地改 feeds/packages/net/dae/Makefile 的 PKG_VERSION / PKG_HASH / PKG_RELEASE
+  → 把结果写进 openwrt/.dae-resolved，产物校验那一步用它比对二进制里的版本串
+```
+
+为什么改 feed 那份、而不是自己复制一份配方到 `package/`：同名包会和
+`package/feeds/packages/dae` 撞车，OpenWrt 按目录扫描顺序取一个，结果不确定。
+原地改只动三行，bpf-headers / `GO_PKG_TAGS` 这些继续跟随 feed 维护者的判断。
+
+**想钉死就填 `dae_version`**（`2.1.1` 或 `v2.1.1`）：
+
+| 场景 | 行为 |
+|---|---|
+| `dae_version` 留空（含 push / 定时触发） | 查 API 拿 latest。**查不到只 warn**、沿用 feed 里的版本，不中断构建 |
+| 填了 `dae_version` | 不查 API。**版本不存在就硬失败** —— 静默编成别的版本比报错更糟 |
+
+三个必须知道的代价：
+
+- **不再可复现**。同一个 commit，这周编出 2.1.1、下个月可能编出 2.2.0。要稳定就填 `dae_version`。
+- **Go 工具链门槛**。2.1.1 的 `go.mod` 要求 `go >= 1.26.0`，feed 的 `golang/host` 是 `1.27.2`（够用）。
+  脚本会把两者打出来；将来上游跳到比 feeds 更新的 Go，编译会在十几分钟后才失败，看到这行就知道原因。
+- **`luci-app-dae` 还是 feed 版本**（界面是配置编辑器，通常能编辑旧字段；dae 新增字段要手改 `/etc/dae/config.dae`）。
+
+验证这次用的到底是哪版（三处证据）：
+
+```sh
+grep 'dae：上游最新 tag' "$GITHUB_WORKSPACE/prepare-build.log"   # 解析结果
+cat openwrt/.dae-resolved                                    # ver= / hash= / file=
+strings -a /usr/bin/dae | grep -x "$(sed -n 's/^ver=//p' openwrt/.dae-resolved)"   # 产物里真的是它
+```
+
+产物校验那一步会自动做最后这条：解析出 2.1.1 但二进制里是 2.0.0（dl 里留着旧包、
+或 BUILD_DIR 复用了上次构建）会直接判失败 —— 只看日志是查不出这种事的。
+
 ### `dae.config` 与另外两份覆盖层的关系
 
 `configs/dae.config` 是在 `homeproxy.config` 的基础上整块换掉代理栈：
@@ -451,6 +500,7 @@ patches/kernel/6.18/312-arm64-cpuinfo-Add-model-name-in-proc-cpuinfo-for-64bit-t
 | `release` | 勾上 = 编译成功后创建 Release 并把镜像挂上去；不勾 = 只出 Actions artifact |
 | `clean_build` | **勾上 = 忽略 dl 与 ccache 缓存，完全从零编译**（慢很多，单条约 3 小时以上） |
 | `ddns_go_version` / `msd_lite_sha` | 留空 = 跟随上游最新；填版本号 / sha 则钉死（要可复现固件时才填） |
+| `dae_version`（**dae 线**） | 留空 = 每次构建都用**上游最新 release**（脚本自动改 feed 配方，见第六节「dae 版本」）；填 `2.1.1` 之类则钉死 |
 | HomeProxy 版另有 `imm_ref` / `imm_luci` / `imm_pkgs` | ImmortalWrt 的 ref 与仓库地址，留空 = 官方 master |
 | HomeProxy 版另有 `singbox_expect` | 期望的 sing-box 配方版本，留空 = `1.12.25`（见第三节） |
 

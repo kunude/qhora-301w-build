@@ -309,6 +309,17 @@ elif [[ "$PROXY_STACK" == "dae" ]]; then
     || die "配置里没有 CONFIG_KERNEL_DEBUG_INFO_BTF=y —— dae 的 CO-RE 前提不成立" \
            "（检查 configs/dae.config 的内核段）"
   log "dae 与 luci-app-dae 已就位；内核 BTF 已请求（产物阶段会验 vmlinux 的 .BTF 段）"
+
+  # 把 feed 里写死的 dae 版本换成**上游最新 release**（或 DAE_VERSION 指定的版本）。
+  # 为什么要这一步：immortalwrt/packages 的 dae 是 PKG_VERSION:=2.0.0 写死的，
+  # 「拉最新 feeds」并不等于「编最新 dae」（2026-10-22 实测：feed 2.0.0 / 上游 2.1.1）。
+  # 位置很关键：必须在 feeds install 之后（改的是 package/feeds 背后那份 Makefile）、
+  # 且在建 .config 之前（版本号只影响下载与校验，不影响 PACKAGE_dae 符号）。
+  # 没指定 DAE_VERSION 时脚本只 warn 不中断 —— API 抖动不该让两小时的编译白跑。
+  log "解析 dae 上游版本（留空 DAE_VERSION = 跟随最新 release）"
+  OPENWRT_DIR="$OPENWRT_DIR" GH_TOKEN="${GH_TOKEN:-}" DAE_VERSION="${DAE_VERSION:-}" \
+    bash "$BUILDER_DIR/scripts/resolve-dae-version.sh" \
+    || die "dae 版本解析失败：DAE_VERSION=${DAE_VERSION:-（未指定）}，详见上面的输出"
 else
   for p in luci-app-ddns-go luci-app-msd_lite luci-app-passwall2; do
     [[ -e "package/feeds/luci/$p" ]] \

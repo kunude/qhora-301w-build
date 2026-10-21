@@ -92,15 +92,19 @@ on:
         required: false
         default: ""
       imm_pkgs:
-        description: "immortalwrt/packages 仓库地址（留空 = 官方；提供 dae 本体）"
+        description: "immortalwrt/packages 仓库地址（留空 = 官方）—— 只对 homeproxy 线的 sing-box 生效；本线的 dae 来自基座 feed，填了也不影响"
         required: false
         default: ""
       release:
         description: "构建成功后创建 GitHub Release 并附带镜像"
         type: boolean
         default: false
-      # 下面两个留空就跟随上游最新版本（默认行为）。
+      # 下面三个留空就跟随上游最新版本（默认行为）。
       # 想编某个确定版本、或者要可复现的固件时，在这里填死。
+      dae_version:
+        description: "钉死 dae 版本，如 2.1.1（留空 = 每次构建都用上游最新 release；注意 feed 里写死的是 2.0.0）"
+        required: false
+        default: ""
       ddns_go_version:
         description: "钉死 ddns-go 版本，如 6.17.7（留空 = 跟随上游最新 release）"
         required: false
@@ -281,6 +285,9 @@ jobs:
           # 求值为空字符串，所以那两个触发方式天然就是"跟随最新"。
           DDNS_GO_VERSION: ${{ github.event.inputs.ddns_go_version }}
           MSD_LITE_SHA: ${{ github.event.inputs.msd_lite_sha }}
+          # 留空 = 跟随上游最新 release（push / schedule 事件天然如此）。
+          # resolve-dae-version.sh 会把解析结果写回 feeds 的 dae 配方。
+          DAE_VERSION: ${{ github.event.inputs.dae_version }}
           # 本线只用 immortalwrt/luci 那四个前端（ddns-go / msd_lite /
           # luci-base / luci-mod-status）；dae 与 luci-app-dae 由 feeds 直供。
           # 全部留空 = 用 extra-packages.sh 的默认值。
@@ -708,6 +715,23 @@ jobs:
               else
                 echo "::notice title=dae 配置权限::${dae_mode}（validate 通过）"
               fi
+            fi
+            # 构建时解析出来的 dae 版本，必须真的编进了二进制。
+            # 光看日志不够：配方改了但 dl/ 里留着旧包、或 BUILD_DIR 复用了上一次的
+            # 构建产物时，日志说 2.1.1、固件里还是 2.0.0。所以从产物里直接找版本串
+            # （ldflags 写的是 cmd.Version=$(PKG_VERSION)，二进制里是一段独立字符串）。
+            if [[ -f openwrt/.dae-resolved ]]; then
+              dver=$(sed -n 's/^ver=//p' openwrt/.dae-resolved | head -1)
+              if [[ -z "$dver" ]]; then
+                echo "::warning::openwrt/.dae-resolved 里没有 ver=，跳过 dae 版本核对"
+              elif strings -a "$tmpd/rootfs/usr/bin/dae" 2>/dev/null | grep -qx "$dver"; then
+                echo "::notice title=dae 版本::产物里是 $dver（与本次解析一致）"
+              else
+                echo "::error::产物里的 dae 不是本次解析的版本 $dver —— 检查 dl/ 里是否留着旧源码包、或 BUILD_DIR 是否被复用"
+                bad=$((bad + 1))
+              fi
+            else
+              echo "::warning::没有 openwrt/.dae-resolved（版本解析那步回落了），dae 版本按 feed 里写死的来"
             fi
             # 出厂配置里不许有有效订阅/节点链接（prepare-build.sh 的第 6a 步已经查过
             # 源文件，这里再查一遍**产物**：覆盖层叠加顺序出问题时源文件和固件会不一致）
