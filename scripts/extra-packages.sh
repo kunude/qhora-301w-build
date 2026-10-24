@@ -92,7 +92,7 @@
 # ── 环境变量 ────────────────────────────────────────────────────
 #   OPENWRT_DIR     OpenWrt 源码目录（必需）
 #   BUILDER_DIR     本仓库检出目录（必需）
-#   PROXY_STACK     代理栈：passwall2（默认）| homeproxy | dae
+#   PROXY_STACK     代理栈：passwall2（默认）| homeproxy | dae | daed
 #   IMM_REF         ImmortalWrt 的分支，默认 master（luci 侧也用它）
 #   IMM_LUCI        immortalwrt/luci 仓库地址
 #   IMM_PKGS        immortalwrt/packages 仓库地址（homeproxy 版取 sing-box 用）
@@ -168,8 +168,8 @@ PW_APP_REPO="${PW_APP_REPO:-https://github.com/Openwrt-Passwall/openwrt-passwall
 PW_PKGS_REPO="${PW_PKGS_REPO:-https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git}"
 
 case "$PROXY_STACK" in
-  passwall2|homeproxy|dae) ;;
-  *) echo "不认识的 PROXY_STACK：$PROXY_STACK（只支持 passwall2 / homeproxy / dae）" >&2; exit 1 ;;
+  passwall2|homeproxy|dae|daed) ;;
+  *) echo "不认识的 PROXY_STACK：$PROXY_STACK（只支持 passwall2 / homeproxy / dae / daed）" >&2; exit 1 ;;
 esac
 
 case "$SINGBOX_MODE" in
@@ -361,6 +361,24 @@ if [[ "$PROXY_STACK" == "dae" ]]; then
   #    而且一旦哪天有人手滑把它们选中，就会和 dae 抢同一份流量。
   log "代理栈 = dae：全部来自基座官方 feed，不引入任何第三方仓库"
   ann "::notice title=dae 来源::immortalwrt/packages@${IMM_REF} + immortalwrt/luci@${IMM_REF}（官方 feed，无需外部落位）"
+elif [[ "$PROXY_STACK" == "daed" ]]; then
+  # ════════════════════════════════════════════════════════════
+  # ③-D2 代理栈 = daed：同样**一个仓库都不用拉**
+  # ════════════════════════════════════════════════════════════
+  # daed / daed-geoip / daed-geosite 在 immortalwrt/packages
+  # （feeds/packages/net/daed），luci-app-daed 在 immortalwrt/luci ——
+  # 与 dae 线一样全部来自基座官方 feed。
+  #
+  # 与 dae 线的差别只在"编什么"：dae 是单二进制 + 配置文件；daed 是
+  # dae-wing（Go 服务）+ 内嵌 Web 面板 + SQLite（/etc/daed/wing.db），
+  # 编译时还要从 daeuniverse/daed 的 release 拉一份 web.zip 打进二进制
+  # （配方里的 Download/daed-web 段），所以构建时间比 dae 更长一点。
+  #
+  # 内核前提完全相同（BTF / cls_bpf / act_bpf / XDP），不需要任何额外落位；
+  # 两个内核不能同时装（抢 clsact qdisc 上的 eBPF 程序），configs/daed.config
+  # 里已把 dae 那组符号显式置 n。
+  log "代理栈 = daed：全部来自基座官方 feed，不引入任何第三方仓库"
+  ann "::notice title=daed 来源::immortalwrt/packages@${IMM_REF} + immortalwrt/luci@${IMM_REF}（官方 feed，无需外部落位）"
 elif [[ "$PROXY_STACK" == "homeproxy" ]]; then
   # ════════════════════════════════════════════════════════════
   # ③-H 代理栈 = homeproxy：只要一个 sing-box 组件
@@ -578,6 +596,9 @@ if [[ "$PROXY_STACK" == "homeproxy" ]]; then
 elif [[ "$PROXY_STACK" == "dae" ]]; then
   log "  · ImmortalWrt 前端 luci-app-{ddns-go,msd_lite}"
   log "  · 代理核心        dae（基座官方 feed，未引入任何第三方仓库）"
+elif [[ "$PROXY_STACK" == "daed" ]]; then
+  log "  · ImmortalWrt 前端 luci-app-{ddns-go,msd_lite}"
+  log "  · 代理核心        daed（dae-wing + 内嵌面板，基座官方 feed，未引入第三方仓库）"
 else
   log "  · ImmortalWrt 前端 luci-app-{ddns-go,msd_lite}"
   log "  · passwall2       luci-app-passwall2 + ${#pw_rels[@]} 个依赖组件"

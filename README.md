@@ -409,6 +409,25 @@ common.config  →  qhora_301w.config  →  dae.config  →  imm-nss.config
 由 `feeds/packages/net/v2ray-geodata` 一个配方产出两个子包（所以 `dae.config` 里可以直接写 `=y`，
 不用像 homeproxy 那样另建目录）。
 
+## 第七条线（测试）：immortalwrt 基座 + NSS + daed
+
+`build-qhora-301w-imm-nss-daed.yml`，与第六条线只差**代理核心**：
+
+| | 第六条线（dae） | 第七条线（daed，测试） |
+|---|---|---|
+| 核心 | `dae`，单二进制 + `/etc/dae/config.dae` | `daed`，dae-wing + 内嵌面板 + SQLite（`/etc/daed/wing.db`） |
+| 界面 | LuCI 三页（状态 / 配置 / 日志） | 自带 Web 面板（默认 `:2023`）+ `luci-app-daed` 入口页 |
+| 出厂配置 | `files-dae/` 覆盖层（完整 config.dae + 节点切换脚本） | **无覆盖层**，全部用包默认值 |
+| 构建耗时 | 较短 | 较长（编译时还要拉一份 `web.zip` 打进二进制） |
+| 包来源 | 基座官方 feed | 同左（`feeds/packages/net/daed` + `feeds/luci/.../luci-app-daed`） |
+
+两条线**不能同时装**：它们抢同一个 `clsact` qdisc 上的 eBPF 程序，所以
+`configs/daed.config` 把 dae 那一组符号显式置 `n`，产物阶段还会反向确认
+manifest 里没有 `dae`。内核前提（BTF / cls_bpf / act_bpf / XDP）与 dae 线完全一致。
+
+这条线目前只有 `workflow_dispatch`（没有定时任务），用来验证 daed 能否在本机
+编出来、面板能否打开；确认可用之后再决定要不要并进出厂选择。
+
 ## 目录结构
 
 ```

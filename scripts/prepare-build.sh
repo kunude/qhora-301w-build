@@ -29,7 +29,7 @@
 # 可选：
 #   NSS_FEED         NSS feed 的 src-git 行，默认指向 edma-nss 分支
 #   GH_TOKEN         查 GitHub API 用，避免未认证限额（Actions 里默认注入）
-#   PROXY_STACK      代理栈：passwall2（默认）| homeproxy | dae
+#   PROXY_STACK      代理栈：passwall2（默认）| homeproxy | dae | daed
 #                    homeproxy 时额外拼接 configs/homeproxy.config（覆盖层），
 #                    并把 feed 断言换成 homeproxy 那一组；默认值下本文件
 #                    的行为与以前完全一致。传给 extra-packages.sh 的是同一个变量。
@@ -160,7 +160,8 @@ case "$PROXY_STACK" in
   passwall2) ;;
   homeproxy) CONFIGS+=( "$BUILDER_DIR/configs/homeproxy.config" ) ;;
   dae)       CONFIGS+=( "$BUILDER_DIR/configs/dae.config" ) ;;
-  *) die "不认识的 PROXY_STACK：$PROXY_STACK（只支持 passwall2 / homeproxy / dae）" ;;
+  daed)      CONFIGS+=( "$BUILDER_DIR/configs/daed.config" ) ;;
+  *) die "不认识的 PROXY_STACK：$PROXY_STACK（只支持 passwall2 / homeproxy / dae / daed）" ;;
 esac
 
 # 可选：再追加一层覆盖层（同样"后拼接者覆盖前者"）。
@@ -320,6 +321,27 @@ elif [[ "$PROXY_STACK" == "dae" ]]; then
   OPENWRT_DIR="$OPENWRT_DIR" GH_TOKEN="${GH_TOKEN:-}" DAE_VERSION="${DAE_VERSION:-}" \
     bash "$BUILDER_DIR/scripts/resolve-dae-version.sh" \
     || die "dae 版本解析失败：DAE_VERSION=${DAE_VERSION:-（未指定）}，详见上面的输出"
+elif [[ "$PROXY_STACK" == "daed" ]]; then
+  # ── daed 版（测试线）────────────────────────────────────────
+  # daed 与 luci-app-daed 同样来自**基座自带 feed**，extra-packages.sh 的
+  # daed 分支一个仓库都没拉，所以这里只核对 install 之后它们真的在 package/feeds/ 下。
+  #
+  # 与 dae 线的区别：daed 的内核不是单独一个 dae 包，而是 dae-wing 里嵌的；
+  # 数据包叫 daed-geoip / daed-geosite（不是 dae-geoip / dae-geosite）。
+  for p in luci-app-ddns-go luci-app-msd_lite luci-app-daed; do
+    [[ -e "package/feeds/luci/$p" ]] \
+      || die "package/feeds/luci/$p 不存在，引入的包没有被 feeds install 接管"
+  done
+  for p in daed daed-geoip daed-geosite v2ray-geodata; do
+    [[ -e "package/feeds/packages/$p" ]] \
+      || die "package/feeds/packages/$p 不存在（daed 本体 / geo 软链包 / geo 数据配方缺失）"
+  done
+  # daed 与 dae 共用 CO-RE 前提：内核没有 BTF 时它同样"编得出来、跑不起来"。
+  btf_req="$(grep -c '^CONFIG_KERNEL_DEBUG_INFO_BTF=y' "${CONFIGS[@]}" 2>/dev/null | awk -F: '{s+=$2} END{print s+0}')"
+  [[ "${btf_req:-0}" -ge 1 ]] \
+    || die "配置里没有 CONFIG_KERNEL_DEBUG_INFO_BTF=y —— daed 的 CO-RE 前提不成立" \
+           "（检查 configs/daed.config 的内核段）"
+  log "daed 与 luci-app-daed 已就位；内核 BTF 已请求（产物阶段会验 vmlinux 的 .BTF 段）"
 else
   for p in luci-app-ddns-go luci-app-msd_lite luci-app-passwall2; do
     [[ -e "package/feeds/luci/$p" ]] \
@@ -392,6 +414,7 @@ log "$cred_report"
 #                      files-passwall2/  → etc/config/passwall2
 #                      files-homeproxy/  → etc/config/homeproxy + 9 个 .srs
 #                      files-dae/        → etc/dae/config.dae + SSH 修复脚本
+#                      files-daed/       → 目前不存在（daed 测试线刻意不带预置配置）
 # 目录不存在就跳过；先叠共用、后叠变体，变体里的同名文件覆盖共用。
 overlay_variant="$BUILDER_DIR/files-$PROXY_STACK"
 for d in "$BUILDER_DIR/files" "$overlay_variant"; do
