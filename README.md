@@ -418,7 +418,7 @@ common.config  →  qhora_301w.config  →  dae.config  →  imm-nss.config
 | 核心 | `dae`，单二进制 + `/etc/dae/config.dae` | `daed`，dae-wing + 内嵌面板 + SQLite（`/etc/daed/wing.db`） |
 | 界面 | LuCI 三页（状态 / 配置 / 日志） | 自带 Web 面板（默认 `:2023`）+ `luci-app-daed` 入口页 |
 | 出厂配置 | `files-dae/` 覆盖层（完整 config.dae + 节点切换脚本） | **无覆盖层**，全部用包默认值 |
-| 构建耗时 | 较短 | 较长（编译时还要拉一份 `web.zip` 打进二进制） |
+| 构建耗时 | 较短 | **更短**（用官方预编译二进制，不编 Go、也不编前端） |
 | 包来源 | 基座官方 feed | 同左（`feeds/packages/net/daed` + `feeds/luci/.../luci-app-daed`） |
 
 两条线**不能同时装**：它们抢同一个 `clsact` qdisc 上的 eBPF 程序，所以
@@ -426,7 +426,33 @@ common.config  →  qhora_301w.config  →  dae.config  →  imm-nss.config
 manifest 里没有 `dae`。内核前提（BTF / cls_bpf / act_bpf / XDP）与 dae 线完全一致。
 
 这条线目前只有 `workflow_dispatch`（没有定时任务），用来验证 daed 能否在本机
-编出来、面板能否打开；确认可用之后再决定要不要并进出厂选择。
+跑起来、面板能否打开；确认可用之后再决定要不要并进出厂选择。
+
+### daed 用 2.1.1 的官方预编译二进制（不是源码编译）
+
+feed 里的 daed 还是 `1.27.0`；而 **2.x 起上游把仓库拆成了 pnpm workspace + `wing`
+子模块，不再发布 `web.zip`** —— 1.27 那份配方正是靠 `web.zip` 把前端塞进
+`wing/webrender/web` 再 `go:embed` 的。换到 2.x 之后：
+
+- codeload 的源码包**不含 `wing/`**（子模块），编不了；
+- 官方 `daed-full-src.zip` 有 220MB，里面**也没有 `dist/`**，前端仍要 pnpm 现编；
+- OpenWrt 构建树里没有 node/pnpm。
+
+所以这条线用官方 `daed-linux-arm64.zip`（31MB，里面是 55MB 的 aarch64
+静态链接 stripped 二进制，前端已嵌入）。`scripts/resolve-daed-version.sh` 在
+prepare 阶段下载它、算 sha256，然后用 `scripts/daed-prebuilt.mk` 重渲染
+`feeds/packages/net/daed/Makefile`（保留 feed 的 `files/daed.init` 与
+`files/daed.config`，所以监听地址、数据库路径照旧）。
+
+| 输入 | 行为 |
+|---|---|
+| `daed_version` 留空 | 默认 `2.1.1` |
+| `daed_version=2.1.0` | 钉死该版本，拿不到就硬失败 |
+| `daed_version=latest` | 查 `releases/latest`，API 失败则保留 feed 原配方（1.27.0 源码版） |
+
+产物阶段会用 `strings` 在 rootfs 的 `/usr/bin/daed` 里找 `v<版本>`，
+对不上就判失败。代价：apk 数据库里记的是这个预编译包（`2.1.1-r1`），
+不再与 feed 的 `1.27.0` 对应 —— 这也是它只能当测试线的原因之一。
 
 ## 目录结构
 

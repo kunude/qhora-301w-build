@@ -342,6 +342,17 @@ elif [[ "$PROXY_STACK" == "daed" ]]; then
     || die "配置里没有 CONFIG_KERNEL_DEBUG_INFO_BTF=y —— daed 的 CO-RE 前提不成立" \
            "（检查 configs/daed.config 的内核段）"
   log "daed 与 luci-app-daed 已就位；内核 BTF 已请求（产物阶段会验 vmlinux 的 .BTF 段）"
+
+  # 把 feed 的 daed（1.27.0，源码配方）换成**官方预编译二进制**（默认 2.1.1）。
+  # 为什么不能源码编：2.x 起上游不再发 web.zip，前端要 pnpm 现编，而构建树里没有 node。
+  # 细节见 scripts/resolve-daed-version.sh 头部；这里只负责调用。
+  # 位置：feeds install 之后（改的是 package/feeds 背后那份 Makefile），
+  #      make defconfig 之前（包元数据会重新扫一遍）。
+  log "解析 daed 版本（默认 2.1.1 预编译；DAED_VERSION=latest 跟随上游）"
+  OPENWRT_DIR="$OPENWRT_DIR" BUILDER_DIR="$BUILDER_DIR" GH_TOKEN="${GH_TOKEN:-}" \
+    DAED_VERSION="${DAED_VERSION:-2.1.1}" \
+    bash "$BUILDER_DIR/scripts/resolve-daed-version.sh" \
+    || die "daed 版本渲染失败：DAED_VERSION=${DAED_VERSION:-2.1.1}，详见上面的输出"
 else
   for p in luci-app-ddns-go luci-app-msd_lite luci-app-passwall2; do
     [[ -e "package/feeds/luci/$p" ]] \

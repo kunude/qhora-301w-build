@@ -50,6 +50,13 @@ on:
         description: "构建成功后创建 GitHub Release 并附带镜像"
         type: boolean
         default: false
+      # daed 版本：留空 = 2.1.1 的**官方预编译二进制**（aarch64 静态，内含前端）。
+      # 填 latest = 跟随上游最新 release；填 2.1.0 之类 = 钉死。
+      # 为什么是预编译：daed 2.x 不再发布 web.zip，前端要 pnpm 现编，构建树里没有 node。
+      daed_version:
+        description: "daed 版本，如 2.1.1（留空 = 默认 2.1.1 预编译；填 latest = 跟随上游最新 release）"
+        required: false
+        default: ""
       # 下面两个留空就跟随上游最新版本（默认行为）。
       # 想编某个确定版本、或者要可复现的固件时，在这里填死。
       ddns_go_version:
@@ -226,8 +233,9 @@ jobs:
           # 求值为空字符串，所以那两个触发方式天然就是"跟随最新"。
           DDNS_GO_VERSION: ${{ github.event.inputs.ddns_go_version }}
           MSD_LITE_SHA: ${{ github.event.inputs.msd_lite_sha }}
-          # 本线没有 dae 版本解析：daed 的版本由 feeds 的配方决定（PKG_VERSION:=1.27.0），
-          # 想换版本就等 feeds 跟进，或者以后再加一个 daed 版解析脚本。
+          # daed 版本：留空 = 2.1.1 预编译；resolve-daed-version.sh 会重渲染 feed 配方
+          # （feed 自带的是 1.27.0 源码版，且 2.x 源码在 OpenWrt 里编不出前端）。
+          DAED_VERSION: ${{ github.event.inputs.daed_version }}
           # 本线只用 immortalwrt/luci 那四个前端（ddns-go / msd_lite /
           # luci-base / luci-mod-status）；daed 与 luci-app-daed 由 feeds 直供。
           # 全部留空 = 用 extra-packages.sh 的默认值。
@@ -649,6 +657,19 @@ jobs:
             else
               echo "::error::rootfs 里没有 /etc/config/daed —— daed 包没有正确安装"
               bad=$((bad + 1))
+            fi
+            # 预编译版必须真的是那个版本：解析出 2.1.1、装进去却是别的（dl 里留着旧包）
+            # 这种不一致只看日志查不出来，直接从二进制里找版本串。
+            if [[ -f openwrt/.daed-resolved ]]; then
+              dver=$(sed -n 's/^ver=//p' openwrt/.daed-resolved | head -1)
+              if [[ -z "$dver" ]]; then
+                echo "::warning::openwrt/.daed-resolved 里没有 ver=，跳过 daed 版本核对"
+              elif strings -a "$tmpd/rootfs/usr/bin/daed" 2>/dev/null | grep -qx "v${dver}"; then
+                echo "::notice title=daed 版本::产物里是 v${dver}（与本次渲染一致）"
+              else
+                echo "::error::产物里的 daed 不是 v${dver} —— 检查 dl/ 里的 zip 是否是本次下载的那份"
+                bad=$((bad + 1))
+              fi
             fi
             # 反向确认：这条线不该带 dae / sing-box / homeproxy / passwall2。
             # 判据用 **manifest（已安装包清单）**，不查 /etc/config/：
