@@ -332,9 +332,15 @@ elif [[ "$PROXY_STACK" == "daed" ]]; then
     [[ -e "package/feeds/luci/$p" ]] \
       || die "package/feeds/luci/$p 不存在，引入的包没有被 feeds install 接管"
   done
-  for p in daed daed-geoip daed-geosite v2ray-geodata; do
+  for p in daed v2ray-geodata; do
     [[ -e "package/feeds/packages/$p" ]] \
-      || die "package/feeds/packages/$p 不存在（daed 本体 / geo 软链包 / geo 数据配方缺失）"
+      || die "package/feeds/packages/$p 不存在（daed 本体或 geo 数据配方缺失）"
+  done
+  # daed-geoip / daed-geosite 是**同一个 Makefile 里的子包**，不是独立目录 ——
+  # feeds install 只按目录建 symlink，所以不能按目录判断（2026-10-24 的 run 就栽在这）。
+  for sub in daed-geoip daed-geosite; do
+    grep -q "^define Package/${sub}$" "package/feeds/packages/daed/Makefile" \
+      || die "package/feeds/packages/daed/Makefile 里没有 define Package/${sub} —— 配方结构变了？"
   done
   # daed 与 dae 共用 CO-RE 前提：内核没有 BTF 时它同样"编得出来、跑不起来"。
   btf_req="$(grep -c '^CONFIG_KERNEL_DEBUG_INFO_BTF=y' "${CONFIGS[@]}" 2>/dev/null | awk -F: '{s+=$2} END{print s+0}')"
