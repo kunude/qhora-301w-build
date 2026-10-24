@@ -26,15 +26,22 @@ PKG_RELEASE:=1
 PKG_LICENSE:=AGPL-3.0-only
 PKG_MAINTAINER:=daeuniverse
 
+# 用标准下载流程（PKG_SOURCE），不用自定义 Download/ 块：
+#   · PKG_SOURCE 是 $(STAMP_PREPARED) 的依赖，download 目标会自动带上它；
+#     自定义 Download/ 只注册规则、不挂依赖，prepare 时 dl/ 里可能还是空的。
+#   · dl/ 里存成 daed-bin-<ver>.zip（版本化），避免换版本时与旧缓存撞名；
+#     远端资产名用 PKG_SOURCE_URL_FILE 指定。
+PKG_SOURCE:=daed-bin-$(PKG_VERSION).zip
+PKG_SOURCE_URL:=https://github.com/daeuniverse/daed/releases/download/v$(PKG_VERSION)
+PKG_SOURCE_URL_FILE:=daed-linux-arm64.zip
+PKG_HASH:=@HASH@
+
 PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)-bin-$(PKG_VERSION)
 
-# URL_FILE 指向真实资产名，FILE 决定 dl/ 里存成什么 —— 这样不同版本不会互相顶掉缓存。
-define Download/daed-bin
-	URL:=https://github.com/daeuniverse/daed/releases/download/v$(PKG_VERSION)
-	URL_FILE:=daed-linux-arm64.zip
-	FILE:=daed-bin-$(PKG_VERSION).zip
-	HASH:=@HASH@
-endef
+# ⚠️ 这行不能少：package.mk 才定义 BuildPackage / build 规则。
+#    少了它 $(call BuildPackage,...) 会静默展开成空 —— 包不报错、也不存在，
+#    make defconfig 只是"丢弃符号"（2026-10-25 的 run 就栽在这）。
+include $(INCLUDE_DIR)/package.mk
 
 define Package/daed/Default
   SECTION:=net
@@ -75,11 +82,10 @@ define Package/daed-geosite
   PKGARCH:=all
 endef
 
-# 没有 PKG_SOURCE（下载规则在 Download/daed-bin 里），所以不用 Build/Prepare/Default，
-# 自己把 zip 解到 PKG_BUILD_DIR；zip 里是 daed-linux-arm64/ 一层目录。
+# zip 里多一层 daed-linux-arm64/，默认解包不会 strip，所以自己解到 PKG_BUILD_DIR。
 define Build/Prepare
 	mkdir -p $(PKG_BUILD_DIR)
-	unzip -q -o $(DL_DIR)/daed-bin-$(PKG_VERSION).zip -d $(PKG_BUILD_DIR)
+	unzip -q -o $(DL_DIR)/$(PKG_SOURCE) -d $(PKG_BUILD_DIR)
 endef
 
 define Build/Compile
@@ -105,8 +111,6 @@ define Package/daed-geosite/install
 	$(INSTALL_DIR) $(1)/usr/share/daed
 	$(LN) ../v2ray/geosite.dat $(1)/usr/share/daed/geosite.dat
 endef
-
-$(eval $(call Download,daed-bin))
 
 $(eval $(call BuildPackage,daed))
 $(eval $(call BuildPackage,daed-geoip))

@@ -451,7 +451,14 @@ prepare 阶段下载它、算 sha256，然后用 `scripts/daed-prebuilt.mk` 重�
 | `daed_version=latest` | 查 `releases/latest`，API 失败则保留 feed 原配方（1.27.0 源码版） |
 
 产物阶段会用 `strings` 在 rootfs 的 `/usr/bin/daed` 里找 `v<版本>`，
-对不上就判失败。代价：apk 数据库里记的是这个预编译包（`2.1.1-r1`），
+对不上就判失败。
+
+**写这类配方有个容易踩的坑**：`include $(INCLUDE_DIR)/package.mk` 一行都不能少。
+少了它 `BuildPackage` 未定义，`$(eval $(call BuildPackage,daed))` 会**静默展开成空** ——
+不报错、不警告，包根本不存在，`make defconfig` 只会说「丢弃配置请求的符号」
+（2026-10-25 的 run 就是这么失败的：`CONFIG_PACKAGE_daed*` 三个全被丢弃）。
+`resolve-daed-version.sh` 现在会在渲染后自检这一行和三个 `BuildPackage` 调用。
+代价：apk 数据库里记的是这个预编译包（`2.1.1-r1`），
 不再与 feed 的 `1.27.0` 对应 —— 这也是它只能当测试线的原因之一。
 
 ## 目录结构

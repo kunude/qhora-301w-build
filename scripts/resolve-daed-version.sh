@@ -113,6 +113,20 @@ mv "$DAE_MAKE.tmp" "$DAE_MAKE"
 grep -qx "PKG_VERSION:=${ver}" "$DAE_MAKE" \
   || die "渲染后 PKG_VERSION 不是 ${ver}，检查模板"
 grep -q "$hash" "$DAE_MAKE" || die "渲染后 HASH 没写进去"
+if grep -qE '@[A-Z_]+@' "$DAE_MAKE"; then
+  die "渲染后还有未替换的占位符：$(grep -oE '@[A-Z_]+@' "$DAE_MAKE" | sort -u | tr '\n' ' ')"
+fi
+
+# 包必须**真的被注册**。少了 include $(INCLUDE_DIR)/package.mk 时 BuildPackage 未定义，
+# $(eval $(call BuildPackage,...)) 静默展开成空 —— 包既不报错也不存在，扫描阶段发现不了，
+# make defconfig 只会"丢弃配置请求的符号"（2026-10-25 的 run 就是这么失败的）。
+grep -qx 'include $(INCLUDE_DIR)/package.mk' "$DAE_MAKE" \
+  || die "渲染后没有 include \$(INCLUDE_DIR)/package.mk —— 包不会被注册（BuildPackage 未定义），检查模板"
+for p in daed daed-geoip daed-geosite; do
+  grep -qx "define Package/${p}" "$DAE_MAKE" || die "配方里缺 define Package/${p}"
+  grep -qF "\$(eval \$(call BuildPackage,${p}))" "$DAE_MAKE" \
+    || die "配方里缺 \$(eval \$(call BuildPackage,${p}))"
+done
 # files/ 必须还在（init 与 UCI 默认配置来自 feed，不属于本模板）
 for f in files/daed.init files/daed.config; do
   [[ -f "$DAE_PKG_DIR/$f" ]] || die "$DAE_PKG_DIR/$f 不见了 —— 上游把 init/config 挪走的话要改模板"

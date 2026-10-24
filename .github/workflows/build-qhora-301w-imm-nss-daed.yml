@@ -81,8 +81,13 @@ on:
       - ".github/workflows/build-qhora-301w-imm-nss-daed.yml"
       - "configs/daed.config"
       - "configs/imm-nss.config"
-      # ⚠️ scripts/** 故意**不**监听：共用的 prepare / extra-packages 一改，
-      #    五条线会一起进全量编译。改了脚本手动 Run workflow 即可。
+      # 这两个脚本**只属于本线**，改它们就该重跑：
+      #   resolve-daed-version.sh 决定编哪版、daed-prebuilt.mk 是配方模板。
+      - "scripts/resolve-daed-version.sh"
+      - "scripts/daed-prebuilt.mk"
+      # ⚠️ 其余 scripts/**（prepare-build.sh、extra-packages.sh 等）故意**不**监听：
+      #    它们是五条线共用的，一改就会让所有线一起进全量编译。
+      #    改了共用脚本，手动 Run workflow 即可。
   # 故意**没有** schedule：这是测试线，先手动跑通再说。
   # 等 daed 能稳定编出来、面板确认可用之后，再把 dae 线那条
   # `- cron: "0 22 * * 0"` 挪过来（两条 cron 要错开，别撞 concurrency）。
