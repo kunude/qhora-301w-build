@@ -33,7 +33,11 @@ on:
   workflow_dispatch:
     inputs:
       imm_ref:
-        description: "ImmortalWrt 基座的 ref（分支 / 标签 / commit，留空 = master）"
+        description: "ImmortalWrt 基座的 ref（分支 / 标签 / commit；留空 = 钉在 da63f7d，NSS 补丁验证过的那版）"
+        required: false
+        default: ""
+      imm_feed_ref:
+        description: "luci / packages 两个 feed 仓库的 ref（**必须是分支名**，留空 = master）。基座钉 commit 时这两个仓库里没有那个 SHA，所以不能共用 imm_ref"
         required: false
         default: ""
       release:
@@ -108,13 +112,27 @@ env:
   IMM_REPOSITORY: immortalwrt/immortalwrt
   # 用 github.event.inputs 而不是 inputs：两者在 workflow_dispatch 下等价，
   # 但前者在 push / schedule 事件下也能安全求值（返回空）。
-  # ⚠️ 暂时钉在 da63f7d（2026-10-15，NSS 补丁完整编译验证过的那一版）。
+  #
+  # ⚠️ 这里必须分成两个变量，它们属于**三个不同的仓库**：
+  #   IMM_BASE_REF = immortalwrt/immortalwrt 的 ref（checkout 基座用）
+  #                  —— 可以是分支，也可以是 commit SHA
+  #   IMM_REF      = immortalwrt/luci 与 immortalwrt/packages 的 ref
+  #                  （extra-packages.sh 稀疏检出前端 / sing-box 用）
+  #                  —— **必须是分支名**，因为 sparse_clone 用的是
+  #                     `git clone --branch <ref>`
+  # 之前这里只有一个 IMM_REF 且默认取基座的 SHA，于是脚本去
+  # `git clone --branch da63f7d... luci`，报 "Remote branch ... not found in
+  # upstream origin"，整条线在准备阶段就挂了（2026-10-25 的 run）。
+  #
+  # ⚠️ 基座暂时钉在 da63f7d（2026-10-15，NSS 补丁完整编译验证过的那一版）。
   # 原因：immortalwrt 的 2248ed7（2026-10-16 "nftables: refresh patches after
   # version bump"）动了内核模块定义，patches/immortalwrt-nss/ 这份补丁的
   # 上下文对不上（input.mk / usb.mk / ipq8074-rt-ax89x.dts / qca_ppe_main.c
   # 四处），`git apply` 与 `patch --fuzz=3` 都拒绝。
   # 补丁按新基座重新生成之后，把这里改回 'master' 即可。
-  IMM_REF: ${{ github.event.inputs.imm_ref || 'da63f7d6ac4207e534c9b92ba3d2b555a8edce8d' }}
+  IMM_BASE_REF: ${{ github.event.inputs.imm_ref || 'da63f7d6ac4207e534c9b92ba3d2b555a8edce8d' }}
+  # luci / packages 跟分支走，不跟基座那个 SHA 走。
+  IMM_REF: ${{ github.event.inputs.imm_feed_ref || 'master' }}
   # NSS 驱动 / ECM / qdisc / 固件所在的独立 feed —— 与老两条线**同一个**。
   # feed 是独立的包仓库，与"换不换基座"无关，所以这里一个字都不用改。
   # 缺了它 ATH11K_NSS_SUPPORT 的依赖不满足，连 defconfig 都会失败。
@@ -176,7 +194,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: ${{ env.IMM_REPOSITORY }}
-          ref: ${{ env.IMM_REF }}
+          ref: ${{ env.IMM_BASE_REF }}
           fetch-depth: 1
           path: openwrt
 
@@ -433,7 +451,7 @@ jobs:
             (cd "$out" && ls -lh . | grep -E "${DEVICE}|sha256sums|config\.buildinfo|profiles\.json|\.manifest" || true)
             echo '```'
             echo
-            echo "- 基座：\`${IMM_REPOSITORY}@${IMM_REF}\`，提交 \`$(git -C openwrt rev-parse --short HEAD)\`"
+            echo "- 基座：\`${IMM_REPOSITORY}@${IMM_BASE_REF}\`，提交 \`$(git -C openwrt rev-parse --short HEAD)\`"
             echo "- NSS 补丁集：\`patches/immortalwrt-nss/\`（来源见该目录 README.md）"
             if [[ -f "$out/config.buildinfo" ]]; then
               echo "- NSS 固件档位：\`$(grep -m1 '^CONFIG_NSS_FIRMWARE_VERSION' "$out/config.buildinfo" || true)\`"
@@ -571,7 +589,7 @@ jobs:
             printf '# QHora-301W · ImmortalWrt + NSS 固件（passwall2 版）\n\n'
             printf '| | |\n|---|---|\n'
             printf '| **编译日期** | %s（北京时间 %s） |\n' "$DATE_UTC" "$DATE_CN"
-            printf '| **基座源码** | `%s` @ `%s`，提交 `%s` |\n' "$IMM_REPOSITORY" "$IMM_REF" "$BASE_COMMIT"
+            printf '| **基座源码** | `%s` @ `%s`，提交 `%s` |\n' "$IMM_REPOSITORY" "$IMM_BASE_REF" "$BASE_COMMIT"
             printf '| **NSS 支持** | `patches/immortalwrt-nss/`（补丁，来源见该目录 README） |\n'
             printf '| **OpenWrt** | %s |\n' "${OW_VER:-未知}"
             printf '| **代理栈** | passwall2（`luci-app-passwall2`） |\n'
