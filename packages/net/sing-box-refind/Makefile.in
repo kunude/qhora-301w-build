@@ -26,12 +26,14 @@
 # 只给该 commit 的树（~25MB），且能进 dl/ 缓存、有 PKG_HASH 可校验。
 # 代价：换 commit 必须同时换 hash —— 这正是 resolve 脚本干的事。
 #
-# ── 构建标签：与上游 release 的 DEFAULT_BUILD_TAGS 对齐 ─────────────
+# ── 构建标签：对齐上游 release 的 DEFAULT_BUILD_TAGS（去掉 naive）─────────
 # 取自 reF1nd/sing-box@testing:release/DEFAULT_BUILD_TAGS。少了 badlinkname 会
 # 在链接期报 //go:linkname 相关错误；tfogo_checklinkname0 是 tfo-go 的
 # -checklinkname=0 配套。**故意不开 with_gvisor**：reF1nd 已把 gVisor 从默认
 # 依赖里摘掉（commit "Remove dependency on gVisor"），开着它反而要拉旧 gvisor。
 # 本线走 tproxy 入站（HomeProxy 那套），不依赖 tun 的 gvisor stack。
+# **with_naive_outbound 也去掉了**，理由见下面 GO_PKG_TAGS 上方的长注释
+# （一句话：cronet-go 的静态库是 glibc 的，musl 目标上根本编不出来）。
 #
 # ── 注意：这里不编前端 ────────────────────────────────────────────
 # sing-box 没有 Web UI，Clash API 由 HomeProxy/其他面板消费。所以不需要 node/pnpm。
@@ -58,10 +60,27 @@ PKG_BUILD_FLAGS:=no-mips16
 GO_PKG:=github.com/sagernet/sing-box
 GO_PKG_BUILD_PKG:=$(GO_PKG)/cmd/sing-box
 
-# 与上游 release/DEFAULT_BUILD_TAGS 完全一致。要裁剪体积就从这里删标签
-# （例如去掉 with_tailscale / with_openvpn / with_openconnect 各能省几 MB，
+# 与上游 release/DEFAULT_BUILD_TAGS **唯一的差别：去掉了 with_naive_outbound**。
+#
+# 为什么必须去掉（2026-10-26 实测，本地 go build 复现）：
+#   with_naive_outbound → protocol/naive → cronet-go/all → cronet-go/lib/linux_arm64
+#   而那个包的文件头是
+#       //go:build linux && !android && arm64 && !with_musl && !with_purego
+#       // #cgo LDFLAGS: -L${SRCDIR} -l:libcronet.a -ldl -lpthread -lrt -lm -lresolv
+#   即：随包的 libcronet.a 是 **glibc** 静态库，被 `!with_musl` 明确挡在 musl 之外；
+#   而当前 go.mod 钉的 cronet-go 版本里**根本没有 musl_arm64 目录**（只有 linux_arm64），
+#   所以加 with_musl 只会变成"build constraints exclude all Go files"。
+#   CGO_ENABLED=0 时同样报这一句；CGO_ENABLED=1（golang-package.mk 的默认）时
+#   能编过，最后链接会撞上一堆 glibc 专有符号（__isoc99_sscanf 之类）而失败。
+#   官方 immortalwrt/packages 的配方也把这一项做成 CONFIG_SING_BOX_BUILD_NAIVE_OUTBOUND
+#   默认关、且额外 TARGET_LDFLAGS += -lcronet（要一个独立的 libcronet 动态库）。
+#   → OpenWrt 这个 musl 目标上 naive 出站编不出来，只能不要。
+#   用户若在配置里选了 naive，sing-box 会明确报 "naive is not included in this build"。
+#
+# 其余标签与上游 release/DEFAULT_BUILD_TAGS 逐字一致。要裁剪体积就继续从
+# 这里删（例如去掉 with_tailscale / with_openvpn / with_openconnect 各能省几 MB，
 #  但 HomeProxy 里若配了对应协议就会在 check 阶段报"tag 未编入"）。
-GO_PKG_TAGS:=with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,with_cloudflared,with_naive_outbound,with_usbip,with_openvpn,with_openconnect,badlinkname,tfogo_checklinkname0
+GO_PKG_TAGS:=with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,with_cloudflared,with_usbip,with_openvpn,with_openconnect,badlinkname,tfogo_checklinkname0
 
 # 写法与上游 immortalwrt/packages 逐字对齐：
 #   GO_PKG_LDFLAGS    链接器开关（-checklinkname=0）

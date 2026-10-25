@@ -608,11 +608,24 @@ Google 打不开、`api.ip.sb` 显示的是家里的 IP。这时 `/etc/init.d/da
 多出一个 `net/sing-box-refind` 目录就会和 feed 的 `net/sing-box` 变成两个同名包，
 `feeds install` 直接冲突。改成 `.in` 之后 `find -name Makefile` 扫不到它。
 
-构建标签与 reF1nd 的 `release/DEFAULT_BUILD_TAGS` 逐字一致：
+构建标签与 reF1nd 的 `release/DEFAULT_BUILD_TAGS` 只差一个：
 `with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,`
-`with_ccm,with_ocm,with_cloudflared,with_naive_outbound,with_usbip,with_openvpn,`
+`with_ccm,with_ocm,with_cloudflared,with_usbip,with_openvpn,`
 `with_openconnect,badlinkname,tfogo_checklinkname0`。
-**故意不开 `with_gvisor`** —— reF1nd 已经把 gVisor 从默认依赖里摘掉。
+两处故意不编：
+
+- **`with_gvisor`** —— reF1nd 已经把 gVisor 从默认依赖里摘掉；本线走 tproxy 入站，
+  用不到 tun 的 gvisor stack。
+- **`with_naive_outbound`** —— musl 目标上编不出来。它拉进来的
+  `cronet-go/lib/linux_arm64` 文件头写着
+  `//go:build linux && !android && arm64 && !with_musl && !with_purego`，
+  随包的 `libcronet.a` 是 **glibc** 静态库；而当前 go.mod 钉的 cronet-go 里
+  根本没有 `musl_arm64`。于是：`CGO_ENABLED=0` 报
+  `build constraints exclude all Go files`；`CGO_ENABLED=1`（OpenWrt 默认）
+  能编过、链接时撞一堆 glibc 专有符号。官方 `immortalwrt/packages` 的配方也把
+  这项做成默认关的 `CONFIG_SING_BOX_BUILD_NAIVE_OUTBOUND`，并额外
+  `TARGET_LDFLAGS += -lcronet`。留着的话，配置里选 naive 会明确报
+  `naive is not included in this build`。
 
 ### 版本号怎么读
 

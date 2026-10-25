@@ -149,6 +149,12 @@ jobs:
           grep -nE '^PKG_NAME|^PKG_VERSION|^PKG_SOURCE|^PKG_HASH|^GO_PKG_TAGS|^GO_PKG_LDFLAGS|^PKG_BUILD_DEPENDS' "$m"
           grep -q '^PKG_SOURCE:=sing-box-refind-' "$m" ||
             { echo "::error::$m 不是本仓库的源码配方（PKG_SOURCE 不是 sing-box-refind-*）"; exit 1; }
+          # with_naive_outbound 会把 cronet-go（glibc 静态库）拉进来，musl 目标上
+          # 必然编不过 —— 2026-10-25 两轮整机编译就死在这。见配方里的长注释。
+          if grep -q 'with_naive_outbound' "$m"; then
+            echo "::error::GO_PKG_TAGS 含 with_naive_outbound，musl 目标编不出来"
+            exit 1
+          fi
 
       # ── 为什么必须先编一遍宿主机工具 ─────────────────────────────────────
       # `make package/<x>/compile` **不会**替你跑 tools 阶段。2026-10-25 那次

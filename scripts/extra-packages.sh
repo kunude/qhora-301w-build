@@ -404,6 +404,19 @@ place_singbox_from_source() {
 	grep -q 'codeload\.github\.com/reF1nd/sing-box' feeds/packages/net/sing-box/Makefile \
 		|| die "渲染出的配方没有指向 reF1nd/sing-box（模板被改坏了？）"
 
+	# 硬断言：⚠️ 别把 with_naive_outbound 加回来。它拉进的 cronet-go 静态库是
+	# glibc 的（文件头 `//go:build linux && !android && arm64 && !with_musl ...`），
+	# 而当前 go.mod 钉的 cronet-go 里没有 musl_arm64 → musl 目标上必然失败：
+	#   CGO_ENABLED=0 → build constraints exclude all Go files
+	#   CGO_ENABLED=1 → 链接期一堆 glibc 专有符号未定义
+	# 2026-10-25 那两轮整机编译就是死在这上面（报错被 subdir.mk 吞进
+	# logs/package/.../compile.txt，控制台只剩一句 failed to build）。
+	if grep -q 'with_naive_outbound' feeds/packages/net/sing-box/Makefile; then
+		die "配方里的 GO_PKG_TAGS 含 with_naive_outbound —— musl 目标编不出来。
+      cronet-go 的 libcronet.a 是 glibc 静态库，且该版本没有 musl_arm64 目录。
+      详见 packages/net/sing-box-refind/Makefile.in 里 GO_PKG_TAGS 上方的注释。"
+	fi
+
 	# HomeProxy 的生成器必须已是 1.13+ 写法。reF1nd/testing 是 1.14.x-dev，
 	# legacy inbound 字段（sniff / sniff_override_destination = true）会直接 FATAL。
 	if [[ "$check_homeproxy" == "1" ]]; then
