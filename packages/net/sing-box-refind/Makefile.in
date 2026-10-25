@@ -48,6 +48,21 @@ PKG_SOURCE:=sing-box-refind-@SHA@.tar.gz
 PKG_SOURCE_URL:=https://codeload.github.com/reF1nd/sing-box/tar.gz/@SHA@?
 PKG_HASH:=@HASH@
 
+# ── 解包：codeload 的 tar.gz 顶层多一层目录 ─────────────────────────
+# `https://codeload.github.com/<owner>/<repo>/tar.gz/<sha>` 出来的树是
+#   sing-box-<sha>/go.mod
+#   sing-box-<sha>/cmd/sing-box/...
+# 而 OpenWrt 默认的 PKG_UNPACK 只是 `tar -C $(PKG_BUILD_DIR)`，不剥顶层 ——
+# 结果 $(PKG_BUILD_DIR) 下变成 sing-box-<sha>/go.mod，模块根不在 PKG_BUILD_DIR，
+# golang-package.mk 直接报：
+#   no required module provides package github.com/sagernet/sing-box/cmd/sing-box:
+#   go.mod file not found in current directory or any parent directory
+# （2026-10-26 那轮整机编译就死在这，见 run 40221304087）
+# → 用 --strip-components=1 把那一层剥掉，让 PKG_BUILD_DIR 就是模块根。
+# PKG_UNPACK 必须用 `=`（延迟展开）：$(TAR) 由 package.mk / tools 定义。
+PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)-$(PKG_VERSION)
+PKG_UNPACK=$(TAR) -xzf "$(DL_DIR)/$(PKG_SOURCE)" --strip-components=1 -C $(PKG_BUILD_DIR)
+
 PKG_LICENSE:=GPL-3.0-or-later
 PKG_LICENSE_FILES:=LICENSE
 PKG_MAINTAINER:=reF1nd <https://github.com/reF1nd/sing-box>
