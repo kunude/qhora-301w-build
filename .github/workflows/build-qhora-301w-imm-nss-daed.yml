@@ -658,9 +658,12 @@ jobs:
             # wing.db 是**出厂配置本体**，必须打进固件：daed 2.x 没有配置文件，
             # global / dns / routing / 分组全在这个 SQLite 库里。上一段只核对了
             # 文件存在（压坏的空壳也能过），这里用构建期同一个脚本验内容。
+            # 路径必须走 $BUILDER_DIR：本仓库是 checkout 到 builder/ 子目录的，
+            # 默认工作目录是 workspace 根，写 `scripts/...` 会 No such file or directory
+            # （2026-10-25 就是这么挂的：产镜像没问题，最后一步校验挂掉）。
             wingdb="$tmpd/rootfs/etc/daed/wing.db"
             if [[ -f "$wingdb" ]]; then
-              if python3 scripts/check-daed-wingdb.py "$wingdb"; then
+              if python3 "$BUILDER_DIR/scripts/check-daed-wingdb.py" "$wingdb"; then
                 echo "::notice title=daed 出厂配置::wing.db 就位（三段配置 selected + proxy 组 + 1 个管理员）"
               else
                 echo "::error::固件里的 wing.db 内容不对（上面每行 [x] 都是具体判据）"
