@@ -1,0 +1,61 @@
+global {
+    tproxy_port: 12345
+    tproxy_port_protect: true
+    log_level: info
+
+    # ── 接口 ────────────────────────────────────────────────────────────
+    # lan_interface 是**必须**的：不写它，dae 只在 WAN 侧生效，
+    # LAN 里所有设备（手机/电脑/TV）的流量根本进不了 eBPF 分流。
+    # 本机型 LAN 桥是 br-lan（交换机 + 两个 WiFi AP 都在里面）。
+    #
+    # 访客网络、以及 WireGuard/ZeroTier 这类**隧道的服务端接口**，也必须加进来：
+    # 从隧道进来的流量（在外面连回家、再从家里出去上网）只有落在 lan_interface
+    # 上才会进 eBPF，否则表现为"内网能访问、代理完全不生效"。
+    # 名字要和 `ip link` 里的一模一样，逗号分隔：
+    #   lan_interface: br-lan, br-guest, wg0
+    #
+    # 注意：写进来的接口必须一直存在。删掉/改名之后 dae 会因为绑不上而启动失败，
+    # 那时不是"少代理一个网段"，而是**整个代理都不工作**。
+    lan_interface: br-lan
+
+    # auto = 自动认 WAN（本机型是 wan / pppoe-wan，auto 都能认）
+    wan_interface: auto
+
+    # 自己把 ip_forward / rp_filter 之类调到正确值
+    auto_config_kernel_parameter: true
+
+    # ── 节点健康检查 ────────────────────────────────────────────────────
+    # 组内选点的依据就是这里测出来的延迟。30s 一轮，够快也不费流量。
+    tcp_check_url: 'http://cp.cloudflare.com,1.1.1.1'
+    tcp_check_http_method: HEAD
+    udp_check_dns: 'dns.google:53,8.8.8.8'
+    check_interval: 30s
+    # 新节点要快 50ms 以上才抢走流量，避免来回抖动
+    check_tolerance: 50ms
+
+    # ── 拨号方式 ────────────────────────────────────────────────────────
+    # domain++：把嗅探到的域名交给节点侧解析，并且**按嗅探到的域名做路由**。
+    #
+    # 为什么不用 domain：`domain` 模式下路由在嗅探之前就按 IP 做完了，域名规则
+    # 能否命中取决于"DNS 查询有没有穿过 dae"。而 LAN 里 dnsmasq 有缓存，
+    # 命中缓存时 DNS 根本不发出去，dae 就没有 domain→IP 映射 ⇒
+    # geosite 里的域名规则时灵时不灵（实测：同一台机器上有时命中域名规则，
+    # 有时全部落回 fallback 按 IP 走）。
+    # domain++ 会在嗅探后强制按域名重路由，代价是每连接多一点 CPU。
+    dial_mode: domain++
+    allow_insecure: false
+    # 30ms 在这台机器上抓不到 ClientHello（实测 sniffed 全是空），
+    # 300ms 后 netflix / youtube 的 SNI 都能稳定抓到。
+    sniffing_timeout: 300ms
+
+    # utls + chrome_auto：Client Hello 伪装成 Chrome，对纯 TLS 的节点更稳
+    tls_implementation: utls
+    utls_imitate: chrome_auto
+
+    # 启动早期拉订阅时 dae 自己的 DNS 还没起来，先借阿里 DNS
+    bootstrap_resolver: '223.5.5.5:53'
+
+    # Hysteria2 这类协议靠带宽信息调拥塞窗口，填上更稳
+    bandwidth_max_tx: '200 mbps'
+    bandwidth_max_rx: '1 gbps'
+}

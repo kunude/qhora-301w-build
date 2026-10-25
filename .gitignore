@@ -10,3 +10,7 @@
 *.itb
 *.tar.zst
 !configs/**
+
+# daed 的出厂数据库：构建时由 scripts/gen-daed-wingdb.py 从 configs/daed/*.dae
+# 编译出来（里面有管理员口令哈希和每次构建都新的 jwt_secret），只在本地产出，不入库
+files-daed/etc/daed/wing.db

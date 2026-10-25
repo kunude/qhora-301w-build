@@ -14,6 +14,10 @@
 #   5. 扫描出厂预置（files*/etc/config/），命中节点凭据 / 订阅链接就中断构建
 #      —— 固件是公开产物，凭据进来就等于公开
 #   6. 叠加 files/ 覆盖文件，再叠一层 files-<PROXY_STACK>/（变体专属）
+#   6a.（仅 PROXY_STACK=daed）先用 scripts/gen-daed-wingdb.py 把
+#      configs/daed/{global,dns,routing}.dae 编译成 /etc/daed/wing.db
+#      —— daed 2.x 没有配置文件，默认配置就是那个 SQLite 文件本身。
+#      产物直接落进覆盖层，刷完机 daed 一起来就是配好的状态。
 #   6b.（仅 PROXY_STACK=homeproxy）先断言出厂配置确实走"本地规则集"这条路
 #      （routing_mode=custom 且 ruleset 全是 type=local），再把 9 个 .srs
 #      规则集刷成上游最新版并放进覆盖层 —— 固件里这些 ruleset 是
@@ -431,8 +435,29 @@ log "$cred_report"
 #                      files-passwall2/  → etc/config/passwall2
 #                      files-homeproxy/  → etc/config/homeproxy + 9 个 .srs
 #                      files-dae/        → etc/dae/config.dae + SSH 修复脚本
-#                      files-daed/       → 目前不存在（daed 测试线刻意不带预置配置）
+#                      files-daed/       → etc/daed/wing.db（构建时生成，见 6a）
 # 目录不存在就跳过；先叠共用、后叠变体，变体里的同名文件覆盖共用。
+# ── 6-0. daed 线的出厂数据库（必须在叠加覆盖层之前生成）────────────
+# daed 2.x 把 global / dns / routing / 分组全存在 <config-dir>/wing.db
+# （SQLite）里，没有"配置文件"这回事（见 dae-wing 的 db/db.go：文件名写死
+# wing.db）。所以"默认配置"只能是这个 .db 本身 —— 构建期由
+# scripts/gen-daed-wingdb.py 从 configs/daed/*.dae 编译出来，直接落进
+# files-daed/etc/daed/，跟覆盖层一起进固件。刷完机 daed 一起来就已经是
+# 配好的三段配置 + 单个 proxy 组，设备上不需要跑任何脚本。
+#
+# 管理员口令取 DAED_ADMIN_PASS，缺省值写在脚本里（仓库公开 ⇒ 首登请改）。
+# 产物在 .gitignore 里：它是构建产物，每次构建重新生成（jwt_secret 也随之换新）。
+if [[ "$PROXY_STACK" == "daed" ]]; then
+  command -v python3 >/dev/null 2>&1 || die \
+    "PROXY_STACK=daed 需要 python3 来编译 wing.db（GitHub runner 自带；本地装一个）"
+  mkdir -p "$BUILDER_DIR/files-daed/etc/daed"
+  log "编译 daed 出厂数据库：files-daed/etc/daed/wing.db"
+  python3 "$BUILDER_DIR/scripts/gen-daed-wingdb.py" \
+    --out "$BUILDER_DIR/files-daed/etc/daed/wing.db" \
+    --src "$BUILDER_DIR/configs/daed" \
+    || die "wing.db 生成失败（configs/daed/ 下的三段配置结构不对，见上面的输出）"
+fi
+
 overlay_variant="$BUILDER_DIR/files-$PROXY_STACK"
 for d in "$BUILDER_DIR/files" "$overlay_variant"; do
   [[ -d "$d" ]] || continue
@@ -496,6 +521,27 @@ if [[ "$PROXY_STACK" == "dae" ]]; then
         "把值删掉、只保留注释掉的示例；真正的节点在设备上填"
   fi
   log "dae 出厂配置就位：无有效订阅/节点链接（订阅留空，实测该配置能通过 dae validate）"
+fi
+
+# ── 6a-2. daed 覆盖层：wing.db 的形状与内容 ──────────────────────
+# 生成动作在 6-0（必须早于覆盖层拷贝）。这里只做事后核对，判据全部写在
+# scripts/check-daed-wingdb.py 里 —— 产物阶段从镜像里解包出来的那份用的
+# 是同一个脚本，两处不会各写一套然后慢慢走样：
+#   ① 三段配置各一条、selected=1，而且是**完整块**（daed 存的是
+#      "dns {\n...\n}"，少一层大括号就会在 dae.ParseConfig 里解析失败）；
+#   ② proxy 组在、策略不是 fixed（fixed 只容得下一个节点）；
+#   ③ 恰好一个管理员（没有就进不了面板）；
+#   ④ 安全闸：库里不许有订阅/分享链接（固件是公开产物）。
+if [[ "$PROXY_STACK" == "daed" ]]; then
+  db="files/etc/daed/wing.db"
+  [[ -f "$db" ]] || die \
+    "PROXY_STACK=daed 但覆盖层里没有 $db" \
+    "（files-daed/ 没被叠加？或 6-0 的 wing.db 编译被跳过）"
+  [[ "$(head -c 15 "$db")" == "SQLite format 3" ]] || die "$db 不是合法的 SQLite 文件"
+  python3 "$BUILDER_DIR/scripts/check-daed-wingdb.py" "$db" \
+    || die "wing.db 内容不对（上面每条 [x] 都是具体的判据，见 scripts/check-daed-wingdb.py）"
+  # 里面有管理员口令哈希：别让它在镜像里 world-readable。
+  chmod 0600 "$db" 2>/dev/null || true
 fi
 
 # ── 6b. HomeProxy 规则集：编译期刷新到最新版 ──────────────────

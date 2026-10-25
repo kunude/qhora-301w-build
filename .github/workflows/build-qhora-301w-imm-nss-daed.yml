@@ -19,8 +19,11 @@ name: Build QHora-301W (ImmortalWrt + NSS + daed)
 #   · 这条线是**测试线**：先确认能编、能跑、面板能开，再谈并进出厂选择。
 #
 # ── 本线刻意不做的事 ───────────────────────────────────────────
-#   · 不预置 /etc/config/daed 覆盖文件（没有 files-daed/），全部用包默认值；
-#     首启由 daed.init 建库，LuCI 里点几下就能用。
+#   · 不预置 /etc/config/daed（那是 UCI 外壳，包自带默认值就够了）；
+#     真正的出厂配置是 /etc/daed/wing.db —— daed 2.x 没有配置文件，三段
+#     配置和分组全在这个 SQLite 库里。它由 scripts/gen-daed-wingdb.py 在
+#     构建时从 configs/daed/*.dae 编译出来，跟着覆盖层进固件。刷完机 daed
+#     一起来就是配好的状态，设备上不用跑任何脚本。
 #   · 不装 dae（configs/daed.config 里显式 =n，产物阶段还会反向确认）。
 #   · 不带 dae 线那两个专属脚本（dae-switch / dae-geo-update）。
 #
@@ -596,9 +599,10 @@ jobs:
           echo "::notice title=BTF 就绪::内核带 ${btf_size} 字节 BTF，daed 的 CO-RE 前提成立"
 
           # ── ④ rootfs 里真的有 daed 那一套 ─────────────────────────
-          # 本测试线**不叠加** files-daed/ 覆盖层（刻意不带预置配置），所以这里
-          # 核对的是包自己装进去的文件：主程序、UCI 配置、init、geo 软链、
-          # LuCI 菜单与 ACL。少任何一个都说明 daed 没被正确安装。
+          # 这里核对两类文件：① 包自己装进去的（主程序、UCI 配置、init、
+          # geo 软链、LuCI 菜单与 ACL）；② files-daed/ 覆盖层带来的出厂
+          # 配置 /etc/daed/wing.db（构建时编译出来的那一段）。
+          # 少任何一个都说明 daed 没装对、或者覆盖层没叠上。
           #
           # 注意 host 工具名叫 **unsquashfs4**（不是 unsquashfs）——
           # OpenWrt 的 squashfs-tools 配方产出的二进制带 4 后缀，
@@ -637,7 +641,8 @@ jobs:
                      usr/share/daed/geoip.dat usr/share/daed/geosite.dat \
                      usr/share/luci/menu.d/luci-app-daed.json \
                      usr/share/rpcd/acl.d/luci-app-daed.json \
-                     etc/ssh/sshd_config; do
+                     etc/ssh/sshd_config \
+                     etc/daed/wing.db; do
               # geoip.dat / geosite.dat 是软链（daed-geoip -> ../v2ray/...），
               # 用 -e 会跟随软链判断，软链断了就误报，所以 -L 也算存在
               if [[ -e "$tmpd/rootfs/$f" || -L "$tmpd/rootfs/$f" ]]; then
@@ -647,13 +652,24 @@ jobs:
                 bad=$((bad + 1))
               fi
             done
-            # daed 线没有变体 uci-defaults（files-daed/ 这个测试线不带覆盖层），
-            # 那两个 97/98 脚本是 daed 线专属，这里不检查。
-            if [[ -f "$tmpd/rootfs/etc/daed/wing.db" ]]; then
-              # wing.db 是 daed 运行期自己建的 SQLite 库（配方列在 conffiles 里）。
-              # 镜像里出现它说明构建机上有残留，或数据库被打进了固件 —— 两种都不对。
-              echo "::error::rootfs 里出现了 /etc/daed/wing.db —— 数据库不该被打进固件"
-              bad=$((bad + 1))
+            # 97/98 那两个 uci-defaults 是 dae 线专属（SSH 修复 / config.dae
+            # 权限），daed 线不带，这里也不查。
+            #
+            # wing.db 是**出厂配置本体**，必须打进固件：daed 2.x 没有配置文件，
+            # global / dns / routing / 分组全在这个 SQLite 库里。上一段只核对了
+            # 文件存在（压坏的空壳也能过），这里用构建期同一个脚本验内容。
+            wingdb="$tmpd/rootfs/etc/daed/wing.db"
+            if [[ -f "$wingdb" ]]; then
+              if python3 scripts/check-daed-wingdb.py "$wingdb"; then
+                echo "::notice title=daed 出厂配置::wing.db 就位（三段配置 selected + proxy 组 + 1 个管理员）"
+              else
+                echo "::error::固件里的 wing.db 内容不对（上面每行 [x] 都是具体判据）"
+                bad=$((bad + 1))
+              fi
+              # 里面有管理员口令哈希：镜像里若 world-readable，拿到固件的人
+              # 就能直接拿走哈希去爆破。
+              perm=$(stat -c '%a' "$wingdb" 2>/dev/null || stat -f '%Lp' "$wingdb" 2>/dev/null || echo '?')
+              echo "::notice title=wing.db 权限::$perm"
             fi
             # daed 的配置是 UCI（/etc/config/daed）+ 运行期数据库，没有 config.daed，
             # 所以没有 0600 权限那个坑。这里只确认配置文件在（包自带默认值）。
@@ -792,18 +808,23 @@ jobs:
           > 用 eBPF 分流，不起用户态代理进程、不劫持 dnsmasq、不需要 nft tproxy。
           > 要 passwall2 / HomeProxy 版请用另外两条 imm 线。
 
-          ## 用之前先做两件事
+          ## 用之前先做三件事
 
-          1. **配节点 / 订阅**：本线是**测试线，不带任何出厂配置**（没有 files-daed 覆盖层）。
-             刷完先开 `http://192.168.35.1:2023`（daed 自带面板，端口以
-             `/etc/config/daed` 里的 `listen` 为准），在面板里加机场订阅或节点；
-             也可以走 LuCI → 服务 → daed 改 `/etc/config/daed`。
-             ⚠️ 跟 dae 线不是一回事：daed 用 UCI + SQLite（`/etc/daed/wing.db`）存状态，
-             没有 `/etc/dae/config.dae` 那个文件。
-          2. **改 root 密码**：出厂 SSH 密码是 `password`（首启自动写入，
+          1. **登录面板**：`http://192.168.35.1:2023`（端口以 `/etc/config/daed` 的
+             `listen` 为准），账号 `admin`，口令见构建时传入的 `DAED_ADMIN_PASS`
+             （没传就是仓库脚本里的默认值）。**首登请改口令。**
+          2. **加订阅**：面板里填机场订阅链接，拉出节点后把订阅（或节点）加进
+             那个唯一的 `proxy` 组，然后点「启动」。
+             出厂已经配好 global / dns / routing 三段（`domain++`、`br-lan`、
+             CN 直连、广告拦截、禁 QUIC、其余走 `proxy`），不用再动。
+          3. **改 root 密码**：出厂 SSH 密码是 `password`（首启自动写入，
              解决"空密码 + PermitEmptyPasswords=no ⇒ SSH 永远登不进去"）。
              刷完第一件事就是 `passwd root`。LuCI 里加的公钥现在真的生效了
              （`/etc/dropbear/authorized_keys` 已软链到 `/root/.ssh/authorized_keys`）。
+
+          > 💡 连回家（WireGuard 服务端）要走代理的话，得在面板的 global 里把隧道
+          > 那张网卡加进 `lan_interface`（`br-lan, <隧道网卡>`）——只有列进去的接口
+          > 流量才进 eBPF；反过来，写进去的接口必须一直存在，删了 daed 会起不来。
 
           > ⚠️ 本固件与前两条线（nss-edma fork 基座）**不是同一个基座**：内核、驱动、DTS
           > 都来自 ImmortalWrt。刷机方式与产物结构一致，但不要在两边的固件之间来回

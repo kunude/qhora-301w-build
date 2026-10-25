@@ -417,7 +417,7 @@ common.config  →  qhora_301w.config  →  dae.config  →  imm-nss.config
 |---|---|---|
 | 核心 | `dae`，单二进制 + `/etc/dae/config.dae` | `daed`，dae-wing + 内嵌面板 + SQLite（`/etc/daed/wing.db`） |
 | 界面 | LuCI 三页（状态 / 配置 / 日志） | 自带 Web 面板（默认 `:2023`）+ `luci-app-daed` 入口页 |
-| 出厂配置 | `files-dae/` 覆盖层（完整 config.dae + 节点切换脚本） | **无覆盖层**，全部用包默认值 |
+| 出厂配置 | `files-dae/` 覆盖层（完整 config.dae + 节点切换脚本） | 构建期编译的 `wing.db`（三段配置 + `proxy` 组，见下） |
 | 构建耗时 | 较短 | **更短**（用官方预编译二进制，不编 Go、也不编前端） |
 | 包来源 | 基座官方 feed | 同左（`feeds/packages/net/daed` + `feeds/luci/.../luci-app-daed`） |
 
@@ -461,6 +461,64 @@ prepare 阶段下载它、算 sha256，然后用 `scripts/daed-prebuilt.mk` 重�
 代价：apk 数据库里记的是这个预编译包（`2.1.1-r1`），
 不再与 feed 的 `1.27.0` 对应 —— 这也是它只能当测试线的原因之一。
 
+### 出厂预置：`wing.db` 直接编进固件，刷完就能用
+
+daed 2.x **没有配置文件**：`global` / `dns` / `routing` 三段文本、分组、订阅
+全在 `/etc/daed/wing.db`（SQLite）里。所以"默认配置"只能是这个库本身 ——
+面板里点出来的默认值是 `lanInterface: []`，等于**代理完全不生效**（实测踩过：
+`dae.running=true` 了，LAN 流量根本没进 eBPF）。
+
+做法是构建期把它编译出来，跟着覆盖层进固件：
+
+```
+configs/daed/global.dae   ┐
+configs/daed/dns.dae      ├─ scripts/gen-daed-wingdb.py ─→ files-daed/etc/daed/wing.db
+configs/daed/routing.dae  ┘                                    ↓ 覆盖层
+                                                        固件 /etc/daed/wing.db
+```
+
+刷完机 daed 一起来就是配好的：三段配置各一条且 `selected=1`、单个 `proxy` 组
+（`min_moving_avg`）、一个管理员。设备上**不需要跑任何脚本**。
+
+**两个必须知道的细节**（都是实测踩出来的，改这个脚本前先读）：
+
+1. **表结构不能自己猜**。表名是 `dns` 不是 `dnss`（gorm 认为 dns 不可数）；
+   主键是 `id integer` + 表级 `PRIMARY KEY (id)`，**没有 AUTOINCREMENT**。
+   自己写成 `integer PRIMARY KEY AUTOINCREMENT` 时列定义与 gorm 的期望不一致，
+   启动时 AutoMigrate 会走 AlterColumn 重建表，而 glebarez/sqlite 在"列名与
+   表名同名"（`dns.dns`）时把重建语句拼错：
+   `SQL logic error: no such column: dns__temp` → `Failed to init db` → daed 起不来。
+   所以脚本里的 DDL 是从 `daed run --api-only` 的空库**原样 dump 的 10 张表**，
+   AutoMigrate 一个字段都不用动。
+2. **`running` 不预置成 1**。`Run()` 要求每个被 routing 引用的组至少有一个节点
+   （`please add at least one node into group`），出厂时还没有订阅；强行 true
+   只会在开机日志里留一条失败。填完订阅再点启动。
+
+`lan_interface` 出厂只有 `br-lan`：**只有列进去的接口，流量才进 eBPF**。
+连回家（WireGuard 服务端）要把隧道那张网卡加进去，否则表现为"内网能访问、
+代理完全不生效"；反过来，写进去的接口必须一直存在，删了或改名之后 dae 绑不上，
+整个代理都起不来 —— 所以出厂不带它，用到时在面板里加。
+
+**刷完机三步：**
+
+1. 打开 `http://<路由器>:2023`，用 `admin` + 默认口令登录，**首登请改口令**；
+2. 「订阅」里填订阅链接，刷新出节点；
+3. 把订阅（或节点）加进 `proxy` 组，点启动。
+
+默认口令取构建变量 `DAED_ADMIN_PASS`，不设时用 `scripts/gen-daed-wingdb.py`
+顶部的固定值。**仓库和固件都是公开的**，那个默认值等于公开的：
+
+```sh
+DAED_ADMIN_PASS='你的口令' PROXY_STACK=daed ./scripts/prepare-build.sh
+```
+
+想改出厂的三段配置就编辑 `configs/daed/*.dae`（注释里逐条写了为什么这么设），
+重新构建即可，`wing.db` 每次构建重新生成（`jwt_secret` 也换新），所以它列在
+`.gitignore` 里、不入库。`scripts/check-daed-wingdb.py` 是判据，构建期和
+产物阶段各跑一次：三段配置必须各一条 `selected=1` 且是**完整块**（`dns {`
+那层大括号必须在，否则 `dae.ParseConfig` 解析不出 section）、`proxy` 组必须
+存在且不是 `fixed`、恰好一个管理员、库里不许有订阅/节点链接（固件是公开产物）。
+
 ## 目录结构
 
 ```
@@ -472,6 +530,8 @@ configs/
   qhora_301w.config         # 机型：target / 子目标 / 设备 / 内存档位
   homeproxy.config          # 覆盖层：关掉 passwall2 那组、换成 HomeProxy
   dae.config                # 覆盖层：关掉 passwall2 那组、换成 dae（含内核 BTF/BPF 项）
+  daed.config               # 覆盖层：关掉 passwall2 那组、换成 daed
+  daed/{global,dns,routing}.dae  # daed 出厂的三段配置正文（构建时编译进 wing.db）
   imm-nss.config            # 覆盖层：只给三条 imm 线（immortalwrt 的符号差异）
   homeproxy-rulesets.list   # HomeProxy 规则集清单（名字 ↔ 上游 URL，9 条）
 packages/net/{ddns-go,msd_lite}/   # 自带配方（直接引用上游源码，版本构建时解析注入）
@@ -484,6 +544,8 @@ scripts/
   apply-nss-patches.sh      # 把 patches/immortalwrt-nss/ 的补丁打进 immortalwrt 源码树
   extra-packages.sh         # 把 feed 里没有 / 不该用官方那份的包放进 feed 目录树
   resolve-versions.sh       # 构建时解析 ddns-go / msd_lite 的上游最新版本
+  gen-daed-wingdb.py        # 把 configs/daed/*.dae 编译成 daed 的出厂 wing.db
+  check-daed-wingdb.py      # wing.db 判据（构建期 + 产物阶段各跑一次）
   check-no-credentials.sh   # 构建期守卫：预置文件里出现凭据/订阅链接就中断
   fetch-homeproxy-rulesets.sh # 拉取/校验 9 个 .srs 规则集（构建期刷新 + 刷新仓库副本）
 files/                      # 各变体共用的覆盖文件（uci-defaults、首页硬件区块等）
@@ -494,6 +556,7 @@ files-homeproxy/            # 只叠进 HomeProxy 版：etc/config/homeproxy、
 files-dae/                  # 只叠进 dae 版：etc/dae/config.dae（完整配置，订阅留空）、
                             #   usr/bin/dae-switch（节点切换命令）、
                             #   etc/uci-defaults/97-ssh-login-fix（首启修 SSH，见下）
+files-daed/                 # 只叠进 daed 版：etc/daed/wing.db（构建期生成，不入库）
 ```
 
 **预置文件里只有「策略」，没有「凭据」。** 节点地址 / 端口 / 密码 / UUID / REALITY 公钥 /

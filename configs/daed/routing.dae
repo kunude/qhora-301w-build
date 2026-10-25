@@ -1,0 +1,32 @@
+routing {
+    ### 固定前置，别动 ###
+    # 本机网络管理器直连，否则 dae 绑 WAN 做连通性自检会被自己代理掉
+    pname(NetworkManager) -> direct
+    # 广播/组播/链路本地绝不进代理，否则 LAN 内的发现协议会被打断
+    dip(224.0.0.0/3, 'ff00::/8') -> direct
+    # 内网地址直连（NAS、打印机、路由器管理页）
+    dip(geoip:private) -> direct
+
+    ### 拦截 ###
+    # 广告与追踪
+    domain(geosite:category-ads-all) -> block
+    # 关掉 QUIC：UDP 443 一旦被节点劣化，表现为"网页能开、视频卡成马赛克"
+    # 或"有的站通 Google 不通"。禁掉后浏览器 1 秒内回落 TCP，体验反而更好。
+    # 如果你的节点 UDP 很稳、想要 HTTP/3，把下一行注释掉即可。
+    l4proto(udp) && dport(443) -> block
+
+    ### 直连 ###
+    # 国内 IP 与国内域名。顺序无所谓，两条都留着更保险：
+    # 有些站用国外 CDN 的 IP 但属于国内域名，反之亦然。
+    dip(geoip:cn) -> direct
+    domain(geosite:cn) -> direct
+    # 局域网常见域名后缀
+    domain(suffix: .lan) -> direct
+    domain(suffix: .local) -> direct
+    domain(suffix: .home.arpa) -> direct
+
+    ### 其余全部走 proxy（唯一的代理组，组内自动选最优节点）###
+    # 只有这一个代理组：把订阅里的节点全丢进去，min_moving_avg 自动挑最快的。
+    # 想单独给某个站指定节点时，在面板里再建组并加规则即可。
+    fallback: proxy
+}

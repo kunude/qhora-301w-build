@@ -1,0 +1,26 @@
+dns {
+    upstream {
+        googledns: 'tcp://dns.google:53'
+        alidns: 'udp://223.5.5.5:53'
+    }
+    routing {
+        request {
+            # 国内域名用国内 DNS
+            qname(geosite:cn) -> alidns
+            # 节点自己的域名也走国内 DNS 直接解。
+            # 不加这条会出现死循环：要解析 c38s1.xxx.com → 查 DNS 要走代理 →
+            # 代理要先知道 c38s1 的 IP → 再解析…日志里刷
+            # "bootstrap resolver returned no usable address"。
+            # （daed 里订阅的 tag 由用户在面板里填，这里不能写死 sub(tag)，
+            #   所以只保留按域名规则，靠上面的 qname 兜住国内解析。）
+            fallback: googledns
+        }
+        response {
+            # Google 的答案直接采信
+            upstream(googledns) -> accept
+            # 国内 DNS 返回内网地址 + 又不是国内域名 → 典型的投毒，重查
+            ip(geoip:private) && !qname(geosite:cn) -> googledns
+            fallback: accept
+        }
+    }
+}
