@@ -4,8 +4,14 @@ name: Debug - sing-box 源码包单编（不编整机）
 #  为什么单独有这么一条工作流
 #  ─────────────────────────────────────────────────────────────────────────
 #  整机编译要 80~120 分钟，改一次 sing-box 配方就白等一轮，太慢。
-#  这条工作流只做两件事：把构建环境备好（feeds + .config + 渲染好的源码配方），
-#  然后**只编 feeds/packages/net/sing-box 这一个包**，约 15~25 分钟出结果。
+#  这条工作流只做三件事：把构建环境备好（feeds + .config + 渲染好的源码配方），
+#  编一遍宿主机工具（tools/install，约 10~15 分钟），然后**只编
+#  feeds/packages/net/sing-box 这一个包**。合计 40~60 分钟出结果。
+#
+#  为什么非要 tools/install：`make package/<x>/compile` 不会替你跑 tools 阶段，
+#  而解包用的是 staging_dir/host/bin/libdeflate-gzip（tools/libdeflate 装的）。
+#  缺了它，`package/utils/lua [host]` 会以 "tar: This does not look like a
+#  tar archive" 挂掉 —— 报错指向 lua，真凶却是没编 tools。
 #
 #  ⚠️ 本工作流故意**不设 BUILD_LOG**（全局 env 里也没有）。
 #     OpenWrt 的 include/subdir.mk:68 一旦看到环境里有 BUILD_LOG，就会把每个包的
@@ -63,7 +69,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-26.04
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     steps:
       - name: 释放磁盘空间
@@ -137,6 +143,35 @@ jobs:
           grep -nE '^PKG_NAME|^PKG_VERSION|^PKG_SOURCE|^PKG_HASH|^GO_PKG_TAGS|^GO_PKG_LDFLAGS|^PKG_BUILD_DEPENDS' "$m"
           grep -q '^PKG_SOURCE:=sing-box-refind-' "$m" ||
             { echo "::error::$m 不是本仓库的源码配方（PKG_SOURCE 不是 sing-box-refind-*）"; exit 1; }
+
+      # ── 为什么必须先编一遍宿主机工具 ─────────────────────────────────────
+      # `make package/<x>/compile` **不会**替你跑 tools 阶段。2026-10-25 那次
+      # 单编就死在这儿，而且报错极具误导性：
+      #     bash: .../staging_dir/host/bin/libdeflate-gzip: No such file or directory
+      #     tar: This does not look like a tar archive
+      #     ERROR: package/utils/lua [host] failed to build.
+      # 看着像 lua 挂了，其实是 include 里解包用的是
+      # $(STAGING_DIR_HOST)/bin/libdeflate-gzip（tools/libdeflate 的 Host/Install
+      # 才把它装进去），tools 没编过 → 解包器不存在 → tar 收到 0 字节。
+      # 整机 `make` 会先跑 tools/install，所以这条坑只有单编线才踩得到。
+      - name: 先编宿主机工具（tools/install）
+        run: |
+          set -uo pipefail
+          cd "$OPENWRT_DIR"
+          unset BUILD_LOG BUILD_LOG_DIR || true
+          echo "make -j$(nproc) tools/install"
+          make -j"$(nproc)" tools/install 2>&1 | tail -n 200
+          rc=${PIPESTATUS[0]}
+          if (( rc != 0 )); then
+            echo "::error title=tools/install 失败::退出码 $rc"
+            exit "$rc"
+          fi
+          # 把这次踩的坑做成断言：后面再有类似"解包器缺失"能一眼看出来
+          for t in libdeflate-gzip tar gzip xz; do
+            [[ -x "staging_dir/host/bin/$t" ]] \
+              || { echo "::error::宿主机工具 staging_dir/host/bin/$t 不存在，解包阶段必然失败"; exit 1; }
+          done
+          echo "::notice title=宿主机工具就绪::libdeflate-gzip / tar / gzip / xz 都在"
 
       - name: 只编 sing-box 这一个包
         run: |
