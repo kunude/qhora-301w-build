@@ -33,7 +33,9 @@
 # 可选：
 #   NSS_FEED         NSS feed 的 src-git 行，默认指向 edma-nss 分支
 #   GH_TOKEN         查 GitHub API 用，避免未认证限额（Actions 里默认注入）
-#   PROXY_STACK      代理栈：passwall2（默认）| homeproxy | dae | daed
+#   PROXY_STACK      代理栈：passwall2（默认）| homeproxy | singbox | dae | daed
+#                    singbox = 纯净内核线：不装任何 LuCI 代理前端，只装
+#                    reF1nd 源码编的 sing-box + 它自带的 init/config.json。
 #                    homeproxy 时额外拼接 configs/homeproxy.config（覆盖层），
 #                    并把 feed 断言换成 homeproxy 那一组；默认值下本文件
 #                    的行为与以前完全一致。传给 extra-packages.sh 的是同一个变量。
@@ -52,7 +54,12 @@
 #   SINGBOX_MODE     仅 PROXY_STACK=homeproxy 有意义，原样透传给 extra-packages.sh：
 #                    fixed（默认）= 把 sing-box 钉回 1.12.25（旧线的组合）；
 #                    builtin = 用基座自带的那一对（基座是 immortalwrt 的线走这条）；
-#                    latest = 给 HomeProxy 打 1.13+ 兼容补丁（已过时，见该脚本）。
+#                    latest = 给 HomeProxy 打 1.13+ 兼容补丁（已过时，见该脚本）；
+#                    source = 从 reF1nd/sing-box 源码编译内核（不再套壳，
+#                             配方由 packages/net/sing-box-refind 渲染）。
+#   SINGBOX_SRC_REF  仅 SINGBOX_MODE=source 有意义：取 reF1nd/sing-box 的哪个 ref，
+#                    默认 testing。可以是分支 / tag / 40 位 sha。
+#   SINGBOX_SRC_BASE 同上：包版本号里的上游基线（默认 1.14.0，只影响显示与排序）。
 #   SINGBOX_PKGS_REF 仅 SINGBOX_MODE=fixed 有意义：从 immortalwrt/packages 的哪个
 #                    ref 取那份 1.12.25，默认发布分支 openwrt-25.12。
 #                    **故意不跟 IMM_REF 走** —— master 上的 1.12.25 已在
@@ -165,7 +172,8 @@ case "$PROXY_STACK" in
   homeproxy) CONFIGS+=( "$BUILDER_DIR/configs/homeproxy.config" ) ;;
   dae)       CONFIGS+=( "$BUILDER_DIR/configs/dae.config" ) ;;
   daed)      CONFIGS+=( "$BUILDER_DIR/configs/daed.config" ) ;;
-  *) die "不认识的 PROXY_STACK：$PROXY_STACK（只支持 passwall2 / homeproxy / dae / daed）" ;;
+  singbox)   CONFIGS+=( "$BUILDER_DIR/configs/singbox.config" ) ;;
+  *) die "不认识的 PROXY_STACK：$PROXY_STACK（只支持 passwall2 / homeproxy / singbox / dae / daed）" ;;
 esac
 
 # 可选：再追加一层覆盖层（同样"后拼接者覆盖前者"）。
@@ -221,6 +229,7 @@ log "引入官方 feed 之外的包（PROXY_STACK=${PROXY_STACK}）"
 OPENWRT_DIR="$OPENWRT_DIR" BUILDER_DIR="$BUILDER_DIR" PROXY_STACK="$PROXY_STACK" \
   SINGBOX_MODE="${SINGBOX_MODE:-fixed}" SINGBOX_VERSION="${SINGBOX_VERSION:-}" \
   SINGBOX_EXPECT="${SINGBOX_EXPECT:-}" SINGBOX_PKGS_REF="${SINGBOX_PKGS_REF:-}" \
+  SINGBOX_SRC_REF="${SINGBOX_SRC_REF:-}" SINGBOX_SRC_BASE="${SINGBOX_SRC_BASE:-}" \
   bash "$BUILDER_DIR/scripts/extra-packages.sh"
 
 # 解析这两个包的上游最新版本，注入到刚落位的自带配方里 —— 这是「上游一发新版，
@@ -287,6 +296,18 @@ if [[ "$PROXY_STACK" == "homeproxy" ]]; then
   sb_ver="$(sed -n 's/^PKG_VERSION:=\s*//p' package/feeds/packages/sing-box/Makefile 2>/dev/null | head -n1)"
   if [[ "${SINGBOX_MODE:-fixed}" == "builtin" ]]; then
     log "sing-box 配方版本：${sb_ver:-未知}（SINGBOX_MODE=builtin —— 用基座自带的那份，不换版本、不打补丁）"
+  elif [[ "${SINGBOX_MODE:-fixed}" == "source" ]]; then
+    log "sing-box 配方版本：${sb_ver:-未知}（SINGBOX_MODE=source —— reF1nd/sing-box 源码编译）"
+    # 断言这一份**确实是源码配方**，而不是 feed 原来那份被漏掉覆盖：
+    #   · 源码配方的 ldflags 一定带 -refind 后缀（见 Makefile.in 的 GO_PKG_LDFLAGS_X）；
+    #   · PKG_SOURCE 必须以 sing-box-refind- 开头（渲染脚本生成的本地文件名）。
+    # 两者都缺 ⇒ 说明 feeds/packages/net/sing-box 没有被覆盖成功，
+    # 编出来的会是官方 1.14.x，与"这条线要新内核"的意图不符。
+    sb_mk="package/feeds/packages/sing-box/Makefile"
+    grep -q 'constant\.Version=.*-refind' "$sb_mk" \
+      || die "$sb_mk 不是源码配方（缺 -refind 版本后缀）—— SINGBOX_MODE=source 没生效"
+    grep -q '^PKG_SOURCE:=sing-box-refind-' "$sb_mk" \
+      || die "$sb_mk 的 PKG_SOURCE 不是 sing-box-refind-*，源码配方没有落位"
   else
     case "$sb_ver" in
       1.12.*) log "sing-box 配方版本确认：$sb_ver（ImmortalWrt 那份，与 HomeProxy 匹配）" ;;
@@ -363,6 +384,44 @@ elif [[ "$PROXY_STACK" == "daed" ]]; then
     DAED_VERSION="${DAED_VERSION:-2.1.1}" \
     bash "$BUILDER_DIR/scripts/resolve-daed-version.sh" \
     || die "daed 版本渲染失败：DAED_VERSION=${DAED_VERSION:-2.1.1}，详见上面的输出"
+elif [[ "$PROXY_STACK" == "singbox" ]]; then
+  # ── singbox 版（纯净内核线）────────────────────────────────
+  # 这条线**没有代理前端**，所以要核对的东西比其它线少，但每一条都是
+  # "少一个就白编"的硬前提。
+  for p in luci-app-ddns-go luci-app-msd_lite; do
+    [[ -e "package/feeds/luci/$p" ]] \
+      || die "package/feeds/luci/$p 不存在，引入的包没有被 feeds install 接管"
+  done
+  [[ -e "package/feeds/packages/sing-box" ]] \
+    || die "package/feeds/packages/sing-box 不存在，sing-box 没有被 feeds install 接管"
+
+  # 必须是**源码配方**：extra-packages.sh 的 place_singbox_from_source 渲染后
+  # 覆盖 feeds/packages/net/sing-box。带不上这两个特征就是 feed 原来那份。
+  sb_mk="package/feeds/packages/sing-box/Makefile"
+  grep -q '^PKG_SOURCE:=sing-box-refind-' "$sb_mk" \
+    || die "$sb_mk 的 PKG_SOURCE 不是 sing-box-refind-* —— 源码配方没有落位（SINGBOX_MODE=source 没生效）"
+  grep -q 'constant\.Version=.*-refind' "$sb_mk" \
+    || die "$sb_mk 缺 -refind 版本后缀 —— 这份不是本仓库的源码配方"
+
+  # 纯净线靠**包自带的 init 与 config.json** 跑起来。它们是源码配方里
+  # files/ 下的文件，缺了就说明模板目录被改坏了（编译能过，装进去没人启动）。
+  sb_dir="$(dirname "$(readlink -f "$sb_mk")")"
+  for f in files/sing-box.init files/sing-box.conf files/config.json; do
+    [[ -f "$sb_dir/$f" ]] \
+      || die "源码配方里缺 $f（$sb_dir）—— 纯净线没有它就跑不起来"
+  done
+  bash -n "$sb_dir/files/sing-box.init" \
+    || die "$sb_dir/files/sing-box.init 有语法错误"
+
+  # 反向断言：HomeProxy 不该被拉进来（② 段只在 PROXY_STACK=homeproxy 时加它）。
+  # 万一哪天有人给 ② 段加了"无条件"逻辑，这里会提醒而不是静默多装一个前端。
+  # 注意用 if 而不是 `[[ ]] && warn`：后者在条件为假时整条语句返回 1，
+  # 在 set -e 下会直接退出脚本 —— 而"没有 homeproxy"本来正是正常情况。
+  if [[ -e "package/feeds/luci/luci-app-homeproxy" ]]; then
+    warn "纯净线里出现了 luci-app-homeproxy（不该有）—— 检查 extra-packages.sh 的 ② 段"
+  fi
+
+  log "sing-box 源码配方已就位：$(sed -n 's/^PKG_VERSION:=\s*//p' "$sb_mk" | head -n1)（纯净内核线，无前端）"
 else
   for p in luci-app-ddns-go luci-app-msd_lite luci-app-passwall2; do
     [[ -e "package/feeds/luci/$p" ]] \

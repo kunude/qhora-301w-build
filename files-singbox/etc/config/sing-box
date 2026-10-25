@@ -1,0 +1,18 @@
+# sing-box 的 UCI 配置 —— 纯净内核线（PROXY_STACK=singbox）的出厂值
+#
+# 与包自带的默认值相比只改一处：enabled=1。
+# 包默认是 0（因为 HomeProxy 线装了同一个包但由 homeproxy 的 init 管进程，
+# 不能让这个 init 也起来抢端口），纯净线则要求开机即起。
+#
+# 真正决定行为的是 /etc/sing-box/config.json —— 那份由包提供，默认：
+#   tun 入站（172.19.0.1/30）+ auto_route + auto_redirect，出站 direct，
+#   即"装完能上网、但全部直连"，等着你自己往里加节点。
+#
+# 改完配置后：
+#   /etc/init.d/sing-box restart
+#   logread -e sing-box        # 看 check 失败原因（启动前一定会跑 check）
+
+config sing-box 'main'
+	option enabled '1'
+	option conffile '/etc/sing-box/config.json'
+	option workdir '/etc/sing-box'

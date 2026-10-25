@@ -23,6 +23,10 @@
 target / device。两条线**共用同一个 `/usr/bin/sing-box` 与同一套 nftables 透明代理**，
 所以一套固件里只能启用其中一个（固件里本来也只有其中一个）。
 
+> 后面还长出了两条**内核源码编译**的线（第八、第九条）：内核来自
+> `reF1nd/sing-box` 的源码，在本构建树里交叉编译，不再拿任何预编译二进制。
+> 见下面「第八条线」那一节。
+
 ## 第三条线：immortalwrt 基座 + NSS 补丁
 
 上面两条线的**基座**都是 [`JuliusBairaktaris/openwrt-nss-edma`](https://github.com/JuliusBairaktaris/openwrt-nss-edma)
@@ -562,22 +566,127 @@ dip(203.0.113.0/24) -> proxy                # 没有域名的连接（裸 IP）�
 Google 打不开、`api.ip.sb` 显示的是家里的 IP。这时 `/etc/init.d/daed restart`
 一次就好（15 秒左右恢复）。改一条规则 → 点一次启动 → 等它稳定再动下一条。
 
+## 第八条线：sing-box 内核改为**源码编译**（reF1nd/sing-box）
+
+前七条线的 sing-box 全部是"拿别人的内核"：feed 里的发布包，或 reF1nd 的预编译 tar.gz。
+下面两条线改成**在本构建树里从源码交叉编译** —— 同一份内核，两种前端形态：
+
+| | **第八条线（HomeProxy 前端）** | **第九条线（纯净内核）** |
+|---|---|---|
+| 工作流 | `build-qhora-301w-imm-nss-homeproxy-refind.yml` | `build-qhora-301w-imm-nss-singbox-src.yml` |
+| `PROXY_STACK` | `homeproxy` | `singbox` |
+| `SINGBOX_MODE` | `source` | `source` |
+| 代理前端 | `luci-app-homeproxy`（订阅 / 节点 / 分流页面） | **没有**（只有 `/etc/sing-box/config.json`） |
+| 内核 | `reF1nd/sing-box@<commit>` 源码编译 | 同一份 |
+| 分流方式 | nftables 国内 IP 内核直连 + tproxy 出境 | 默认 tun + auto_redirect，**全部流量走用户态** |
+| 出厂状态 | 与第四条线一致（填订阅即可用） | sing-box 自启，全直连，节点要手填 |
+| 产物 | 与第四条线同样的三个镜像 | 同左 |
+
+两条线可以互刷：内核相同，区别只在"有没有 HomeProxy 这层前端"。
+
+### 为什么不再"套壳"
+
+1. **不再是外部二进制**。reF1nd 的 release tar.gz 是他本机编的，musl 版本、CPU 特性、
+   CGO 开关都只能"信"；源码路线下 `GOARCH` / `GOARM64` / ABI / musl 全跟基座一致，
+   编出来的东西本仓库能复现。
+2. **版本可钉死**。配方钉到 commit，`PKG_HASH` 由 codeload tarball 现算，
+   同一个 commit 反复构建出的内核一致（版本号取 commit 日期而不是构建日期，缓存才有意义）。
+3. **拆掉"壳与核"的绑定**。`weicaixian86/luci-app-homeproxy` 那个 fork 要求内核带
+   `clash_api.proxy_providers` / `cache_file.store_selected` 两个补丁字段，官方 1.14 内核
+   一开 `DisallowUnknownFields` 就 FATAL。源码路线下编哪些 tag 由本仓库决定，
+   HomeProxy 用 `immortalwrt/luci` 上游那份（已迁移到 1.13+ 写法），两边互不牵制。
+
+### 内核是怎么编出来的
+
+| 文件 | 作用 |
+|---|---|
+| `packages/net/sing-box-refind/Makefile.in` | 配方**模板**，三个占位符 `@VER@` / `@SHA@` / `@HASH@` |
+| `scripts/resolve-singbox-src.sh` | `ref → commit sha → 下 codeload tarball → 算 sha256 → 渲染`，顺带把 tarball 放进 `dl/` |
+| `scripts/extra-packages.sh` | `SINGBOX_MODE=source` 通道：渲染结果落位 `feeds/packages/net/sing-box`（**覆盖** feed 那份） |
+
+模板**故意不叫 `Makefile`**：`packages/` 下所有 `Makefile` 都会被 ① 段当成"自带配方"落位，
+多出一个 `net/sing-box-refind` 目录就会和 feed 的 `net/sing-box` 变成两个同名包，
+`feeds install` 直接冲突。改成 `.in` 之后 `find -name Makefile` 扫不到它。
+
+构建标签与 reF1nd 的 `release/DEFAULT_BUILD_TAGS` 逐字一致：
+`with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,`
+`with_ccm,with_ocm,with_cloudflared,with_naive_outbound,with_usbip,with_openvpn,`
+`with_openconnect,badlinkname,tfogo_checklinkname0`。
+**故意不开 `with_gvisor`** —— reF1nd 已经把 gVisor 从默认依赖里摘掉。
+
+### 版本号怎么读
+
+```
+sing-box 1.14.0_git20261024
+         └ 基线 ┘└ 上游 commit 日 ┘
+```
+
+`_git` 是 apk 版本串**允许**的后缀（`_alpha|_beta|_pre|_rc|_cvs|_svn|_git|_hg|_p`）。
+**不能写成 `-refind`**：带字母的自定义后缀会被 apk 直接拒绝。
+`sing-box version` 里显示的才是 `1.14.0_git20261024-refind`（`GO_PKG_LDFLAGS_X` 注入，纯展示）。
+
+日期取**上游 commit 时间**而不是构建时间 —— 同一个 commit 反复构建，包版本稳定不变。
+
+### 怎么钉版本 / 怎么跟新
+
+- **跟最新**：什么都不填，默认取 `reF1nd/sing-box` 的 `testing` 分支 HEAD。
+- **可复现**：`Run workflow` 时把 `singbox_ref` 填成 40 位 commit sha（或 tag）。
+- **大版本变了**：改 `SINGBOX_SRC_BASE`（`env` 里，默认 `1.14.0`）。它**只影响版本串的
+  显示与排序**，不参与任何判断，改错了也不会影响编出来的二进制。
+
+### 三道构建期断言（任何一道不过就中断）
+
+1. `extra-packages.sh`：渲染结果必须指向 `codeload.github.com/reF1nd/sing-box`；
+   homeproxy 线还要确认 `generate_client.uc` 里没有 legacy inbound 字段。
+2. `prepare-build.sh`：`package/feeds/packages/sing-box/Makefile` 必须带
+   `PKG_SOURCE:=sing-box-refind-*` 与 `-refind` 版本后缀（证明覆盖成功，不是 feed 原版）。
+3. 工作流产物阶段：**包版本必须带 `_git`**，且能找到的 `sing-box` 二进制里必须含 `-refind`。
+
+第 3 条里，二进制优先从 rootfs 装配目录取 —— `build_dir` 里的中间产物可能已被
+`CONFIG_AUTOREMOVE` 清掉，不能当唯一依据。
+
+### 第九条线（纯净内核）的代价
+
+选它之前必须知道三件事（`configs/singbox.config` 与工作流开头也写了）：
+
+1. **全部流量走用户态**。默认 `tun + auto_route + auto_redirect`，包括国内流量；
+   NSS 硬件加速对这部分不生效，吞吐明显低于 HomeProxy 线（后者用 nftables
+   把国内 IP 在内核里直连）。要拿回性能就自己把 inbound 换成 tproxy + 挂 nft 规则。
+2. **没有国内直连分流**。默认 `route.final = direct`，加了节点之后要自己写
+   `route.rules`，否则要么全直连、要么全代理。
+3. **没有订阅**。sing-box 本身不支持订阅链接，节点要自己转换后手填。
+
+换来的是链路极短：一个进程 + 一份 JSON。排查只需要 `sing-box check` 与
+`logread -e sing-box`，不用在 rpcd / nftables / ucode 三处之间来回找。
+
+```sh
+# 改完配置
+/etc/init.d/sing-box restart
+logread -e sing-box            # 启动前一定会跑 sing-box check，配置错会留在这里
+sing-box version               # 末尾带 -refind 就是本仓库编的内核
+```
+
 ## 目录结构
 
 ```
-.github/workflows/          # 七条构建线：nss-edma 基座 4 条（passwall2 / HomeProxy 钉 1.12.25 /
-                            #   HomeProxy 新版 sing-box / 上面那条的副本）
-                            #   + immortalwrt 基座 3 条（passwall2 / HomeProxy / dae）
+.github/workflows/          # 九条构建线：
+                            #   nss-edma 基座 4 条（passwall2 / HomeProxy 钉 1.12.25 /
+                            #     HomeProxy 新版 sing-box / 上面那条的副本）
+                            #   immortalwrt 基座 5 条（passwall2 / HomeProxy / dae / daed
+                            #     + 两条源码内核线：homeproxy-refind / singbox-src）
 configs/
   common.config             # NSS 卸载栈 + 通用选项 + 附加功能包
   qhora_301w.config         # 机型：target / 子目标 / 设备 / 内存档位
   homeproxy.config          # 覆盖层：关掉 passwall2 那组、换成 HomeProxy
   dae.config                # 覆盖层：关掉 passwall2 那组、换成 dae（含内核 BTF/BPF 项）
   daed.config               # 覆盖层：关掉 passwall2 那组、换成 daed
+  singbox.config            # 覆盖层：关掉 passwall2 / homeproxy，只留 sing-box（纯净内核线）
   daed/{global,dns,routing}.dae  # daed 出厂的三段配置正文（构建时编译进 wing.db）
   imm-nss.config            # 覆盖层：只给三条 imm 线（immortalwrt 的符号差异）
   homeproxy-rulesets.list   # HomeProxy 规则集清单（名字 ↔ 上游 URL，9 条）
 packages/net/{ddns-go,msd_lite}/   # 自带配方（直接引用上游源码，版本构建时解析注入）
+packages/net/sing-box-refind/      # sing-box 源码配方**模板**（Makefile.in 由脚本渲染，
+                                   #   故意不叫 Makefile —— 否则会被当成独立包落位）
 packages/emortal/autocore/         # 纯脚本包，提供 tempinfo / cpuinfo
 patches/kernel/6.18/               # 叠进上游内核源码树的内核补丁（见下）
 patches/immortalwrt-nss/           # imm-nss 线专用：NSS 补丁集 + 来源说明（见下）
@@ -587,6 +696,8 @@ scripts/
   apply-nss-patches.sh      # 把 patches/immortalwrt-nss/ 的补丁打进 immortalwrt 源码树
   extra-packages.sh         # 把 feed 里没有 / 不该用官方那份的包放进 feed 目录树
   resolve-versions.sh       # 构建时解析 ddns-go / msd_lite 的上游最新版本
+  resolve-singbox-src.sh    # 解析 reF1nd/sing-box 的 ref→sha→tar hash，渲染源码配方
+                            #   （顺带把 tarball 放进 dl/，构建时不再下一次）
   gen-daed-wingdb.py        # 把 configs/daed/*.dae 编译成 daed 的出厂 wing.db
   check-daed-wingdb.py      # wing.db 判据（构建期 + 产物阶段各跑一次）
   check-no-credentials.sh   # 构建期守卫：预置文件里出现凭据/订阅链接就中断
@@ -600,6 +711,8 @@ files-dae/                  # 只叠进 dae 版：etc/dae/config.dae（完整配
                             #   usr/bin/dae-switch（节点切换命令）、
                             #   etc/uci-defaults/97-ssh-login-fix（首启修 SSH，见下）
 files-daed/                 # 只叠进 daed 版：etc/daed/wing.db（构建期生成，不入库）
+files-singbox/              # 只叠进纯净内核线：etc/config/sing-box（enabled=1）、
+                            #   etc/uci-defaults/98-singbox-enable（首启 enable + start）
 ```
 
 **预置文件里只有「策略」，没有「凭据」。** 节点地址 / 端口 / 密码 / UUID / REALITY 公钥 /
@@ -1150,6 +1263,8 @@ cat /sys/class/thermal/thermal_zone*/type     # 固件里有哪些温度传感�
 | `Build imm QHora-301W (NSS EDMA, HomeProxy).yml` | 同上 | 同上 | 与正式线内容一致的副本 |
 | `build-qhora-301w-homeproxy-sb114.yml`（实验线） | `builtin` | **基座自带**（`openwrt/packages`，1.14.0） | 不换版本、不打补丁 |
 | `build-qhora-301w-imm-nss-homeproxy.yml`（第四条线） | `builtin` | **基座自带**（`immortalwrt/packages`，1.14.3） | 同上 |
+| `build-qhora-301w-imm-nss-homeproxy-refind.yml`（第八条线） | `source` | **源码编译**（`reF1nd/sing-box@<commit>`，如 `1.14.0_git20261024`） | 内核从源码编，HomeProxy 用上游新版生成器 |
+| `build-qhora-301w-imm-nss-singbox-src.yml`（第九条线） | `source` | 同上 | 同一份内核，但**没有前端**，只跑 `config.json` |
 
 先纠正一个流传很久的错话：**`set_system_proxy` 不是 legacy 字段。** 它在 sing-box 1.14.x 的
 `option/simple.go` 里仍是 `HTTPMixedInboundOptions` 的合法成员（1.14.0 与 1.14.3 都一样）。

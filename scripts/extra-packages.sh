@@ -107,7 +107,7 @@
 #                   不符**直接中断构建**（不是警告）。想要 1.12.x 任意补丁版就写
 #                   `SINGBOX_EXPECT=1.12.*`（支持通配）。只在 SINGBOX_MODE=fixed 下生效。
 #   SINGBOX_MODE    homeproxy 版怎么处理「HomeProxy 生成的配置 ↔ sing-box 版本」
-#                   这一对。三选一：
+#                   这一对。四选一：
 #                     fixed （默认）从 immortalwrt/packages 取 SINGBOX_EXPECT 那版
 #                           （1.12.25）覆盖官方配方，HomeProxy 一字不动；
 #                     latest 不覆盖官方配方，沿用现有那份 sing-box、把版本改成
@@ -117,6 +117,13 @@
 #                           **immortalwrt 基座**成立：它的 HomeProxy 与 sing-box
 #                           在同一个上游同步维护、已互相适配（实测依据见下面
 #                           ③-H 的 builtin 分支）。
+#                     source **从 reF1nd/sing-box 源码编译内核**，覆盖 feed 那份。
+#                           配方由 packages/net/sing-box-refind/Makefile.in 渲染，
+#                           commit 由 SINGBOX_SRC_REF 钉死（默认 testing 的 HEAD）。
+#                           这是"不再套壳"的那条路：内核在本构建树里交叉编译，
+#                           不下载任何预编译二进制。详见 ③-H-S 段。
+#   SINGBOX_SRC_REF SINGBOX_MODE=source 时取哪个 ref（分支/tag/sha），默认 testing
+#   SINGBOX_SRC_BASE 同上，包版本号里的上游基线（默认 1.14.0，只影响显示）
 #   SINGBOX_VERSION SINGBOX_MODE=latest 时的目标版本（如 1.14.3）。留空则沿用
 #                   官方配方自带版本，只打补丁、不换版本。
 #   PW_REF          passwall 三个仓库的分支，默认 main
@@ -163,21 +170,29 @@ SINGBOX_PKGS_REF="${SINGBOX_PKGS_REF:-openwrt-25.12}"
 # （基座自带的那一对，只对 immortalwrt 基座成立）。
 SINGBOX_MODE="${SINGBOX_MODE:-fixed}"
 SINGBOX_VERSION="${SINGBOX_VERSION:-}"
+SINGBOX_SRC_REF="${SINGBOX_SRC_REF:-testing}"
+SINGBOX_SRC_BASE="${SINGBOX_SRC_BASE:-1.14.0}"
 PW_REF="${PW_REF:-main}"
 PW_APP_REPO="${PW_APP_REPO:-https://github.com/Openwrt-Passwall/openwrt-passwall2.git}"
 PW_PKGS_REPO="${PW_PKGS_REPO:-https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git}"
 
 case "$PROXY_STACK" in
-  passwall2|homeproxy|dae|daed) ;;
-  *) echo "不认识的 PROXY_STACK：$PROXY_STACK（只支持 passwall2 / homeproxy / dae / daed）" >&2; exit 1 ;;
+  passwall2|homeproxy|singbox|dae|daed) ;;
+  *) echo "不认识的 PROXY_STACK：$PROXY_STACK（只支持 passwall2 / homeproxy / singbox / dae / daed）" >&2; exit 1 ;;
 esac
 
 case "$SINGBOX_MODE" in
-  fixed|latest|builtin) ;;
-  *) echo "不认识的 SINGBOX_MODE：$SINGBOX_MODE（只支持 fixed / latest / builtin）" >&2; exit 1 ;;
+  fixed|latest|builtin|source) ;;
+  *) echo "不认识的 SINGBOX_MODE：$SINGBOX_MODE（只支持 fixed / latest / builtin / source）" >&2; exit 1 ;;
 esac
-if [[ "$SINGBOX_MODE" != "fixed" && "$PROXY_STACK" != "homeproxy" ]]; then
-  echo "SINGBOX_MODE=$SINGBOX_MODE 只对 PROXY_STACK=homeproxy 有意义（当前 $PROXY_STACK）" >&2
+if [[ "$SINGBOX_MODE" != "fixed" && "$PROXY_STACK" != "homeproxy" && "$PROXY_STACK" != "singbox" ]]; then
+  echo "SINGBOX_MODE=$SINGBOX_MODE 只对 PROXY_STACK=homeproxy / singbox 有意义（当前 $PROXY_STACK）" >&2
+  exit 1
+fi
+# singbox 这条线**没有前端**，所以 fixed / builtin / latest 三条"配 HomeProxy"的
+# 通道对它毫无意义 —— 只允许 source，否则会静默产出"装了内核但没人配它"的固件。
+if [[ "$PROXY_STACK" == "singbox" && "$SINGBOX_MODE" != "source" ]]; then
+  echo "PROXY_STACK=singbox 只用源码内核：SINGBOX_MODE 必须是 source（当前 $SINGBOX_MODE）" >&2
   exit 1
 fi
 
@@ -341,6 +356,71 @@ clone_shallow() {
   [[ -d "$dest/.git" ]] || die "$repo 克隆后没有 .git，检出不完整"
 }
 
+# ══════════════════════════════════════════════════════════════
+# sing-box 源码配方的渲染与落位（PROXY_STACK=homeproxy / singbox 共用）
+# ══════════════════════════════════════════════════════════════
+# 两条线用的是**同一份内核、同一份配方**，区别只在"有没有 HomeProxy 这层前端"：
+#   homeproxy → 内核给 /etc/init.d/homeproxy 用（它自己生成 sing-box 配置）
+#   singbox   → 内核自己跑（用包自带的 config.json + procd 脚本）
+# 所以落位逻辑抽成函数；只有"顺手检查 HomeProxy 生成器"那一步是 homeproxy 独有
+# （参数 1）。
+#
+# 结果写到两个全局变量里，与 fixed / builtin / latest 三条通道同名同义，
+# 供后面的 ann 注解与调用方复用：
+#   sb_ver / sb_desc
+place_singbox_from_source() {
+	local check_homeproxy="${1:-0}"
+	local sb_tpl="$BUILDER_DIR/packages/net/sing-box-refind"
+	local sb_render="$WORK/sing-box-refind"
+	local gin
+
+	# 模板故意叫 Makefile.in（不叫 Makefile）：① 段的
+	# `find packages -name Makefile` 会把它当普通自带配方落位到
+	# feeds/packages/net/sing-box-refind —— 那样会和 feed 里的 net/sing-box
+	# 变成两个同名包，feeds install 直接冲突。
+	[[ -f "$sb_tpl/Makefile.in" ]] \
+		|| die "找不到源码配方模板：$sb_tpl/Makefile.in"
+
+	OPENWRT_DIR="$OPENWRT_DIR" \
+		SINGBOX_SRC_REF="$SINGBOX_SRC_REF" \
+		SINGBOX_SRC_BASE="$SINGBOX_SRC_BASE" \
+		GH_TOKEN="${GH_TOKEN:-}" \
+		bash "$BUILDER_DIR/scripts/resolve-singbox-src.sh" "$sb_tpl" "$sb_render" \
+		|| die "渲染 sing-box 源码配方失败（详见上面的输出）"
+
+	# shellcheck disable=SC1090
+	. "$sb_render/resolve.env"
+
+	# 覆盖 feed 里那份（同名同目录 —— feeds install 之后包名就是 sing-box）。
+	rm -rf feeds/packages/net/sing-box
+	mkdir -p feeds/packages/net/sing-box
+	cp -a "$sb_render"/. feeds/packages/net/sing-box/
+	# resolve.env 只是给本脚本传值用的中间文件，不该进构建树。
+	rm -f feeds/packages/net/sing-box/resolve.env
+	log "  落位 feeds/packages/net/sing-box（源码配方，PKG_VERSION=${SINGBOX_SRC_VER}）"
+
+	# 硬断言：渲染结果必须指向 reF1nd。模板哪天被改回 SagerNet，这条会拦住 ——
+	# 否则"源码编译版"会静默变成"官方版"，只有版本号不对劲。
+	grep -q 'codeload\.github\.com/reF1nd/sing-box' feeds/packages/net/sing-box/Makefile \
+		|| die "渲染出的配方没有指向 reF1nd/sing-box（模板被改坏了？）"
+
+	# HomeProxy 的生成器必须已是 1.13+ 写法。reF1nd/testing 是 1.14.x-dev，
+	# legacy inbound 字段（sniff / sniff_override_destination = true）会直接 FATAL。
+	if [[ "$check_homeproxy" == "1" ]]; then
+		gin="feeds/luci/applications/luci-app-homeproxy/root/etc/homeproxy/scripts/generate_client.uc"
+		[[ -f "$gin" ]] || die "找不到 HomeProxy 的 generate_client.uc：$gin"
+		if grep -qE '^[ \t]*(sniff|sniff_override_destination)[ \t]*:[ \t]*true' "$gin"; then
+			die "HomeProxy 的 generate_client.uc 里仍有 legacy inbound 字段（sniff / sniff_override_destination = true）
+      sing-box ${SINGBOX_SRC_VER}（≥1.13）会在 /etc/init.d/homeproxy 的 check 阶段 FATAL。
+      出路：改用新版 immortalwrt/luci 的 HomeProxy（IMM_REF=master），
+            或先跑 scripts/patch-homeproxy-for-singbox113.py 把它迁到 route.rules 写法。"
+		fi
+	fi
+
+	sb_ver="$SINGBOX_SRC_VER"
+	sb_desc="reF1nd/sing-box@${SINGBOX_SRC_REF}（源码编译，commit ${SINGBOX_SRC_SHA7}）"
+}
+
 if [[ "$PROXY_STACK" == "dae" ]]; then
   # ════════════════════════════════════════════════════════════
   # ③-D 代理栈 = dae：**一个仓库都不用拉**
@@ -379,6 +459,23 @@ elif [[ "$PROXY_STACK" == "daed" ]]; then
   # 里已把 dae 那组符号显式置 n。
   log "代理栈 = daed：全部来自基座官方 feed，不引入任何第三方仓库"
   ann "::notice title=daed 来源::immortalwrt/packages@${IMM_REF} + immortalwrt/luci@${IMM_REF}（官方 feed，无需外部落位）"
+elif [[ "$PROXY_STACK" == "singbox" ]]; then
+  # ════════════════════════════════════════════════════════════
+  # ③-S 代理栈 = singbox（纯净内核线）
+  # ════════════════════════════════════════════════════════════
+  # **一个前端都不装**：
+  #   · 不拉 immortalwrt/luci 的 luci-app-homeproxy（② 段只在 homeproxy 分支加）；
+  #   · 不拉 passwall 的两个仓库；
+  #   · 只把 reF1nd/sing-box 源码编成的内核 + 它自带的 init/config 落进固件。
+  # 分流、订阅、节点全部靠手改 /etc/sing-box/config.json。
+  #
+  # 为什么要这条线：HomeProxy 那套是「ucode 生成配置 → 写 nft 规则 → 拉起 sing-box」，
+  # 环节多、出错面大（math 模块缺失、legacy 字段、规则集下载失败都踩过）。
+  # 纯净线把这些全省掉，只留一个进程和一份 JSON —— 适合"规则自己维护、
+  # 就想让内核按我说的跑"的场景。代价见 configs/singbox.config 头部。
+  log "代理栈 = singbox：只要内核，不要前端（reF1nd/sing-box@${SINGBOX_SRC_REF} 源码编译）"
+  place_singbox_from_source 0
+  ann "::notice title=内核来源::reF1nd/sing-box 源码编译（${sb_desc}），无 LuCI 前端"
 elif [[ "$PROXY_STACK" == "homeproxy" ]]; then
   # ════════════════════════════════════════════════════════════
   # ③-H 代理栈 = homeproxy：只要一个 sing-box 组件
@@ -402,7 +499,7 @@ elif [[ "$PROXY_STACK" == "homeproxy" ]]; then
   #     immortalwrt/packages 也随之把 sing-box 抬到 1.14.3。两边由同一个上游
   #     同步维护、已互相适配 —— 这时什么都不用做（通道 builtin）。
   #
-  # 三条通道（由 SINGBOX_MODE 选，下面三个分支一一对应）：
+  # 四条通道（由 SINGBOX_MODE 选，下面四个分支一一对应）：
   #   ① fixed   钉 1.12.25：从 immortalwrt/packages@SINGBOX_PKGS_REF
   #             （默认发布分支 openwrt-25.12）取那份配方覆盖掉基座的。
   #             只有「基座是 openwrt / nss-edma 且要旧组合」的线才用它。
@@ -411,8 +508,18 @@ elif [[ "$PROXY_STACK" == "homeproxy" ]]; then
   #             **已过时**：上游的生成器迁移之后，补丁脚本的正则匹配不上新结构，
   #             这条通道现在必然报错。留着是给"万一上游回退"留个出口，别用它。
   #             想跟新 sing-box 就走 builtin。
+  #   ④ source  从 reF1nd/sing-box **源码编译**内核（本仓库新增，见 ③-H-S）。
+  #             要"最新内核 + 不套壳"就走这条；基座必须是 immortalwrt
+  #             （HomeProxy 生成器得是新版写法）。
 
-  if [[ "$SINGBOX_MODE" == "builtin" ]]; then
+  if [[ "$SINGBOX_MODE" == "source" ]]; then
+    # ── 通道 D：内核从 reF1nd/sing-box 源码编（实现见 place_singbox_from_source）──
+    # 这是"不再套壳"那条路：不再下载 reF1nd 预编译的 tar.gz，也不再受
+    # "壳与核被两个补丁字段绑死"的限制 —— 内核在本构建树里用 golang-package.mk
+    # 交叉编译，GOARCH/GOARM64/ABI/musl 全跟基座一致，版本由 commit 钉死。
+    log "代理栈 = homeproxy：sing-box 改由源码编译（reF1nd/sing-box@${SINGBOX_SRC_REF}）"
+    place_singbox_from_source 1
+  elif [[ "$SINGBOX_MODE" == "builtin" ]]; then
     # ── 通道 C：基座自带的那一对，两边都不动 ────────────────────────────
     # 适用：基座 = immortalwrt。它的 feeds/luci 的 luci-app-homeproxy 与
     # feeds/packages 的 sing-box 由同一个上游同步维护、**已经互相适配**，
@@ -592,13 +699,20 @@ log "引入完成（PROXY_STACK=${PROXY_STACK}）："
 log "  · 自带配方        ddns-go / msd_lite / autocore"
 if [[ "$PROXY_STACK" == "homeproxy" ]]; then
   log "  · ImmortalWrt 前端 luci-app-{ddns-go,msd_lite,homeproxy}"
-  log "  · 代理核心        sing-box（ImmortalWrt 配方，覆盖官方那份）"
+  case "$SINGBOX_MODE" in
+    source)  log "  · 代理核心        sing-box（reF1nd/sing-box 源码编译，覆盖官方那份）" ;;
+    builtin) log "  · 代理核心        sing-box（基座自带，未覆盖）" ;;
+    *)       log "  · 代理核心        sing-box（ImmortalWrt 配方，覆盖官方那份）" ;;
+  esac
 elif [[ "$PROXY_STACK" == "dae" ]]; then
   log "  · ImmortalWrt 前端 luci-app-{ddns-go,msd_lite}"
   log "  · 代理核心        dae（基座官方 feed，未引入任何第三方仓库）"
 elif [[ "$PROXY_STACK" == "daed" ]]; then
   log "  · ImmortalWrt 前端 luci-app-{ddns-go,msd_lite}"
   log "  · 代理核心        daed（dae-wing + 内嵌面板，基座官方 feed，未引入第三方仓库）"
+elif [[ "$PROXY_STACK" == "singbox" ]]; then
+  log "  · ImmortalWrt 前端 luci-app-{ddns-go,msd_lite}（没有代理前端）"
+  log "  · 代理核心        sing-box（reF1nd 源码编译，自带 init + config.json）"
 else
   log "  · ImmortalWrt 前端 luci-app-{ddns-go,msd_lite}"
   log "  · passwall2       luci-app-passwall2 + ${#pw_rels[@]} 个依赖组件"

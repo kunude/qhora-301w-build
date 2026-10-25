@@ -1,0 +1,764 @@
+name: Build QHora-301W (ImmortalWrt + NSS + sing-box 纯净内核)
+
+# 第六条线：immortalwrt 基座 + NSS 补丁 + **只有 sing-box，没有前端**。
+#
+# ── 这条线是什么 ────────────────────────────────────────────────
+# 装进固件的代理相关东西只有三样：
+#     /usr/bin/sing-box            reF1nd/sing-box 源码编译（SINGBOX_MODE=source）
+#     /etc/init.d/sing-box         包自带 procd 脚本（启动前先 `sing-box check`）
+#     /etc/sing-box/config.json    默认 tun + auto_route + auto_redirect，全直连
+# 没有 luci-app-homeproxy，没有 passwall2，没有 dae/daed。
+# 分流、订阅、节点全部靠手改 config.json —— 这就是"不套壳"的完整代价。
+#
+# ── 和 homeproxy-refind 那条线的关系 ─────────────────────────────
+#   内核：**完全同一份**（同一个模板、同一个 resolve 脚本、同一批构建标签）；
+#   前端：那条线有 HomeProxy（订阅解析 + 分流页面 + 自动写 nft 规则），
+#         这条线什么都没有，只有 JSON。
+# 所以两条线的固件可以互刷，但刷到纯净线之后 LuCI 里就没有代理页面了 ——
+# 配置只能 SSH 改文件（或者你自己再写个 LuCI 页面）。
+#
+# ── 为什么值得要这条线 ──────────────────────────────────────────
+# HomeProxy 那套链路是「UCI → ucode 生成 config.json → 写 /etc/nftables.d →
+# 拉起 sing-box」，中间任何一环出错都表现为"整个 LAN 断网"，而且报错分散在
+# 三个地方（rpcd、nft、sing-box check）。纯净线把链路压到「一个进程 + 一份 JSON」，
+# 排查只需要 `sing-box check` 与 `logread -e sing-box`。
+#
+# ── 代价（选这条线之前必须知道）──────────────────────────────────
+#   1. **全部流量走用户态**：默认 tun + auto_redirect，包括国内流量。
+#      HomeProxy 线用 nftables 把国内 IP 在内核里直连（china_ip4 集合）、
+#      只有出境流量进 sing-box，NSS 硬件加速对直连部分有效。本线没有这层，
+#      吞吐会明显低于 HomeProxy 线。
+#   2. 没有国内直连分流规则：默认 config.json 的 final 是 direct，
+#      加了节点之后要自己写 route.rules（否则全部走代理，或全部直连）。
+#   3. 没有订阅：sing-box 本身不支持订阅链接，节点要自己转换后手填。
+#
+# ── 内核怎么编 ──────────────────────────────────────────────────
+#   packages/net/sing-box-refind/Makefile.in   配方模板（@VER@/@SHA@/@HASH@）
+#   scripts/resolve-singbox-src.sh             ref → sha → hash → 渲染
+#   scripts/extra-packages.sh  PROXY_STACK=singbox 分支
+#       → 落位 feeds/packages/net/sing-box（覆盖 feed 那份）
+# 构建标签与 reF1nd 的 release/DEFAULT_BUILD_TAGS 逐字一致。
+# 包版本形如 1.14.0_git20261024（_git 是 apk 版本串允许的后缀），
+# `sing-box version` 显示 1.14.0_git20261024-refind。
+#
+# ── 触发方式 ────────────────────────────────────────────────────
+#   · 手动：Actions -> 本工作流 -> Run workflow（可填 singbox_ref 钉 commit）
+#   · 推送：本文件 / configs/singbox.config / packages/net/sing-box-refind/**
+#   · 定时：每周一 22:00 UTC（周二 06:00 东八区），与其它线错开
+#
+# 产物：与其它线相同的三个镜像 + 校验文件；固件里没有代理 LuCI 页面。
+
+on:
+  workflow_dispatch:
+    inputs:
+      imm_ref:
+        description: "ImmortalWrt 基座的 ref（分支 / 标签 / commit，留空 = master）"
+        required: false
+        default: ""
+      imm_feed_ref:
+        description: "ImmortalWrt luci/packages 的 ref（留空 = master；一般不用填）"
+        required: false
+        default: ""
+      imm_luci:
+        description: "immortalwrt/luci 仓库地址（留空 = 官方；提供 ddns-go / msd_lite 前端）"
+        required: false
+        default: ""
+      imm_pkgs:
+        description: "immortalwrt/packages 仓库地址（留空 = 官方；提供 sing-box）"
+        required: false
+        default: ""
+      release:
+        description: "构建成功后创建 GitHub Release 并附带镜像"
+        type: boolean
+        default: false
+      # 下面两个留空就跟随上游最新版本（默认行为）。
+      # 想编某个确定版本、或者要可复现的固件时，在这里填死。
+      ddns_go_version:
+        description: "钉死 ddns-go 版本，如 6.17.7（留空 = 跟随上游最新 release）"
+        required: false
+        default: ""
+      msd_lite_sha:
+        description: "钉死 msd_lite 的 commit sha（留空 = 跟随上游 master HEAD）"
+        required: false
+        default: ""
+      # 内核源码的 ref。留空 = 跟随 reF1nd/sing-box 的 testing 分支 HEAD
+      # （也就是上游最新）。要可复现的固件就在这里填一个 40 位 commit sha 或
+      # tag —— 填了之后同一个值永远编出同一份内核。
+      # 注意：填分支名（如 testing）等于"每次构建都可能不一样"，这与
+      # 下面 release 的说明里会写清楚的 commit 号并不矛盾 —— 版本号吃的是
+      # 解析出来的 sha，不是分支名。
+      singbox_ref:
+        description: "reF1nd/sing-box 的 ref（分支/tag/commit；留空 = testing HEAD）"
+        required: false
+        default: ""
+      # 勾选后**不恢复任何构建缓存**（dl 源码包 + ccache），完全从零编译。
+      # 只影响本次运行：跑完仍会保存新的源码包缓存供下次复用。
+      clean_build:
+        description: "从头编译：忽略 dl 与 ccache 缓存"
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    # 与老 homeproxy 线同样的取舍：只监听"只属于本线"的文件。
+    # 监听 scripts/ patches/ files/ 会让它与 imm-nss 线同时触发全量编译。
+    paths:
+      - ".github/workflows/build-qhora-301w-imm-nss-singbox-src.yml"
+      - "configs/singbox.config"
+      - "configs/imm-nss.config"
+      - "packages/net/sing-box-refind/**"
+      - "scripts/resolve-singbox-src.sh"
+      # 覆盖层也要监听：它决定出厂 /etc/config/sing-box 是 enabled=1 还是 0，
+      # 改错了固件就是"装了内核但不开机自启"，必须在下次构建里体现。
+      - "files-singbox/**"
+  schedule:
+    # GitHub 的 cron 用 UTC。22:00 UTC = 次日 06:00 东八区。
+    # 其它线是 17:00 / 20:00 / 21:00 UTC，本线排最后，四条线不会撞在一起。
+    # 定时跑的意义：reF1nd/testing 是**活的分支**，它随时可能引入编不过的
+    # 改动。定时构建是最早发现"内核跟不上了"的手段。
+    #
+    # 定时跑的意义：基座是活的 immortalwrt，它会往前走。定时构建是
+    # 「NSS 补丁 + HomeProxy 跟不跟得上基座」的唯一自动探测手段。
+    - cron: "0 22 * * 0"
+
+# 用**独立**的 concurrency group。共用一个 group 时，另一条线的 run 会让本线
+# 新进来的 run 被 GitHub 直接判成 cancelled（老 homeproxy 线撞过这个坑）。
+concurrency:
+  group: build-qhora-301w-imm-nss-singbox-src-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # ── 基座源码：活的 ImmortalWrt ──────────────────────────────
+  IMM_REPOSITORY: immortalwrt/immortalwrt
+  # 基座的 ref。**与下面的 IMM_REF 是两个不同的东西**：
+  #   IMM_BASE_REF = immortalwrt/immortalwrt 这个仓库的 ref（checkout 基座用）
+  #   IMM_REF      = immortalwrt/luci 与 immortalwrt/packages 的 ref
+  #                  （extra-packages.sh 稀疏检出 HomeProxy / sing-box 用）
+  # 两者拆开是必要的：它们分属三个不同的仓库，把 imm_ref 钉到某个基座 commit
+  # 时，那个 commit 在 luci/packages 里根本不存在，稀疏检出会直接失败。
+  # ⚠️ 暂时钉在 da63f7d（2026-10-15，NSS 补丁完整编译验证过的那一版）。
+  # 原因：immortalwrt 的 2248ed7（2026-10-16 "nftables: refresh patches after
+  # version bump"）动了内核模块定义，patches/immortalwrt-nss/ 这份补丁的
+  # 上下文对不上（input.mk / usb.mk / ipq8074-rt-ax89x.dts / qca_ppe_main.c
+  # 四处），`git apply` 与 `patch --fuzz=3` 都拒绝。
+  # 补丁按新基座重新生成之后，把这里改回 'master' 即可。
+  IMM_BASE_REF: ${{ github.event.inputs.imm_ref || 'da63f7d6ac4207e534c9b92ba3d2b555a8edce8d' }}
+  # 用 github.event.inputs 而不是 inputs：两者在 workflow_dispatch 下等价，
+  # 但前者在 push / schedule 事件下也能安全求值（返回空）。
+  IMM_REF: ${{ github.event.inputs.imm_feed_ref || 'master' }}
+  IMM_LUCI: ${{ github.event.inputs.imm_luci }}
+  IMM_PKGS: ${{ github.event.inputs.imm_pkgs }}
+  # NSS 驱动 / ECM / qdisc / 固件所在的独立 feed —— 与另外三条线**同一个**。
+  # feed 是独立的包仓库，与"换不换基座"无关，所以这里一个字都不用改。
+  # 缺了它 ATH11K_NSS_SUPPORT 的依赖不满足，连 defconfig 都会失败。
+  NSS_FEED: "src-git nss https://github.com/JuliusBairaktaris/nss-packages.git;edma-nss"
+
+  # ── 目标机型 ────────────────────────────────────────────────
+  TARGET: qualcommax
+  SUBTARGET: ipq807x
+  DEVICE: qnap_301w
+  DEVICE_LABEL: QHora-301W
+  OPENWRT_DIR: ${{ github.workspace }}/openwrt
+  BUILDER_DIR: ${{ github.workspace }}/builder
+
+  # ── 代理栈 ──────────────────────────────────────────────────
+  # singbox：纯净内核线。只拼 configs/singbox.config（把 passwall2 全家关掉、
+  # 点名 sing-box + kmod-tun + kmod-inet-diag），不引入任何 LuCI 代理前端。
+  # 与 homeproxy 的差别在 extra-packages.sh 里有独立分支（③-S）。
+  PROXY_STACK: singbox
+  # source：内核从 reF1nd/sing-box 源码编（本线的内核来源，也是唯一允许的取值 ——
+  # extra-packages.sh 会拒绝 singbox + 其它 SINGBOX_MODE 的组合）。
+  SINGBOX_MODE: source
+  # 内核 ref。留空 = testing HEAD；填 40 位 sha 就是可复现构建。
+  SINGBOX_SRC_REF: ${{ github.event.inputs.singbox_ref }}
+  # 版本号里的上游基线，只影响包版本串的显示与排序。
+  SINGBOX_SRC_BASE: "1.14.0"
+
+jobs:
+  build:
+    name: Build ImmortalWrt@${{ github.event.inputs.imm_ref || 'master' }} -> QHora-301W (NSS + sing-box src)
+    # 与上游作者自己的 CI 同一档环境，避免踩 base image 的坑。
+    runs-on: ubuntu-26.04
+    # GitHub 托管 runner 单个 job 硬上限 6 小时，这里留 2 分钟收尾。
+    # 比 imm-nss-homeproxy 线多留：sing-box 是本树里现编的（Go 交叉编译 +
+    # 首次拉 ~100 个模块），实测比"直接用 feed 的二进制包"多 15~25 分钟。
+    timeout-minutes: 358
+    permissions:
+      # 勾选 release 时需要有写权限。仓库设置里
+      # Settings -> Actions -> General -> Workflow permissions 需要允许读写。
+      contents: write
+
+    steps:
+      # ── 释放磁盘 ──────────────────────────────────────────────
+      # 全量编译（工具链 + 内核 + 全部软件包）大约需要 25-35GB，
+      # runner 根分区默认不够，先删掉用不到的预装 SDK。
+      - name: 释放磁盘空间
+        run: |
+          set -euo pipefail
+          df -h / | tail -1
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /usr/local/share/boost \
+            /opt/hostedtoolcache/CodeQL || true
+          sudo apt-get clean
+          df -h / | tail -1
+
+      # ── 系统依赖 ──────────────────────────────────────────────
+      - name: 安装构建依赖
+        run: |
+          set -euo pipefail
+          # OpenWrt 自建 flex/bison 等 host 工具，所以宿主机只需要最小集合。
+          # 这个列表与上游 Qualcommax_NSS_Builder 的 CI 保持一致，是验证过的组合。
+          # 不需要 rsync —— prepare-build.sh 叠加覆盖文件用的是 cp -a。
+          # patch    NSS 补丁的兜底应用方式（git apply 失败时用）。
+          # python3  extra-packages.sh 的 latest 通道要它打 HomeProxy 兼容补丁；
+          #          runner 预装了，这里显式声明，免得换了 base image 才炸。
+          sudo apt-get update || true
+          sudo apt-get install -y \
+            bzip2 g++ gawk gcc git glibc-source libncurses-dev make patch python3
+
+      # ── 拉取源码 ──────────────────────────────────────────────
+      # fetch-depth 1：本线的补丁应用不依赖历史（用 git apply / patch -p1，
+      # 不做三方合并），浅克隆足够，还能省掉一大截下载时间。
+      - name: 检出 ImmortalWrt 基座源码
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.IMM_REPOSITORY }}
+          ref: ${{ env.IMM_BASE_REF }}
+          fetch-depth: 1
+          path: openwrt
+
+      - name: 检出本仓库（配置与脚本）
+        uses: actions/checkout@v7
+        with:
+          path: builder
+
+      # ── 组装构建环境 ──────────────────────────────────────────
+      # 先确认 runner 上真有 feeds/make 依赖的工具：scripts/feeds 是 Perl 脚本、
+      # 索引器要 make，缺任何一项都会在后面以很晦涩的方式失败。
+      - name: 环境预检
+        run: |
+          set -euo pipefail
+          # scripts/feeds 是 Perl 脚本、索引器要 make；
+          # resolve-versions.sh 还要 curl/tar/sha256sum 去解析上游版本并算 hash；
+          # apply-nss-patches.sh 需要 patch 做兜底应用。
+          # 缺任何一项都会在后面以很晦涩的方式失败，所以先查一遍。
+          for c in perl make git gcc g++ gawk bzip2 curl tar sha256sum patch python3; do
+            command -v "$c" >/dev/null 2>&1 ||
+              { echo "::error::runner 上缺少必需工具：$c"; exit 1; }
+          done
+          perl -v | sed -n '2p'
+          make --version | head -1
+          echo "必需工具齐备"
+
+      # ── NSS 移植 + 准备构建环境 ───────────────────────────────
+      # 第 0 步（imm 线独有）：apply-nss-patches.sh 把 NSS 补丁打进 immortalwrt 源码树；
+      # 第 1–7 步与另外三条线完全相同（feeds / 第三方包 / .config / 符号校验 /
+      # 凭据守卫 / 覆盖文件 / 内核补丁注入），只是 PROXY_STACK=singbox。
+      - name: NSS 移植 + 准备构建环境（feeds + sing-box 源码内核 + .config + 覆盖文件）
+        env:
+          # 用来查 GitHub API 解析 ddns-go / msd_lite 的上游最新版本。
+          # 不给 token 也能跑，但未认证限额只有 60 次/小时，容易被别处撞掉。
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 留空 = 跟随上游最新版本（默认）。push / schedule 事件下这两个表达式
+          # 求值为空字符串，所以那两个触发方式天然就是"跟随最新"。
+          DDNS_GO_VERSION: ${{ github.event.inputs.ddns_go_version }}
+          MSD_LITE_SHA: ${{ github.event.inputs.msd_lite_sha }}
+          # 本线不再从 ImmortalWrt 取 HomeProxy，但仍要用它的 luci 侧拿到
+          # luci-app-ddns-go / luci-app-msd_lite 两个前端（以及 luci-base 的
+          # 首页温度/CPU 那两行）。全部留空 = 用 extra-packages.sh 的默认值。
+          # PROXY_STACK=singbox + SINGBOX_MODE=source 已在顶层 env 里 ——
+          # extra-packages.sh 据此走 ③-S 分支：只渲染源码配方，不拉任何前端。
+          IMM_REF: ${{ github.event.inputs.imm_feed_ref || 'master' }}
+          IMM_LUCI: ${{ github.event.inputs.imm_luci }}
+          IMM_PKGS: ${{ github.event.inputs.imm_pkgs }}
+        run: bash "$BUILDER_DIR/scripts/prepare-build-imm-nss.sh"
+
+      # 日志要仓库 admin 权限才能从 API 下载，所以把它回放到控制台，
+      # 失败时这一步也会执行（always），日志一定看得到。
+      - name: 回放构建准备日志
+        if: always()
+        run: |
+          f="$GITHUB_WORKSPACE/prepare-build.log"
+          if [ -f "$f" ]; then
+            echo "::group::prepare-build.sh 日志（尾部 150 行）"
+            tail -n 150 "$f"
+            echo "::endgroup::"
+          else
+            echo "没有生成 prepare-build.log（可能是 NSS 补丁那一步就失败了，见上一步输出）"
+          fi
+
+      # ── 可复现构建 ────────────────────────────────────────────
+      # 注意：下面两个 KBUILD_BUILD_* 只对**非内核**组件生效。内核版本串里的
+      # user@host 由 include/kernel.mk 以 make 变量覆盖环境变量，必须写在
+      # configs/common.config 的 CONFIG_KERNEL_BUILD_USER / _DOMAIN 里。
+      - name: 设置可复现构建环境变量
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+          git log -1 --format='  base commit : %H %ci%n  subject     : %s'
+          {
+            echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)"
+            echo "TZ=UTC"
+            echo "LC_ALL=C"
+            echo "KBUILD_BUILD_USER=builder"
+            echo "KBUILD_BUILD_HOST=github-actions"
+          } >>"$GITHUB_ENV"
+
+      # ── 下载源码包 ────────────────────────────────────────────
+      # 上游镜像偶尔抽风，重试三次。下载好的包在多次运行之间缓存复用。
+      # cache key 带 imm-hp- 前缀：不与另外三条线的 dl 缓存互相顶掉
+      # （各线的包集合不同）。
+      - name: 恢复源码包缓存
+        if: github.event.inputs.clean_build != 'true'
+        uses: actions/cache/restore@v6
+        with:
+          path: openwrt/dl
+          # 带上 run_attempt：整个 run 重跑时不会撞上已存在的 key
+          key: dl-imm-hp-${{ github.run_id }}-${{ github.run_attempt }}
+          # 退一步也可以复用 imm-nss 线的 dl（基座与 NSS 部分完全相同，
+          # 只差 homeproxy 那几个包的源码包）
+          restore-keys: |
+            dl-imm-hp-
+            dl-imm-
+
+      - name: 下载源码包
+        id: download
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+          mkdir -p dl
+          before=$(find dl -maxdepth 1 -type f | wc -l)
+          for attempt in 1 2 3; do
+            if make download -j"$(nproc)"; then break; fi
+            if [[ $attempt -ge 3 ]]; then echo "::error::源码包下载连续失败三次"; exit 1; fi
+            echo "::warning::第 $attempt 次下载失败，重试"
+            sleep 10
+          done
+          if [[ "$(find dl -maxdepth 1 -type f | wc -l)" -gt "$before" ]]; then
+            echo "grew=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "grew=false" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: 保存源码包缓存
+        if: steps.download.outputs.grew == 'true'
+        # 缓存只是加速手段，存不进去（配额满、key 冲突）不该让整个构建失败
+        continue-on-error: true
+        uses: actions/cache/save@v6
+        with:
+          path: openwrt/dl
+          key: dl-imm-hp-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # ── ccache ────────────────────────────────────────────────
+      # 缓存 key 里带上工具链目录树的哈希和 binutils/gcc/libc 的配置：
+      # 任何一项变了都从空缓存开始，避免命中错误的目标文件。
+      # 前缀带 imm-hp-：与另外三条线的 ccache 分开，各线的宏/补丁集不同，
+      # 混用只会浪费容量。
+      - name: 计算 ccache key
+        id: ccache
+        run: |
+          set -euo pipefail
+          tree=$(git -C openwrt rev-parse HEAD:toolchain)
+          sum=$({
+            echo "$tree"
+            grep -E '^CONFIG_(BINUTILS|GCC|LIBC|MUSL|GLIBC)_' openwrt/.config
+            gcc --version; as --version
+          } | sha256sum | cut -c1-16)
+          echo "prefix=ccache-qhora301w-imm-hp-$sum-" >>"$GITHUB_OUTPUT"
+
+      - name: 恢复 ccache
+        if: github.event.inputs.clean_build != 'true'
+        uses: actions/cache@v6
+        with:
+          path: openwrt/.ccache
+          key: ${{ steps.ccache.outputs.prefix }}${{ github.run_id }}
+          restore-keys: ${{ steps.ccache.outputs.prefix }}
+
+      # ── 编译 ──────────────────────────────────────────────────
+      # 首次运行没有缓存会慢很多；如果撞到 6 小时上限，直接重跑一次，
+      # ccache 和 dl 缓存都会复用。
+      - name: 编译
+        working-directory: openwrt
+        env:
+          CCACHE_COMPILERCHECK: content
+          CCACHE_MAXSIZE: 5G
+          # 构建日志留给下面两步做回放和注解上报。
+          # 放 RUNNER_TEMP 而不是工作区，免得混进 artifact 或被 git 看到。
+          BUILD_LOG: ${{ runner.temp }}/build.log
+        run: |
+          # 这里**故意不加 -e**：make 失败要自己接住，好决定是否单线程重跑，
+          # 并把完整日志留下来给后面两步上报。
+          set -uo pipefail
+          : >"$BUILD_LOG"
+
+          # 走 tee 之后 $? 是 tee 的退出码，make 自己的要用 PIPESTATUS[0] 取。
+          make -j"$(nproc)" 2>&1 | tee -a "$BUILD_LOG"
+          rc=${PIPESTATUS[0]}
+
+          if (( rc != 0 )); then
+            echo "::warning::并行编译失败（make 退出码 $rc），改用单线程 -j1 V=s 重跑以拿到完整报错"
+            make -j1 V=s 2>&1 | tee -a "$BUILD_LOG"
+            rc=${PIPESTATUS[0]}
+          fi
+
+          staging_dir/host/bin/ccache -s 2>&1 | tee -a "$BUILD_LOG" || true
+
+          if (( rc != 0 )); then
+            echo "编译失败：make 最终退出码 $rc。完整日志见下一步「回放编译日志」。"
+            exit "$rc"
+          fi
+          echo "编译通过"
+
+      # 编译**失败**的唯一远程可见通道是注解：作业日志要仓库 admin 权限才能从
+      # API 下载（公开仓库一样 403），而 ::error:: 会变成 check-run annotation，
+      # 那个是公开可读的。所以把"哪个包挂了 / 报错行"发成注解。
+      - name: 回放编译日志
+        if: always()
+        env:
+          BUILD_LOG: ${{ runner.temp }}/build.log
+        run: |
+          if [[ ! -s "$BUILD_LOG" ]]; then
+            echo "没有构建日志（可能编译步骤之前就失败了）"
+            exit 0
+          fi
+          echo "::group::构建日志共 $(wc -l <"$BUILD_LOG") 行，回放最后 250 行"
+          tail -n 250 "$BUILD_LOG"
+          echo "::endgroup::"
+
+      - name: 上报编译失败原因
+        if: failure()
+        env:
+          BUILD_LOG: ${{ runner.temp }}/build.log
+        run: |
+          [[ -s "$BUILD_LOG" ]] || exit 0
+
+          # OpenWrt 挂在某个包上时会打印固定格式： "ERROR: package/<路径> failed to build."
+          failed=$(grep -oE 'ERROR: package/[^ ]+ failed to build' "$BUILD_LOG" \
+                   | sed 's|^ERROR: package/||; s| failed to build$||' \
+                   | sort -u | tr '\n' ' ' || true)
+          # 最常见的几种真实报错行（尾部若干条，前面的多半是噪音）
+          hints=$(grep -nE 'Error [0-9]+$|error:|Error [0-9]+:|undefined reference|cannot find -l|No rule to make target|fatal error|CMake Error' \
+                  "$BUILD_LOG" | tail -n 8 || true)
+
+          if [[ -n "$failed" ]]; then
+            echo "::error title=编译失败的包::${failed}"
+          fi
+          if [[ -n "$hints" ]]; then
+            # 注解里的换行要写成 %0A，而 % 本身必须写成 %25（否则会被当转义前缀）
+            msg=$(printf '%s\n' "$hints" | sed 's/%/%25/g; s/\r//g' | awk '{printf "%s%%0A", $0}')
+            echo "::error title=编译报错行（尾部 8 条）::${msg}"
+          fi
+          if [[ -z "$failed$hints" ]]; then
+            echo "::error title=编译失败::没从日志里认出固定格式的报错，请看上一步的控制台回放"
+          fi
+
+      # ── 收集产物 ──────────────────────────────────────────────
+      - name: 收集并校验产物
+        run: |
+          set -euo pipefail
+          out="openwrt/bin/targets/${TARGET}/${SUBTARGET}"
+          [[ -d "$out" ]] || { echo "::error::输出目录不存在：$out"; exit 1; }
+
+          ls -lh "$out"
+
+          # 必须有 sysupgrade；没有就说明设备压根没编进去。
+          compgen -G "$out/*${DEVICE}*squashfs-sysupgrade.bin" >/dev/null ||
+            { echo "::error::$out 下没有 ${DEVICE} 的 sysupgrade 镜像"; exit 1; }
+
+          # 把产物清单也发成注解：check-run annotations 是公开可读的，
+          # 而作业日志和 artifact 内容都必须登录才能看 —— 这样远程（包括无人值守
+          # 的自动化脚本）也能核对到底编出了哪些镜像、各多大。
+          # 整段包在 if 里，避免 set -e 把「grep 没匹配到」当成失败。
+          # 注意 grep 的模式里要有 .manifest：rootfs 清单的文件名是
+          # openwrt-<board>-<subtarget>[-profile].manifest，不一定含设备名。
+          if listing=$(cd "$out" && ls -lh . 2>/dev/null |
+                         grep -E "${DEVICE}|sha256sums|config\.buildinfo|profiles\.json|\.manifest|\.bom\.cdx\.json" |
+                         awk '{print $5"  "$9}'); then
+            while IFS= read -r line; do
+              [ -n "$line" ] || continue
+              echo "::notice title=QHora-301W 产物::$line"
+            done <<<"$listing"
+          fi
+
+          {
+            echo "## QHora-301W 构建产物（ImmortalWrt + NSS + sing-box 纯净内核）"
+            echo
+            echo '```'
+            (cd "$out" && ls -lh . | grep -E "${DEVICE}|sha256sums|config\.buildinfo|profiles\.json|\.manifest" || true)
+            echo '```'
+            echo
+            echo "- 基座：\`${IMM_REPOSITORY}@${IMM_BASE_REF}\`，提交 \`$(git -C openwrt rev-parse --short HEAD)\`"
+            echo "- NSS 补丁集：\`patches/immortalwrt-nss/\`（来源见该目录 README.md）"
+            echo "- 代理栈：**无前端**，只有 reF1nd 源码编的 sing-box（SINGBOX_MODE=source）"
+            if [[ -f "$out/config.buildinfo" ]]; then
+              echo "- NSS 固件档位：\`$(grep -m1 '^CONFIG_NSS_FIRMWARE_VERSION' "$out/config.buildinfo" || true)\`"
+            fi
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      # ── 校验功能包真的进了固件 ────────────────────────────────
+      # 配置里写 CONFIG_PACKAGE_x=y 只证明"被选中"，不证明"编出来了"。
+      # 这里从两个互相独立的角度核对：
+      #   ① 包有没有生成包文件（apk 后端是 .apk，opkg 后端是 .ipk）；
+      #   ② 包名有没有出现在 rootfs 的 .manifest —— 那是最终固件的包清单。
+      # 两组都要点名，缺一不可：
+      #   · NSS 那 9 个 —— 证明补丁集真的生效（不是空编一场）；
+      #   · sing-box 那组 —— 证明内核与它的内核前提都在（少一个就装不起来）。
+      - name: 校验功能包是否真的编进固件
+        run: |
+          set -euo pipefail
+          out="openwrt/bin/targets/${TARGET}/${SUBTARGET}"
+
+          # NSS 那一组是这条线存在的理由，列在最前面。
+          # nss-tools 提供 /usr/sbin/nss-up、nss-status 与 'nss' 开机服务；
+          # luci-app-nss / luci-app-nssqos 是配套页面；nssqos 是 DSCP 标记。
+          # 缺任何一个都说明补丁集没生效。
+          NSS_WANT="nss-tools luci-app-nss nssqos luci-app-nssqos \
+                    kmod-qca-nss-drv kmod-qca-nss-ecm kmod-qca-ppe-nss \
+                    kmod-qca-nss-drv-pppoe kmod-qca-nss-drv-bridge-mgr"
+
+          # sing-box 那组。这条线没有前端，所以清单很短，但每一项都是硬前提：
+          #
+          #   sing-box        内核本体（源码编，版本串带 _git 与 -refind）
+          #   kmod-tun        tun 入站的设备节点；缺了 sing-box 启动即报错
+          #   kmod-inet-diag  auto_redirect / 进程匹配依赖 inet_diag
+          #
+          # **故意没有** luci-app-homeproxy / kmod-nft-tproxy / ucode-mod-*：
+          # 那是 HomeProxy 线的依赖（它自己写 nft 规则、用 ucode 生成配置）。
+          # 本线的 tun + auto_redirect 由 sing-box 内部用 netlink 写 nft，
+          # 不需要 nft 命令行工具或那些 ucode 模块。
+          WANT="msd_lite luci-app-msd_lite luci-i18n-msd_lite-zh-cn \
+                ddns-go luci-app-ddns-go luci-i18n-ddns-go-zh-cn \
+                wireguard-tools luci-proto-wireguard kmod-wireguard \
+                sing-box kmod-tun kmod-inet-diag \
+                luci-app-statistics luci-i18n-statistics-zh-cn \
+                collectd-mod-thermal rrdtool1 autocore"
+
+          # ── ① 先搞清楚这个分支用的是 apk 还是 opkg ─────────────────
+          # 新版 OpenWrt 默认 CONFIG_USE_APK=y，包文件是 <name>-<version>.apk；
+          # 只有 opkg 才是 <name>_<version>_<arch>.ipk。
+          # 写死 *.ipk 会让每个包都"找不到" —— 上一轮 9 个包全报"没有被编译"
+          # 就是栽在这里：那是校验脚本的误报，不是包没编。
+          backend=$(grep -m1 -E '^CONFIG_USE_APK=' openwrt/.config 2>/dev/null || true)
+          apk_n=$(find openwrt/bin/packages -maxdepth 3 -name '*.apk' 2>/dev/null | wc -l || true)
+          ipk_n=$(find openwrt/bin/packages -maxdepth 3 -name '*.ipk' 2>/dev/null | wc -l || true)
+          echo "::notice title=包后端::${backend:-（.config 里没有 CONFIG_USE_APK，按默认 =y 走 apk）}；bin/packages 下 .apk=$apk_n 个 / .ipk=$ipk_n 个"
+
+          # ── ② rootfs 清单 ──────────────────────────────────────────
+          # 文件名由 $(IMG_PREFIX)$(PROFILE_SANITIZED) 拼成，未必含设备名，
+          # 所以用 find 找，不要按设备名去拼路径。
+          manifest=$(find "$out" -maxdepth 1 -name '*.manifest' -print -quit 2>/dev/null || true)
+          if [[ -n "$manifest" ]]; then
+            echo "::notice title=rootfs 清单::$(basename "$manifest") —— $(wc -l < "$manifest") 行"
+          else
+            echo "::warning::$out 下没有 .manifest，只能核对包文件"
+          fi
+
+          bad=0
+          for p in $NSS_WANT $WANT; do
+            # ③ 包文件：apk 与 ipk 两种命名都找。用 -quit 拿到第一个就停；
+            #    找不到时 find 也返回 0，不会被 set -e 杀掉。
+            pkg=$(find openwrt/bin/packages openwrt/bin/targets \
+                    \( -name "${p}-*.apk" -o -name "${p}_*.ipk" \) \
+                    -print -quit 2>/dev/null || true)
+
+            # ④ 最终 rootfs 清单（每行形如 "msd_lite - 2023-..."）
+            hit=0
+            if [[ -n "$manifest" ]] && grep -qE "^${p}[[:space:]]" "$manifest"; then hit=1; fi
+
+            if [[ -n "$pkg" && "$hit" -eq 1 ]]; then
+              echo "::notice title=功能包 OK::$p → $(basename "$pkg")，已在 rootfs 清单里"
+            elif [[ -n "$pkg" ]]; then
+              echo "::warning::$p 编出来了（$(basename "$pkg")）但不在 rootfs 清单里"
+            elif [[ "$hit" -eq 1 ]]; then
+              echo "::error::$p 在 rootfs 清单里，却找不到它的包文件"
+              bad=$((bad + 1))
+            else
+              echo "::error::$p 既没有包文件也不在 rootfs 清单里 —— 它没有被编译"
+              bad=$((bad + 1))
+            fi
+          done
+
+          [[ "$bad" -eq 0 ]] || { echo "::error::有 $bad 个要求的功能包没有被编译"; exit 1; }
+          echo "要求的功能包全部已编译并进入 rootfs"
+
+          # ── ⑤ 内核来源校验：必须是"本树里编出来的 reF1nd"，不是 feed 的包 ──
+          # 本线的全部意义就是内核来源，所以这里不是"上报"，是**硬断言**。
+          # 三道，任何一道不过都直接失败 —— 因为这三件事出错时，固件照样能编出来、
+          # 刷进去也能开机，只有 `sing-box version` 不对劲，人工很难发现：
+          #   ① 包版本必须带 _git（源码快照）。带不上说明 feeds/packages/net/sing-box
+          #      根本没被源码配方覆盖，装的是基座自带那份官方 1.14.x；
+          #   ② build_dir 里必须真有编出来的二进制，且含 "-refind" 版本串。
+          #      这串由 GO_PKG_LDFLAGS_X 注入，只有 packages/net/sing-box-refind
+          #      的模板里有 —— 从别处拷进来的二进制不会带它；
+          #   ③ 出厂覆盖层真的进了 rootfs（enabled=1 + 自启脚本 + config.json）。
+          sb_pkg=$(find openwrt/bin/packages openwrt/bin/targets \
+                     \( -name 'sing-box-*.apk' -o -name 'sing-box_*.ipk' \) \
+                     -print -quit 2>/dev/null || true)
+          [[ -n "$sb_pkg" ]] || { echo "::error::找不到 sing-box 的包文件，无法核对内核来源"; exit 1; }
+          sb_file=$(basename "$sb_pkg")
+          # sing-box-1.14.0_git20261024-r1.apk → 1.14.0_git20261024-r1
+          # 只去掉包名前缀和扩展名：版本串里本身带下划线（1.14.0_git20261024-r1），
+          # 再按 `_` 切一次会把 _git20261024 整段切掉 —— 上面那个 _git 断言就永远过不了。
+          sb_ver=$(printf '%s' "$sb_file" | sed -E 's/^sing-box[-_]//; s/\.(apk|ipk)$//')
+          echo "::notice title=sing-box 实际包::${sb_file}"
+
+          case "$sb_ver" in
+            *_git*)
+              echo "::notice title=sing-box 版本::${sb_ver} —— 源码快照版本，符合本线预期" ;;
+            *)
+              echo "::error::sing-box 包版本是 ${sb_ver}，不带 _git —— feeds/packages/net/sing-box 没有被源码配方覆盖（SINGBOX_MODE=source 没生效），这份固件里装的是别人的内核"
+              exit 1 ;;
+          esac
+
+          # 找最终那个二进制。**优先 rootfs 装配目录**（就是装进镜像的那份），
+          # 其次才是 build_dir 里的中间产物 —— 后者可能已被 CONFIG_AUTOREMOVE
+          # 清理（它默认开着），不能当成唯一依据，否则断言会误报。
+          sb_bin=$(find openwrt/build_dir -type f \
+                     \( -path '*/root-*/usr/bin/sing-box' -o -path '*sing-box*/bin/sing-box' \) \
+                     -print -quit 2>/dev/null || true)
+          if [[ -n "$sb_bin" ]]; then
+            if grep -aq -- '-refind' "$sb_bin"; then
+              echo "::notice title=内核来源::本树编译（$sb_bin），版本串含 -refind"
+            else
+              echo "::error::$sb_bin 里没有 -refind 版本串 —— 内核不是用 packages/net/sing-box-refind 的配方编的"
+              exit 1
+            fi
+          else
+            echo "::warning::找不到 sing-box 二进制（build_dir 可能被 AUTOREMOVE 清了）；以包版本里的 _git 作为内核来源证据"
+          fi
+
+          # HomeProxy 不在本线，所以没有 generate_client.uc 可查。
+          # 这里改为核对**出厂覆盖层是否真的进了 rootfs** —— 纯净线最常见的
+          # 翻车方式是"内核装上了，但 enabled 还是 0 / uci-defaults 没进去"，
+          # 表现是开机后 sing-box 静静地不跑，用户以为固件坏了。
+          rootfs=$(find openwrt/build_dir -maxdepth 4 -type d -name 'root-*' -print -quit 2>/dev/null || true)
+          if [[ -n "$rootfs" ]]; then
+            sbconf="$rootfs/etc/config/sing-box"
+            [[ -f "$sbconf" ]] || { echo "::error::rootfs 里没有 /etc/config/sing-box"; exit 1; }
+            grep -qE "^[[:space:]]*option[[:space:]]+enabled[[:space:]]+'1'" "$sbconf" \
+              || { echo "::error::/etc/config/sing-box 里 enabled 不是 1 —— 出厂不会自启（files-singbox 覆盖层没生效？）"; exit 1; }
+            [[ -f "$rootfs/etc/rc.d/S99sing-box" || -f "$rootfs/etc/uci-defaults/98-singbox-enable" ]] \
+              || { echo "::error::既没有 /etc/rc.d/S99sing-box 也没有 uci-defaults 里的自启脚本，开机不会拉起 sing-box"; exit 1; }
+            [[ -f "$rootfs/etc/sing-box/config.json" ]] \
+              || { echo "::error::rootfs 里没有 /etc/sing-box/config.json"; exit 1; }
+            echo "::notice title=出厂状态::/etc/config/sing-box enabled=1，自启脚本与 config.json 都在"
+          else
+            echo "::warning::找不到 rootfs 装配目录，跳过出厂覆盖层核对"
+          fi
+
+      - name: 上传镜像（artifact）
+        # 用 always()：即使后面某一步（比如功能包校验）失败，产物也必须传上去。
+        # 否则一旦校验报错，连固件本身都拿不到了 —— 老 homeproxy 线 run #6 就吃了
+        # 这个亏：校验误报 → 这一步被 skip → artifact 总数为 0。
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: openwrt-${{ env.DEVICE }}-imm-nss-singbox-src-${{ github.run_number }}
+          path: |
+            openwrt/bin/targets/qualcommax/ipq807x/*qnap_301w*
+            openwrt/bin/targets/qualcommax/ipq807x/*.manifest
+            openwrt/bin/targets/qualcommax/ipq807x/sha256sums
+            openwrt/bin/targets/qualcommax/ipq807x/config.buildinfo
+            openwrt/bin/targets/qualcommax/ipq807x/profiles.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      # ── 可选：发 Release ──────────────────────────────────────
+      # 版本取自 rootfs 清单（*.manifest，每行 "<包> - <版本>"）—— 固件里**实际
+      # 装进去**的版本，比读配方文件可靠（配方版本 ≠ 最终包版本）。
+      - name: 生成 Release 说明（编译日期 / 各组件版本）
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.release == 'true'
+        run: |
+          set -uo pipefail
+          out="openwrt/bin/targets/${TARGET}/${SUBTARGET}"
+          manifest=$(find "$out" -maxdepth 1 -name '*.manifest' -print -quit 2>/dev/null || true)
+
+          # 取版本；没收录（本版没编进去）就如实写"未收录"，不编数字
+          ver_of() {
+            local v=""
+            if [[ -n "$manifest" ]]; then
+              v="$(sed -n "s/^$1[[:space:]]\+-[[:space:]]\+//p" "$manifest" | head -n1)"
+            fi
+            printf '%s' "${v:-未收录}"
+          }
+
+          DATE_UTC="$(date -u '+%Y-%m-%d %H:%M UTC')"
+          DATE_CN="$(date -u -d '+8 hours' '+%Y-%m-%d %H:%M')"
+          BASE_COMMIT="$(git -C openwrt log -1 --format='%h · %cs' 2>/dev/null || echo '?')"
+          OW_VER="$(sed -n 's/^RELEASE:=//p' openwrt/include/version.mk 2>/dev/null | head -n1)"
+
+          PKGS="sing-box kmod-tun kmod-inet-diag \
+                msd_lite luci-app-msd_lite ddns-go luci-app-ddns-go \
+                wireguard-tools luci-proto-wireguard \
+                luci-app-statistics collectd-mod-thermal rrdtool1 autocore \
+                nss-tools luci-app-nss nssqos luci-app-nssqos \
+                kmod-qca-nss-drv kmod-qca-nss-ecm kmod-qca-ppe-nss"
+
+          {
+            printf '# QHora-301W · ImmortalWrt + NSS 固件（sing-box 纯净内核，无前端）\n\n'
+            printf '| | |\n|---|---|\n'
+            printf '| **编译日期** | %s（北京时间 %s） |\n' "$DATE_UTC" "$DATE_CN"
+            printf '| **基座源码** | `%s` @ `%s`，提交 `%s` |\n' "$IMM_REPOSITORY" "$IMM_BASE_REF" "$BASE_COMMIT"
+            printf '| **sing-box 内核** | `reF1nd/sing-box` 源码编译（版本见下表，末尾带 `-refind`） |\n'
+            printf '| **NSS 支持** | `patches/immortalwrt-nss/`（补丁，来源见该目录 README） |\n'
+            printf '| **OpenWrt** | %s |\n' "${OW_VER:-未知}"
+            printf '| **代理栈** | 无前端：只有 sing-box（源码编译）+ 手写 config.json |\n'
+            printf '| **构建配方** | `kunude/qhora-301w-build` @ `%s`，run #%s |\n\n' "${{ github.sha }}" "${{ github.run_number }}"
+
+            printf '## 组件版本（取自固件 rootfs 清单）\n\n'
+            printf '| 组件 | 版本 |\n|---|---|\n'
+            for p in $PKGS; do printf '| `%s` | %s |\n' "$p" "$(ver_of "$p")"; done
+            printf '\n'
+            printf '> **本线不装任何 LuCI 代理前端**：没有 HomeProxy、没有 passwall2。\n'
+            printf '> 节点与分流靠手改 `/etc/sing-box/config.json`，改完\n'
+            printf '> `/etc/init.d/sing-box restart`；出错看 `logread -e sing-box`（启动前\n'
+            printf '> 一定会跑 `sing-box check`，配置错会直接留在日志里）。\n'
+            printf '> 内核同样是从 `reF1nd/sing-box` 源码编的，`sing-box version` 带 `-refind`。\n\n'
+
+            cat <<'MD'
+          ## 文件
+
+          | 文件 | 用途 |
+          |---|---|
+          | `*-initramfs-uImage.itb` | **首次安装**：U-Boot 里用 TFTP 引导，再 sysupgrade |
+          | `*-squashfs-sysupgrade.bin` | 日常升级（已在跑 OpenWrt 时） |
+          | `*-squashfs-factory.bin` | eMMC 整盘写入 |
+
+          刷机前先用 `sha256sums` 校验。默认 LAN `192.168.35.1`，NSS 硬件卸载开机自启
+          （`nss-status` 查看状态）。**出厂即开 sing-box**（`tun + auto_redirect`，
+          全部流量先直连），但没有代理 LuCI 页面 —— 节点与分流要 SSH 改
+          `/etc/sing-box/config.json` 后 `/etc/init.d/sing-box restart`。
+
+          > ⚠️ 本固件不含 homeproxy、不含 passwall2、不含 dnsmasq-full。想用 LuCI
+          > 管理代理（订阅/分流页面）请刷 `imm-nss-homeproxy-refind` 那条线 ——
+          > 内核相同，只多了 HomeProxy 这层前端。
+
+          > ⚠️ 本固件与前两条线（nss-edma fork 基座）**不是同一个基座**：内核、驱动、DTS
+          > 都来自 ImmortalWrt。刷机方式与产物结构一致，但不要在两边的固件之间来回
+          > 只刷 sysupgrade 而不看版本——基座不同，建议保留一份可回退的镜像。
+          MD
+          } > "$GITHUB_WORKSPACE/release-notes.md"
+
+          echo "已生成 release-notes.md（$(wc -l < "$GITHUB_WORKSPACE/release-notes.md") 行）"
+
+      - name: 计算 Release 标签
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.release == 'true'
+        id: tag
+        run: echo "tag=qhora-301w-imm-nss-singbox-src-$(date -u +%Y%m%d)-${{ github.run_number }}" >>"$GITHUB_OUTPUT"
+
+      - name: 创建 Release
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.release == 'true'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: QHora-301W ImmortalWrt + NSS (sing-box 纯净内核) ${{ steps.tag.outputs.tag }}
+          draft: false
+          prerelease: false
+          body_path: release-notes.md
+          files: |
+            openwrt/bin/targets/qualcommax/ipq807x/*qnap_301w*

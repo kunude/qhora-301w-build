@@ -1,0 +1,23 @@
+#!/bin/sh
+#
+# 首次启动时把 sing-box 挂进 rc.d 并拉起来。
+#
+# 为什么不用"在 files 里直接放 /etc/rc.d/S99sing-box 符号链接"：
+#   符号链接要跨平台进 git（Windows 检出会变成普通文本文件），
+#   cp -a 到构建树后可能已经不是链接了。用 uci-defaults 在设备上创建最稳。
+#
+# 为什么 enabled 已经在 /etc/config/sing-box 里写成 1，这里还要 enable：
+#   这个 init 脚本是普通 procd 脚本（USE_PROCD=1），不是 enabled/disabled 那种
+#   由 /etc/rc.common 管理的自启开关 —— 真正决定开机自启的是 /etc/rc.d/S99sing-box
+#   这个链接，只有 `enable` 会建它。
+#
+# 执行完 OpenWrt 会自动删掉本文件（uci-defaults 的标准行为）；sysupgrade 保留
+# /etc/rc.d，所以升级后不需要再跑一次。
+# 用 -x 检查而不是直接执行：万一某个固件裁剪了 sing-box 包，脚本不该报错。
+
+[ -x /etc/init.d/sing-box ] || exit 0
+
+/etc/init.d/sing-box enable
+/etc/init.d/sing-box restart
+
+exit 0
