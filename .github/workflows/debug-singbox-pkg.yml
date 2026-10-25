@@ -151,8 +151,13 @@ jobs:
             { echo "::error::$m 不是本仓库的源码配方（PKG_SOURCE 不是 sing-box-refind-*）"; exit 1; }
           # with_naive_outbound 会把 cronet-go（glibc 静态库）拉进来，musl 目标上
           # 必然编不过 —— 2026-10-25 两轮整机编译就死在这。见配方里的长注释。
-          if grep -q 'with_naive_outbound' "$m"; then
-            echo "::error::GO_PKG_TAGS 含 with_naive_outbound，musl 目标编不出来"
+          # 只看 GO_PKG_TAGS 的实际取值：配方注释里大段解释「为什么不要 naive」，
+          # 全文 grep 会把这些注释误判成违规（三条线就是这么一起挂的）。
+          tags="$(sed -n 's/^GO_PKG_TAGS[[:space:]]*:=[[:space:]]*//p' "$m" | tr -d '\\' | tr ',' '\n')"
+          [ -n "$tags" ] || { echo "::error::$m 里读不到 GO_PKG_TAGS"; exit 1; }
+          if printf '%s\n' "$tags" | grep -qx '[[:space:]]*with_naive_outbound[[:space:]]*'; then
+            echo "::error::GO_PKG_TAGS 的实际取值含 with_naive_outbound，musl 目标编不出来"
+            echo "实际取值：$(printf '%s' "$tags" | tr '\n' ',')"
             exit 1
           fi
 

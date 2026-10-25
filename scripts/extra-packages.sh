@@ -411,11 +411,20 @@ place_singbox_from_source() {
 	#   CGO_ENABLED=1 → 链接期一堆 glibc 专有符号未定义
 	# 2026-10-25 那两轮整机编译就是死在这上面（报错被 subdir.mk 吞进
 	# logs/package/.../compile.txt，控制台只剩一句 failed to build）。
-	if grep -q 'with_naive_outbound' feeds/packages/net/sing-box/Makefile; then
+	# 只比对 GO_PKG_TAGS 这一行的**实际取值**，不 grep 全文 ——
+	# 模板注释里反复用 with_naive_outbound 解释「为什么不要它」，
+	# 全文 grep 会把这些注释当成违规（2026-10-25 三条线全挂在这上面）。
+	sb_tags="$(sed -n 's/^GO_PKG_TAGS[[:space:]]*:=[[:space:]]*//p' \
+		feeds/packages/net/sing-box/Makefile | tr -d '\\' | tr ',' '\n')"
+	[[ -n "$sb_tags" ]] \
+		|| die "读不到 feeds/packages/net/sing-box/Makefile 里的 GO_PKG_TAGS（模板结构变了？）"
+	if printf '%s\n' "$sb_tags" | grep -qx '[[:space:]]*with_naive_outbound[[:space:]]*'; then
 		die "配方里的 GO_PKG_TAGS 含 with_naive_outbound —— musl 目标编不出来。
       cronet-go 的 libcronet.a 是 glibc 静态库，且该版本没有 musl_arm64 目录。
       详见 packages/net/sing-box-refind/Makefile.in 里 GO_PKG_TAGS 上方的注释。"
 	fi
+	# 顺手把实际标签数报出来：标签被误删（比如漏了 with_quic）时能早点发现。
+	log "  GO_PKG_TAGS（$(printf '%s\n' "$sb_tags" | grep -c .) 个）：$(printf '%s' "$sb_tags" | tr '\n' ',' | sed 's/,$//')"
 
 	# HomeProxy 的生成器必须已是 1.13+ 写法。reF1nd/testing 是 1.14.x-dev，
 	# legacy inbound 字段（sniff / sniff_override_destination = true）会直接 FATAL。
