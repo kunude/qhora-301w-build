@@ -63,14 +63,17 @@ GO_PKG_BUILD_PKG:=$(GO_PKG)/cmd/sing-box
 #  但 HomeProxy 里若配了对应协议就会在 check 阶段报"tag 未编入"）。
 GO_PKG_TAGS:=with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,with_cloudflared,with_naive_outbound,with_usbip,with_openvpn,with_openconnect,badlinkname,tfogo_checklinkname0
 
-# 与上游 release/LDFLAGS 对齐：
-#   -checklinkname=0                       Go 1.23+ 链接器开关，配合 badlinkname tag
-#   -X runtime.godebugDefault=...          上游默认的 GODEBUG（multipathtcp 关、tlssha1 开）
-# 第二条要 Go 1.26+ 的 runtime 支持；基座 golang 是 1.27，满足。万一将来基座降级，
-# 它的表现只是"这条 -X 没生效"（-X 找不到符号只告警），不会让构建失败。
-GO_PKG_LDFLAGS:=-checklinkname=0 -X runtime.godebugDefault=multipathtcp=0,tlssha1=1
-# 版本串只用于 `sing-box version` 与 HomeProxy 状态页显示；包版本见 PKG_VERSION。
-GO_PKG_LDFLAGS_X:=$(GO_PKG)/constant.Version=@VER@-refind
+# 写法与上游 immortalwrt/packages 逐字对齐：
+#   GO_PKG_LDFLAGS    链接器开关（-checklinkname=0）
+#   GO_PKG_LDFLAGS_X  所有 -X 变量，golang-package.mk:242 会给每项自动加 `-X `
+# 两处分开写**不是**必需（mk 最终都拼进同一条
+#   -ldflags "$(GO_PKG_LDFLAGS) $(GO_PKG_LDFLAGS_X:%=-X %)"
+# 字符串），照上游写只是为了以后 diff 上游时一眼能对上。
+# runtime.godebugDefault 要 Go 1.26+ 的 runtime 支持，基座是 1.27，满足。
+GO_PKG_LDFLAGS:=-checklinkname=0
+GO_PKG_LDFLAGS_X:= \
+	$(GO_PKG)/constant.Version=@VER@-refind \
+	runtime.godebugDefault=multipathtcp=0,tlssha1=1
 
 include $(INCLUDE_DIR)/package.mk
 include ../../lang/golang/golang-package.mk

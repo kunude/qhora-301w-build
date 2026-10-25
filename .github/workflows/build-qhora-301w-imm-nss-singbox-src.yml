@@ -445,6 +445,24 @@ jobs:
           hints=$(grep -nE 'Error [0-9]+$|error:|Error [0-9]+:|undefined reference|cannot find -l|No rule to make target|fatal error|CMake Error' \
                   "$BUILD_LOG" | tail -n 8 || true)
 
+          # ── 真正的报错通常不在 $BUILD_LOG 里 ──────────────────────────
+          # 本步骤的 env 里有 BUILD_LOG，而 OpenWrt 的 include/subdir.mk 只要看到
+          # 这个变量，就会把**每个包的输出**重定向进 logs/package/<包路径>/compile.txt
+          # （见 subdir.mk 的 log_make），控制台只剩
+          #     make[3] -C feeds/packages/net/sing-box compile
+          #     ERROR: package/feeds/packages/net/sing-box failed to build.
+          # 于是 $BUILD_LOG 里连一条报错行都没有 —— 2026-10-25 那次就这么白跑一轮。
+          # 所以这里按失败包名把 per-package 日志抓出来打一遍。
+          for pkg in $failed; do
+            for stage in prepare configure compile install; do
+              f="$OPENWRT_DIR/logs/package/$pkg/$stage.txt"
+              [[ -s "$f" ]] || continue
+              echo "::group::$pkg / $stage.txt（尾部 120 行）"
+              tail -n 120 "$f"
+              echo "::endgroup::"
+            done
+          done
+
           if [[ -n "$failed" ]]; then
             echo "::error title=编译失败的包::${failed}"
           fi

@@ -1,0 +1,190 @@
+name: Debug - sing-box 源码包单编（不编整机）
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  为什么单独有这么一条工作流
+#  ─────────────────────────────────────────────────────────────────────────
+#  整机编译要 80~120 分钟，改一次 sing-box 配方就白等一轮，太慢。
+#  这条工作流只做两件事：把构建环境备好（feeds + .config + 渲染好的源码配方），
+#  然后**只编 feeds/packages/net/sing-box 这一个包**，约 15~25 分钟出结果。
+#
+#  ⚠️ 本工作流故意**不设 BUILD_LOG**（全局 env 里也没有）。
+#     OpenWrt 的 include/subdir.mk:68 一旦看到环境里有 BUILD_LOG，就会把每个包的
+#     输出重定向进 logs/package/<包路径>/compile.txt，控制台只剩一行
+#         make[3] -C feeds/packages/net/sing-box compile
+#         ERROR: package/feeds/packages/net/sing-box failed to build.
+#     —— 2026-10-25 那次整机编译失败就是这么把报错吞掉的：日志里 0 条 error 行，
+#     真正的报错随 runner 一起销毁。单编线让 make 直接吐到控制台。
+#     （两条整机线也已经补了"失败时把 per-package 日志打出来"的兜底。）
+#
+#  产物：只有一条 ::notice:: + 编出来的 /usr/bin/sing-box（跑 version 自证 -refind）。
+#        不打包镜像、不发 release —— 这里只回答"配方能不能编出来"。
+# ═══════════════════════════════════════════════════════════════════════════
+
+on:
+  workflow_dispatch:
+    inputs:
+      singbox_ref:
+        description: "reF1nd/sing-box 的 ref（分支/tag/commit；留空 = testing HEAD）"
+        required: false
+        default: ""
+      imm_ref:
+        description: "ImmortalWrt 基座的 ref（留空 = 线上那条钉的 da63f7d6ac）"
+        required: false
+        default: ""
+      verbose:
+        description: "make 日志级别（V=s 是标准啰嗦版；排 dyld/链接问题可改 V=sc）"
+        required: false
+        default: "V=s"
+
+concurrency:
+  group: debug-singbox-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMM_REPOSITORY: immortalwrt/immortalwrt
+  IMM_BASE_REF: ${{ github.event.inputs.imm_ref || 'da63f7d6ac4207e534c9b92ba3d2b555a8edce8d' }}
+  IMM_REF: master
+  IMM_LUCI: ""
+  IMM_PKGS: ""
+  NSS_FEED: src-git nss https://github.com/JuliusBairaktaris/nss-packages.git;edma-nss
+  TARGET: qualcommax
+  SUBTARGET: ipq807x
+  DEVICE: qnap_301w
+  DEVICE_LABEL: QHora-301W
+  OPENWRT_DIR: ${{ github.workspace }}/openwrt
+  BUILDER_DIR: ${{ github.workspace }}/builder
+  # 纯净内核线（无前端）：准备阶段最省事，且源码配方的落位逻辑与 HomeProxy 线
+  # 完全共用（place_singbox_from_source），这里出问题两条线都会出问题。
+  PROXY_STACK: singbox
+  SINGBOX_MODE: source
+  SINGBOX_SRC_REF: ${{ github.event.inputs.singbox_ref }}
+  SINGBOX_SRC_BASE: 1.14.0
+
+jobs:
+  build:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 90
+
+    steps:
+      - name: 释放磁盘空间
+        run: |
+          set -euo pipefail
+          df -h / | tail -1
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /usr/local/share/boost \
+            /opt/hostedtoolcache/CodeQL || true
+          sudo apt-get clean
+          df -h / | tail -1
+
+      - name: 安装构建依赖
+        run: |
+          set -euo pipefail
+          sudo apt-get update || true
+          sudo apt-get install -y \
+            bzip2 g++ gawk gcc git glibc-source libncurses-dev make patch python3
+
+      - name: 检出 ImmortalWrt 基座源码
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.IMM_REPOSITORY }}
+          ref: ${{ env.IMM_BASE_REF }}
+          fetch-depth: 1
+          path: openwrt
+
+      - name: 检出本仓库（配置与脚本）
+        uses: actions/checkout@v7
+        with:
+          path: builder
+
+      - name: 环境预检
+        run: |
+          set -euo pipefail
+          for c in perl make git gcc g++ gawk bzip2 curl tar sha256sum patch python3; do
+            command -v "$c" >/dev/null 2>&1 ||
+              { echo "::error::runner 上缺少必需工具：$c"; exit 1; }
+          done
+          perl -v | sed -n '2p'
+          make --version | head -1
+          echo "必需工具齐备"
+
+      - name: 准备构建环境（feeds + .config + 覆盖文件 + 渲染源码配方）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          bash "$BUILDER_DIR/scripts/prepare-build-imm-nss.sh"
+
+      - name: 回放准备日志
+        if: always()
+        run: |
+          f="$GITHUB_WORKSPACE/prepare-build.log"
+          if [ -f "$f" ]; then
+            echo "::group::prepare-build.sh 日志（尾部 120 行）"
+            tail -n 120 "$f"
+            echo "::endgroup::"
+          else
+            echo "没有生成 prepare-build.log（见上一步输出）"
+          fi
+
+      - name: 先确认落位的是源码配方（不是 feed 那份）
+        run: |
+          set -euo pipefail
+          cd "$OPENWRT_DIR"
+          m="package/feeds/packages/sing-box/Makefile"
+          echo "--- $m 关键行 ---"
+          grep -nE '^PKG_NAME|^PKG_VERSION|^PKG_SOURCE|^PKG_HASH|^GO_PKG_TAGS|^GO_PKG_LDFLAGS|^PKG_BUILD_DEPENDS' "$m"
+          grep -q '^PKG_SOURCE:=sing-box-refind-' "$m" ||
+            { echo "::error::$m 不是本仓库的源码配方（PKG_SOURCE 不是 sing-box-refind-*）"; exit 1; }
+
+      - name: 只编 sing-box 这一个包
+        run: |
+          set -uo pipefail
+          cd "$OPENWRT_DIR"
+
+          # 见文件头：绝不能让 make 看到 BUILD_LOG，否则输出被 subdir.mk 吸进
+          # logs/package/.../compile.txt，控制台只剩两行。
+          unset BUILD_LOG BUILD_LOG_DIR || true
+
+          V="${V_LEVEL:-V=s}"
+          echo "make package/feeds/packages/sing-box/compile $V"
+          make package/feeds/packages/sing-box/compile "$V" 2>&1 | tee "$RUNNER_TEMP/pkg.log"
+          rc=${PIPESTATUS[0]}
+
+          # 万一还是落了 per-package 日志（别的环境变量带进来的），一并打出来
+          for f in logs/package/feeds/packages/sing-box/*.txt; do
+            [[ -f "$f" ]] || continue
+            echo "::group::per-package 日志 $f（尾部 120 行）"
+            tail -n 120 "$f"
+            echo "::endgroup::"
+          done
+
+          if (( rc != 0 )); then
+            echo "::error title=sing-box 单编失败::退出码 $rc，报错在上面（或 $RUNNER_TEMP/pkg.log）"
+            exit "$rc"
+          fi
+          echo "::notice title=sing-box 单编通过::配方能编出二进制"
+        env:
+          V_LEVEL: ${{ github.event.inputs.verbose }}
+
+      - name: 自证：二进制版本串与产物体积
+        if: success()
+        run: |
+          set -euo pipefail
+          cd "$OPENWRT_DIR"
+          b=$(find build_dir -type f -path '*sing-box*/bin/sing-box' -print -quit || true)
+          if [[ -z "$b" ]]; then
+            echo "::warning::没在 build_dir 里找到 sing-box 二进制（可能被 CONFIG_AUTOREMOVE 清了）"
+            exit 0
+          fi
+          ls -l "$b"
+          # 交叉编出来的二进制不能在 runner 上跑，只做静态取证
+          if grep -aq -- '-refind' "$b"; then
+            echo "::notice title=版本串::二进制里含 -refind，确实是本仓库配方编的"
+          else
+            echo "::error title=版本串::二进制里没有 -refind"
+            exit 1
+          fi
+          echo "--- 包的 apk/ipk ---"
+          ls -l bin/packages/*/*/sing-box* 2>/dev/null || echo "（还没到 Package/install 阶段，正常）"
