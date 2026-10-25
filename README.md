@@ -519,6 +519,49 @@ DAED_ADMIN_PASS='你的口令' PROXY_STACK=daed ./scripts/prepare-build.sh
 那层大括号必须在，否则 `dae.ParseConfig` 解析不出 section）、`proxy` 组必须
 存在且不是 `fixed`、恰好一个管理员、库里不许有订阅/节点链接（固件是公开产物）。
 
+### 让自己的域名单独走直连 / 走代理
+
+geosite 收不全私人和公司域名，`routing` 段就是给这种情况留的口子。写法：
+
+```
+domain(suffix: .my-company.com) -> proxy    # 该域名及所有子域走 proxy 组
+domain(full: intranet.my-company.com) -> direct
+domain(keyword: mybrand) -> proxy           # 域名里含这个词（太宽，慎用）
+domain(regexp: ^.*\.corp\.example$) -> direct
+dip(203.0.113.0/24) -> proxy                # 没有域名的连接（裸 IP）只能按 IP 写
+```
+
+**位置决定能不能命中**，这是最容易踩的地方：`routing` 从上往下、第一条命中的
+定去向，而 `dip(geoip:cn) -> direct` 是按 IP 判定的 —— 想让一个解析到国内 IP
+的域名走代理，规则必须写在它**之前**。`configs/daed/routing.dae` 里
+「自定义域名」那一段就是为此放在拦截/直连之前，直接把规则填在那里。
+
+实测对照（2026-10-25，把 `myip.ipip.net` 强制指 `proxy`）：
+
+| 规则位置 | 结果 |
+|---|---|
+| 「自定义域名」段（`dip(geoip:private)` 之后、`dip(geoip:cn)` 之前） | 走代理 ✅ |
+| `domain(geosite:cn) -> direct` 之后 | 仍走直连 ❌（`geoip:cn` 先按 IP 命中） |
+
+两个限制：
+
+- **域名规则依赖嗅探**：HTTP 的 `Host`、TLS 的 SNI 都能抓到，所以浏览器/常规
+  App 没问题；纯 TCP 非 TLS 的私有协议抓不到域名，只能用 `dip()` 按 IP 写。
+  QUIC 已在上面被 `l4proto(udp) && dport(443) -> block` 拦掉，会秒回落 TCP，
+  不影响判定。
+- 域名规则对**已有的长连接**不生效，改完要新开连接（浏览器刷新基本就够）。
+
+不想重新构建固件的话，也可以在面板里改：`分流` → 编辑当前 `default` →
+把规则拖到「直连」那几条之前 → 保存 → 启动。面板改的是设备上的 `wing.db`，
+重新刷机（或重新构建后刷机）会回到出厂那份。
+
+改完别连着点保存/启动：每次「启动」都是一次整体 reload（重新拉订阅、重建
+路由、重选节点），实测在 2 分钟里连做 6～7 次会把 dae 弄成半死状态 ——
+`daed` 自报 `running=true`，但 LAN 全部直连，日志里刷
+`bootstrap resolver returned no usable address for "c38s1...`，
+Google 打不开、`api.ip.sb` 显示的是家里的 IP。这时 `/etc/init.d/daed restart`
+一次就好（15 秒左右恢复）。改一条规则 → 点一次启动 → 等它稳定再动下一条。
+
 ## 目录结构
 
 ```

@@ -7,6 +7,31 @@ routing {
     # 内网地址直连（NAS、打印机、路由器管理页）
     dip(geoip:private) -> direct
 
+    ### 自定义域名（必须放最前面，命中即止）###
+    # 为什么排在这儿：下面的 `dip(geoip:cn)` 是按 IP 判定的，你要是想让一个
+    # 解析到国内 IP 的域名走代理，规则排在它后面就永远命不中。所以自定义规则
+    # 统一写在拦截/直连之前，从上往下第一条匹配的生效（越具体的写越上面）。
+    # 实测对照（2026-10-25，把同一台机上的 myip.ipip.net 强指 proxy）：
+    #   放在本段位置            → 走代理 ✅
+    #   放在 domain(geosite:cn) 之后 → 仍走直连 ❌（geoip:cn 先按 IP 命中）
+    # 上面那三条固定前置（pname / 组播 / 内网）留在前面不影响。
+    #
+    # 四种写法，按需选一种：
+    #   domain(suffix: .your-domain.com)   该域名及其所有子域
+    #   domain(full: a.your-domain.com)    只匹配这一个完整域名
+    #   domain(keyword: yourbrand)         域名里含这个词（太宽，慎用）
+    #   domain(regexp: ^.*\.foo\.com$)     正则
+    #   dip(1.2.3.4/32, 10.0.0.0/8)        没有域名的连接只能按 IP/CIDR 写
+    #
+    # 想让自己的域名**走代理**（走 proxy 组）：
+    # domain(suffix: .my-company.com) -> proxy
+    # 想让某个域名**强制直连**（比如国内站被误判成国外）：
+    # domain(suffix: .my-intranet.example) -> direct
+    #
+    # 一个限制：域名规则依赖嗅探，HTTP/TLS(SNI) 能抓到；纯 TCP 非 TLS 的私有
+    # 协议抓不到域名，只能用 dip() 按 IP 写。QUIC 已被下面的规则统一拦掉，
+    # 会在一秒内回落 TCP，不影响判定。
+
     ### 拦截 ###
     # 广告与追踪
     domain(geosite:category-ads-all) -> block
