@@ -1187,6 +1187,64 @@ bash scripts/fetch-homeproxy-rulesets.sh --dest files-homeproxy/etc/homeproxy/ru
 bash scripts/fetch-homeproxy-rulesets.sh --dest files-homeproxy/etc/homeproxy/ruleset --verify-only  # 只校验不联网
 ```
 
+#### 流量到底走哪条路：`bypass_cn_traffic` 是唯一的 nft 开关
+
+**结论先说**：HomeProxy 这套的"国内直连"不在 sing-box 里做，而在 nft 里做。
+`routing_mode` 只决定**用哪套规则集**，`bypass_cn_traffic` 才决定**流量要不要进 sing-box**。
+
+`firewall_post.ut` 里这两个判断是**或**关系（第 178 行建集合、347 行判 return）：
+
+```ucode
+{% elif (match(routing_mode, /mainland_china/) || bypass_cn_traffic === '1'): %}
+set homeproxy_mainland_addr_v4 { ... elements = { <china_ip4.txt 全量> } }
+...
+{% elif (routing_mode === 'bypass_mainland_china' || bypass_cn_traffic === '1'): %}
+	ip daddr @homeproxy_mainland_addr_v4 counter return
+```
+
+于是有两张完全不同的路径图：
+
+| | `bypass_cn_traffic='1'`（本仓库出厂值） | `bypass_cn_traffic='0'` |
+|---|---|---|
+| 集合 `@homeproxy_mainland_addr_v4` | 建，8000+ 条（`/etc/homeproxy/resources/china_ip4.txt`） | **根本不创建** |
+| 目的 IP 属国内的包 | `return`，走 nft 之后的内核转发，**NSS 卸载有效** | 照样 `redirect`/`tproxy` 进 sing-box |
+| 出境包 | `redirect` → :5331 / `tproxy` → :5332 | 同左 |
+| sing-box 的负载 | 只有出境流量 | **全部流量**（含国内），direct-out 也是用户态出去 |
+| 谁在干活 | 内核 + 用户态分工 | 全用户态 |
+
+`routing_mode='custom'` **不会**自动带上这个集合 —— 所以 custom 模式下必须靠
+`bypass_cn_traffic='1'`（LuCI：`Routing settings → Bypass CN traffic`，
+注释是 "Bypass mainland China traffic via firewall rules by default"）。
+设成 0 的后果不是报错，而是**每条 TCP/UDP 都先过一遍用户态 sing-box**：
+功能一样、吞吐差一截，而且在 `top` 里看不到明显异常，很容易误以为"NSS 没生效"。
+
+> ⚠️ 代价（也是为什么它不是默认全开的那类开关）：nft 的 `return` 发生在 sing-box
+> 之前，所以**按 IP 优先于按域名**。某个 IP 在 `china_ip4.txt` 里、但你想让它走代理，
+> 在 bypass=1 下做不到 —— 只能把那条 IP 从集合里删掉，而 `update_resources.sh`
+> 下次更新又会拉回来。要"按域名精细控制"，用 daed 那条线（`configs/daed/routing.dae`
+> 里的「自定义域名」段），或者把这一项关掉让 sing-box 的规则集说了算。
+
+**DNS 是例外**：DNS 一点都绕不过 sing-box。`custom` 模式下 `/etc/init.d/homeproxy`
+往 dnsmasq 里塞的是 `no-resolv` + `server=127.0.0.1#5333`（`init.d/homeproxy:84-91`），
+**所有**查询无条件转给 sing-box，再加 nft 的 `udp dport 53 redirect to :5333`
+（`firewall_post.ut:259`）兜住不听话的客户端。国内域名在 sing-box 里命中
+`cn_dns` → `direct_dns`（223.5.5.5）→ `direct-out`，所以只是"本地一跳"、不出口，
+量也小（几十 KB/s 级）。这部分**不受** `bypass_cn_traffic` 影响，也是"sing-box 挂了
+DNS 就全挂"的根源 —— 所以规则集必须 local、节点没填时干脆不启动。
+
+**怎么确认机器上是哪种**（SSH）：
+
+```sh
+uci get homeproxy.routing.bypass_cn_traffic          # 1 = 内核直连生效
+nft list set inet fw4 homeproxy_mainland_addr_v4 | head -5   # 有 elements 才说明集合建了
+nft list chain inet fw4 homeproxy_redirect | grep mainland   # 有 return 那条才说明生效
+# 再看活跃连接落在哪：国内连接应该看不到，只有出境连接挂在 5331
+ss -tnp | grep -c ':5331'
+```
+
+改完（`uci set homeproxy.routing.bypass_cn_traffic='1' && uci commit homeproxy`）
+要 `/etc/init.d/homeproxy restart` 才会重生成 nft 规则 —— nft 表是启动时一次性写进去的。
+
 ### 附加服务
 
 | 服务 | 状态 | 怎么用 |

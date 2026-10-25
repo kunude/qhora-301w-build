@@ -649,6 +649,22 @@ if [[ "$PROXY_STACK" == "homeproxy" ]]; then
   fi
   log "HomeProxy 出厂配置：routing_mode=custom，$hp_local 条规则集全为 local（预置生效的前提成立）"
 
+  # ── 6b-1. 内核层国内直连开关 ────────────────────────────────────────
+  # 只有 firewall_post.ut:347 的 `routing_mode === 'bypass_mainland_china' ||
+  # bypass_cn_traffic === '1'` 成立，nft 才会建 @homeproxy_mainland_addr_v4，
+  # 并对目的 IP 属国内的包直接 return —— 那些包在内核里转发，NSS 卸载有效。
+  # 反之（custom + bypass=0）集合根本不创建：LAN 的每条 TCP 都 redirect 到
+  # 5331、UDP tproxy 到 5332，**全部流量过一遍用户态 sing-box** 才由
+  # direct-out 出去。这不会报错，只是白丢性能，所以这里至少喊一声。
+  hp_bypass="$(awk -F"'" '/^[[:space:]]*option[[:space:]]+bypass_cn_traffic/ {print $2; exit}' "$hp_conf")"
+  if [[ "${hp_bypass:-0}" == "1" ]]; then
+    log "HomeProxy 内核直连：bypass_cn_traffic=1（国内目的 IP 在 nft 里 return，不进 sing-box）"
+  else
+    warn "HomeProxy 内核直连：bypass_cn_traffic=${hp_bypass:-未设置} —— 国内流量也会进 sing-box 用户态" \
+         "（nft 不会建 @homeproxy_mainland_addr_v4，全部 TCP/UDP 都被 redirect/tproxy 进内核进程）" \
+         "要拿回 NSS 快路径就把 routing_options 里这一项改成 1"
+  fi
+
   ruleset_dir="files/etc/homeproxy/ruleset"
   if [[ ! -d "$ruleset_dir" ]]; then
     die "PROXY_STACK=homeproxy 但覆盖层里没有 $ruleset_dir ——" \

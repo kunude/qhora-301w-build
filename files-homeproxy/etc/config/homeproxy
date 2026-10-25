@@ -71,7 +71,18 @@ config homeproxy 'routing'
 	# 解析节点地址（域名）用的解析器；default-dns = WAN 下发的那台，走直连
 	option default_outbound_dns 'default-dns'
 	option sniff_override '1'
-	option bypass_cn_traffic '0'
+	# ⚠️ 这一行不是遗留字段，也不是给 generate_client.uc 看的 —— 它是**唯一**的
+	#    「内核层国内直连」开关，由 firewall_post.ut:68/178/347 读取：
+	#        bypass_cn_traffic === '1'  ⇒ nft 里才建 @homeproxy_mainland_addr_v4
+	#        （china_ip4.txt 那 8000+ 条），并在 redirect / tproxy 链里对
+	#        「目的 IP 属国内」的包直接 return（内核转发，不进 sing-box）。
+	#    设成 '0' 时那个集合**根本不会创建**，于是 LAN 的每条 TCP 都被
+	#        redirect 到 127.0.0.1:5331、每条 UDP 都被 tproxy 到 :5332，
+	#    全部流量先过一遍用户态 sing-box，再由它的 direct-out 出去 ——
+	#    NSS 硬件加速对这部分不生效，吞吐明显低于内核直连。
+	#    routing_mode=custom 与它是**或**关系（firewall_post.ut:347），
+	#    所以 custom 模式下必须靠这一行打开内核直连。
+	option bypass_cn_traffic '1'
 
 config homeproxy 'dns'
 	option dns_strategy 'prefer_ipv4'
