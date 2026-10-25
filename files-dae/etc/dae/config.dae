@@ -28,7 +28,15 @@ global {
     # lan_interface 是**必须**的：不写它，dae 只在 WAN 侧生效，
     # LAN 里所有设备（手机/电脑/TV）的流量根本进不了 eBPF 分流。
     # 本机型 LAN 桥是 br-lan（交换机 + 两个 WiFi AP 都在里面）。
-    # 有访客网络再加，逗号分隔：lan_interface: br-lan,br-guest
+    #
+    # 访客网络、以及 WireGuard/ZeroTier 这类**隧道的服务端接口**，也必须加进来：
+    # 从隧道进来的流量（在外面连回家、再从家里出去上网）只有落在 lan_interface
+    # 上才会进 eBPF，否则表现为"内网能访问、代理完全不生效"。
+    # 名字要和 `ip link` 里的一模一样，逗号分隔：
+    #   lan_interface: br-lan, br-guest, wg0
+    #
+    # 注意：写进来的接口必须一直存在。删掉/改名之后 dae 会因为绑不上而启动失败，
+    # 那时不是"少代理一个网段"，而是**整个代理都不工作**。
     lan_interface: br-lan
 
     # auto = 自动认 WAN（本机型是 wan / pppoe-wan，auto 都能认）
