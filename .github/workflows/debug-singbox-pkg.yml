@@ -211,6 +211,33 @@ jobs:
             || { echo "::error::staging_dir/toolchain-* 不存在，交叉编译无法进行"; exit 1; }
           echo "::notice title=交叉工具链就绪::$(ls -d staging_dir/toolchain-*)"
 
+      # sing-box 的 DEPENDS 里有 kmod-tun / kmod-inet-diag，make 会顺带把这一串
+      # 内核模块包拉进编译图。而内核树在两件事做完之前**不存在**：
+      #     build_dir/target-<arch>_musl/linux-<board>/linux-<ver>/.config
+      # 少了它，编到 kmod 那一步报的是
+      #     make[3]: *** No rule to make target '.../linux-6.18.55/.config',
+      #              needed by '.../gpio-button-hotplug/.built'
+      # 跟 sing-box 本身毫无关系，但会把整条单编判成失败。
+      # `make target/linux/prepare` 才是生成内核树的那一步（`package/<x>/compile`
+      # 和 tools/toolchain 都不碰它）。整机 `make` 也会跑，所以只有单编线会踩到。
+      - name: 准备内核源码树（target/linux/prepare）
+        run: |
+          set -uo pipefail
+          cd "$OPENWRT_DIR"
+          unset BUILD_LOG BUILD_LOG_DIR || true
+          echo "make -j$(nproc) target/linux/prepare"
+          make -j"$(nproc)" target/linux/prepare 2>&1 | tail -n 120
+          rc=${PIPESTATUS[0]}
+          if (( rc != 0 )); then
+            echo "::error title=target/linux/prepare 失败::退出码 $rc"
+            exit "$rc"
+          fi
+          # 断言：内核树确实落地了，否则后面编 kmod 一定炸
+          kdir=$(ls -d build_dir/target-*/linux-*/linux-* 2>/dev/null | head -1)
+          [[ -n "$kdir" ]] || { echo "::error::没找到内核构建目录 build_dir/target-*/linux-*/linux-*"; exit 1; }
+          [[ -f "$kdir/.config" ]] || { echo "::error::$kdir/.config 不存在，内核树没准备好"; exit 1; }
+          echo "::notice title=内核树就绪::$kdir"
+
       - name: 只编 sing-box 这一个包
         run: |
           set -uo pipefail
