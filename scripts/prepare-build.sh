@@ -239,6 +239,20 @@ fi
 
 cd "$OPENWRT_DIR"
 
+# ── 幂等：摘掉上一轮遗留的 small feed 行 ────────────────────────
+# small 是"按需"feed：feed 行由下面的 small 段在 `feeds install -a` 之后才追加，
+# 只有 EXTRA_PACKAGES 点名的包（及其同 feed 依赖）会被软链。
+#
+# 但 feeds.conf 是**源码树里**的文件，不是本仓库的 —— 本地反复跑 prepare 时，
+# 上一轮追加的行会留在里面。下一轮 `feeds update -a` 就会把整个 small 拉下来，
+# `feeds install -a` 把二十多个包全软链一遍：撞名风险陡增、make 扫描也变慢，
+# 而且结果与全新检出不一致。CI 是全新 clone 所以看不出来，本地才有。
+# 每轮进 feeds 阶段前先摘干净，行为才和 CI 等价。
+if grep -q 'github\.com/kenzok8/small' feeds.conf 2>/dev/null; then
+  sed -i '/github\.com\/kenzok8\/small/d' feeds.conf
+  log "清理上一轮遗留的 small feed 行（与全新检出保持一致）"
+fi
+
 # 把实际生效的 feed 配置打进日志：配置错误会让 feeds 在解析阶段直接 die。
 log "feeds.conf 实际内容："
 sed 's/^/    /' feeds.conf | tee -a "$LOG_FILE" >&3
@@ -283,16 +297,33 @@ log "安装全部 feed"
 log "feeds install 完成，package/feeds/ 下有："
 ls -1 package/feeds/ 2>/dev/null | sed 's/^/    /' | tee -a "$LOG_FILE" >&3 || true
 
-# ── kenzok8/small：按需的额外插件 ──────────────────────────────
+# ── kenzok8/small：按需的额外插件 + 依赖闭包 ────────────────────
 # 位置**必须**在 `feeds install -a` 之后。small 里有 sing-box / homeproxy /
 # daed / luci-app-homeproxy 这类与官方 feed 同名的包；feed 行要是提前加进去，
 # 上面那句 install -a 会把 small 里二十多个包全部 link 一遍，撞名会让 make
 # 报 "duplicate package"，而且报的位置离这里很远。
 #
+# `scripts/feeds install -p small <pkg>` 会沿 `DEPENDS` 递归装**同一个 feed
+# 里**的运行时依赖（见 scripts/feeds 的 install_src：遍历 packages->depends
+# 后 install_package($feed, ...)），但仅限 small 自己；依赖落在别的 feed 时
+# 它只是 "already installed" 静默跳过。所以闭包解析**不是**为了补 feeds 的
+# 漏洞，而是为了：
+#   ① 让「点了一个插件会拖进来什么」在日志里可见（否则出问题只能翻 30MB 日志）；
+#   ② 兜住 feeds 解析差异（它跳过 `@条件`，也不处理 `+COND:pkg` 条件依赖里的
+#      右侧包名）；
+#   ③ 闭包清单留到 defconfig 之后逐个核对「到底进没进固件」，见第 3b 步。
+# 真正的静默失败点是：符号存在但没选中 ⇒ 插件在固件里缺依赖跑不起来；
+# 符号不存在 ⇒ make defconfig 把整条链丢掉，固件照编，功能没有。
+#
 # 不设版本：每次构建 `feeds update small` 拿的就是当时最新的源码。
+#
+# 包存在性判定统一走这两个 glob（feeds 下是软链，主树里是真目录）：
+#   compgen -G 'package/feeds/*/<pkg>'   已由某个 feed 提供
+#   [[ -d package/<pkg> ]]               主树自带
 EXTRA_PKGS_CONFIG=""
+EXTRA_DEPS_FILE=""
 if [[ -n "${EXTRA_PACKAGES:-}" ]]; then
-  log "接入 kenzok8/small（只装 EXTRA_PACKAGES 点名的包）：$EXTRA_PACKAGES"
+  log "接入 kenzok8/small（点名：$EXTRA_PACKAGES）"
 
   SMALL_FEED="src-git small https://github.com/kenzok8/small.git;master"
   if ! grep -q 'github.com/kenzok8/small' feeds.conf; then
@@ -301,27 +332,45 @@ if [[ -n "${EXTRA_PACKAGES:-}" ]]; then
   fi
   ./scripts/feeds update small
 
+  # 上一轮可能留下整个 feed 的软链（那时 feeds.conf 还带着 small 行，
+  # `feeds install -a` 会把二十多个包全链一遍）。这里清空重建，
+  # 保证「装进来的只有点名包 + 它们的闭包」。
+  rm -rf package/feeds/small
+  mkdir -p package/feeds/small
+
+  IFS=', ' read -r -a _want <<<"$EXTRA_PACKAGES"
+  declare -A _explicit=()
+  for p in "${_want[@]}"; do [[ -n "$p" ]] && _explicit["$p"]=1; done
+  ((${#_explicit[@]})) || die "EXTRA_PACKAGES 里有内容但没有解析出任何包名：$EXTRA_PACKAGES"
+
   EXTRA_PKGS_CONFIG="$(dirname "$LOG_FILE")/extra-packages.config"
   : > "$EXTRA_PKGS_CONFIG"
 
-  IFS=', ' read -r -a _want <<<"$EXTRA_PACKAGES"
-  for p in "${_want[@]}"; do
-    [[ -n "$p" ]] || continue
+  # ① 展开依赖闭包（只在 small 内部递归；官方 feed 已被 install -a 全量接管）
+  log "解析额外插件的依赖闭包"
+  _closure="$(FEED_DIR=feeds/small bash "$BUILDER_DIR/scripts/resolve-deps.sh" "${!_explicit[@]}")" \
+    || die "依赖闭包解析失败（scripts/resolve-deps.sh）"
+  log "闭包共 $(wc -l <<<"$_closure") 项：$(awk -F'\t' '{printf "%s[%s] ", $1, $2}' <<<"$_closure")"
 
-    # 同名包的既有来源：feeds 下的是软链，可以摘掉换成 small 的；
-    # 主树里的真目录不能动（那是基座源码），遇到就保留主树版本。
-    for existing in package/feeds/*/"$p"; do
-      [[ -L "$existing" ]] || continue
-      warn "额外插件 $p 已由 ${existing#package/feeds/} 提供，改挂 small 的版本"
-      rm -f "$existing"
-    done
-
+  # ② 显式点名的包：优先用 small 的版本，其次退回官方 feed / 主树
+  for p in "${!_explicit[@]}"; do
     if [[ -d "package/$p" ]]; then
       warn "额外插件 $p 在基座主树里自带（package/$p），保留主树版本，跳过 small"
-    else
+    elif [[ -d "feeds/small/$p" ]]; then
+      # 同名包的既有来源：feeds 下的是软链，可以摘掉换成 small 的；
+      # 主树里的真目录不能动（那是基座源码）。
+      for existing in package/feeds/*/"$p"; do
+        [[ -L "$existing" ]] || continue
+        warn "额外插件 $p 已由 ${existing#package/feeds/} 提供，改挂 small 的版本"
+        rm -f "$existing"
+      done
       ./scripts/feeds install -p small "$p" \
-        || die "额外插件 $p 在 kenzok8/small 里找不到 —— 名字拼错了？"
+        || die "额外插件 $p 在 feeds/small 里存在，但 feeds install 失败"
       log "额外插件 $p ← kenzok8/small"
+    elif compgen -G "package/feeds/*/$p" >/dev/null; then
+      warn "额外插件 $p 不在 small 里，改用官方 feed 的同名包"
+    else
+      die "额外插件 $p 既不在 kenzok8/small，也不在任何已装 feed / 主树里 —— 名字拼错了？"
     fi
 
     # 点名装进固件。包不存在时 defconfig 会自动丢掉这个符号，
@@ -329,7 +378,31 @@ if [[ -n "${EXTRA_PACKAGES:-}" ]]; then
     echo "CONFIG_PACKAGE_$p=y" >> "$EXTRA_PKGS_CONFIG"
   done
 
+  # ③ 闭包里的其余 small 包：只补建软链，让符号存在。
+  #    不写进 .config —— 装不装进固件由 defconfig 的 select 决定，
+  #    那样才精确（ssr-plus 的闭包能带出十几个变体，全塞进固件会白胖一圈）。
+  _added=0
+  while IFS=$'\t' read -r dep src; do
+    [[ -n "$dep" && "$src" == "small" ]] || continue
+    [[ -n "${_explicit[$dep]:-}" ]] && continue
+    # 已有来源就保留原版本（可能来自官方 feed），不为了依赖去换版本
+    if compgen -G "package/feeds/*/$dep" >/dev/null || [[ -d "package/$dep" ]]; then
+      continue
+    fi
+    ./scripts/feeds install -p small "$dep" \
+      || die "依赖 $dep（small 提供）feeds install 失败"
+    log "  依赖 $dep ← kenzok8/small"
+    _added=$((_added + 1))
+  done <<<"$_closure"
+  log "依赖闭包补齐了 $_added 个包"
+
   CONFIGS+=("$EXTRA_PKGS_CONFIG")
+
+  # 闭包清单留到第 3b 步核对落位。此时只建了软链，符号有没有被选中要等
+  # defconfig 才知道 —— 「建了软链」和「进了固件」是两件不同的事。
+  EXTRA_DEPS_FILE="$(dirname "$LOG_FILE")/extra-deps.txt"
+  printf '%s\n' "$_closure" > "$EXTRA_DEPS_FILE"
+
   log "额外插件配置层已并入：$EXTRA_PKGS_CONFIG"
 fi
 
@@ -528,6 +601,33 @@ cat "${CONFIGS[@]}" > .config
 log "make defconfig 开始（输入 $(wc -l < .config) 行）"
 make defconfig
 log "make defconfig 完成（输出 $(wc -l < .config) 行）"
+
+# ── 2b. 额外插件的依赖落位 ───────────────────────────────────
+# 点名包本身由第 3 步断言（它的 CONFIG_PACKAGE_*=y 写在 extra-packages.config
+# 里，被 defconfig 丢掉就会红）。这里补的是**依赖**：它们没写进 .config，
+# 全靠 defconfig 顺着 DEPENDS 的 select 带出来 —— 带没带出来必须逐个核对，
+# 否则"插件装了但跑不起来"要等刷机才发现。
+if [[ -n "${EXTRA_DEPS_FILE:-}" && -f "$EXTRA_DEPS_FILE" ]]; then
+  log "额外插件的依赖落位："
+  _missing=()
+  while IFS=$'\t' read -r dep src; do
+    [[ -n "$dep" ]] || continue
+    if grep -qx "CONFIG_PACKAGE_$dep=y" .config; then
+      st="进固件"
+    elif grep -qx "# CONFIG_PACKAGE_$dep is not set" .config; then
+      st="未选（条件依赖，或依赖者没启用）"
+    else
+      st="无符号（包没被 make 扫描到）"
+      _missing+=("$dep")
+    fi
+    printf '    %-24s %s\n' "$dep" "$st" | tee -a "$LOG_FILE" >&3
+  done <"$EXTRA_DEPS_FILE"
+  # 「无符号」是硬问题：软链没建成，依赖链断了，插件在固件里缺东西。
+  # 「未选」不算 —— 条件依赖（+CONFIG_X:y）在 X 关着时本来就该不选。
+  if ((${#_missing[@]})); then
+    die "这些依赖包在 make 眼里不存在（软链没建成功）：${_missing[*]}" "${_missing[@]}"
+  fi
+fi
 
 # ── 3. 校验符号 ──────────────────────────────────────────────
 # Kconfig 在依赖不满足时会**静默**丢掉选项。断言：配置文件里显式请求的每一个

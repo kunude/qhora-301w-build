@@ -16,7 +16,8 @@
 #                     有线 PPE 加速 + NSS Wi-Fi offload 全都在，不打补丁。
 #                 0 = 纯上游：不引 feed、不打补丁、不开任何 NSS 符号。
 #   PROXY_STACK   daed（默认）| dae | homeproxy | singbox | passwall2 | none
-#   SINGBOX_MODE  builtin（默认）| source —— 仅 singbox/homeproxy 有意义
+#   SINGBOX_MODE  builtin（默认，仅 homeproxy）| source（仅 singbox）
+#                 其余代理栈一律按 fixed 处理 —— 它们不碰 sing-box
 #   EXTRA_PACKAGES  逗号分隔，从 kenzok8/small 取的额外插件（可空）
 #
 #   其余变量（GH_TOKEN / DDNS_GO_VERSION / MSD_LITE_SHA …）原样透传给
@@ -42,7 +43,21 @@ BUILDER_DIR="${BUILDER_DIR:?BUILDER_DIR 未设置}"
 DISTRO="${DISTRO:-immortalwrt}"
 NSS="${NSS:-1}"
 PROXY_STACK="${PROXY_STACK:-daed}"
-SINGBOX_MODE="${SINGBOX_MODE:-builtin}"
+# SINGBOX_MODE 只对 homeproxy / singbox 有意义。其余栈（daed / dae / passwall2 /
+# none）根本不碰 sing-box，传它一个 builtin 会被 extra-packages.sh 里的断言
+# 直接拒绝（"builtin 只对 homeproxy / singbox 有意义"）。
+# workflow 的 singbox_mode 是个全局默认值，不分栈，所以这里统一归一 ——
+# 与其让调用方每次都记得传对，不如在这里兜住。
+case "${PROXY_STACK}" in
+  homeproxy|singbox) SINGBOX_MODE="${SINGBOX_MODE:-builtin}" ;;
+  *)
+    if [[ -n "${SINGBOX_MODE:-}" && "${SINGBOX_MODE}" != "fixed" ]]; then
+      printf '\033[1;33m[!]\033[0m SINGBOX_MODE=%s 对代理栈 %s 没有意义，按 fixed 处理\n' \
+        "$SINGBOX_MODE" "$PROXY_STACK"
+    fi
+    SINGBOX_MODE=fixed
+    ;;
+esac
 EXTRA_PACKAGES="${EXTRA_PACKAGES:-}"
 
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
@@ -96,7 +111,15 @@ if [[ "$NSS" == "1" ]]; then
 
   # ppe-nss 的 nss-packages 分支只提供 nss-firmware，驱动在树里。
   export NSS_FEED="src-git nss https://github.com/JuliusBairaktaris/nss-packages.git;ppe-nss"
-  EXTRA_LAYERS=("$OPENWRT_DIR/seeds/qualcommax-nss-wifi.seed")
+  # 顺序要紧：树的 seed 先上（提供全部 NSS 符号），本仓库的 nss.config 后上
+  # （只做减法 —— 关掉 seed 里在原版 feed 上取不到的可选包，否则符号校验会红）。
+  [[ -f "$BUILDER_DIR/configs/nss.config" ]] || die "缺少 configs/nss.config"
+  [[ -f "$OPENWRT_DIR/seeds/qualcommax-nss-wifi.seed" ]] \
+    || die "ppe-nss 树里没有 seeds/qualcommax-nss-wifi.seed"
+  EXTRA_LAYERS=(
+    "$OPENWRT_DIR/seeds/qualcommax-nss-wifi.seed"
+    "$BUILDER_DIR/configs/nss.config"
+  )
 
 else
   # ── NSS=0：树里不能有 NSS 的东西，否则说明检出了 ppe-nss ──────

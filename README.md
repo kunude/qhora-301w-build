@@ -72,9 +72,36 @@ CONFIG_PACKAGE_ppe-help
 不写死版本：每次构建 `feeds update small` 拿当时最新的。填在 `extra_packages`
 里即可（例如 `luci-app-openclash,mosdns`）。
 
-接入点在 `feeds install -a` **之后** —— small 里不少包与官方 feed 同名
-（sing-box / homeproxy / daed），提前加 feed 行会让 `install -a` 把 small
-全部二十多个包 link 一遍，撞名直接让 make 报 `duplicate package`。
+### 依赖会自动带出来
+
+点一个插件，它的依赖不用手填。两层机制：
+
+**第一层，`feeds install` 自己会跟**：它沿 `DEPENDS` 递归装**同一个 feed 内**的
+运行时依赖（源码里 `install_src` 遍历 `packages->depends`）。所以
+`luci-app-nikki` 会带上 `nikki` 和 `mihomo`。
+
+**第二层，`scripts/resolve-deps.sh` 展开完整闭包**：`feeds install` 只在同一个
+feed 内跟依赖、跳过 `@条件`、也不处理 `+COND:pkg` 里的条件包名，所以它不够。
+闭包脚本把整条链算出来，缺的补建软链，然后在日志里打出**每个依赖的最终落位**：
+
+```
+==> 闭包共 21 项：luci-base[external] … mihomo[small] nikki[small] mosdns[small] …
+==> 额外插件的依赖落位：
+    mosdns                   进固件
+    mihomo                   进固件
+    geo2txt                  进固件
+```
+
+三种状态含义不同：`进固件`（`=y`，真的会打进镜像）、`未选`（条件依赖没满足，
+正常）、`无符号`（包没被 make 扫描到，**硬失败**——插件会在固件里缺东西）。
+
+只点名包会写进 `.config`（`CONFIG_PACKAGE_*=y`），依赖不写——由 defconfig 顺着
+`select` 精确带出。这样既不会漏，也不会把整个闭包硬塞进镜像。
+
+`NSS=是` 时还有一层：ppe-nss 是 openwrt main 的 fork，它的 luci / packages feed
+是**官方 openwrt** 的，没有 `dae` / `daed` / `homeproxy` 这些 ImmortalWrt 专属包。
+`extra-packages.sh` 会按「feed 里有没有」判断，缺了才从 immortalwrt 稀疏检出补进来
+（`place_imm_extra`）—— 判据是 feed 而不是树名，ImmortalWrt 基座直接跳过。
 
 ## 目录
 
@@ -86,13 +113,16 @@ configs/
   common.config           所有变体共用
   qhora_301w.config       机型
   imm.config              immortalwrt 差异层（仅 distro=imm 且 nss=否 时挂）
+  nss.config              NSS 线的减法层（仅 nss=是 时挂，在 seed 之后）
   none.config             不集成代理（把 passwall2 全家 + Rust 工具链按掉）
   daed.config 等          各代理栈的覆盖层
 scripts/
   prepare.sh              唯一入口：三层参数 → 树选择 + config 拼装
   prepare-build.sh        feeds / .config / 符号校验 / 覆盖文件 / 内核补丁
+  resolve-deps.sh         展开插件依赖闭包（small feed 内部递归）
   wanted-packages.sh      当前变体「必须进固件」的包清单 → 产物校验用
   extra-packages.sh       ddns-go / msd_lite / passwall2 组件落位
+  test-local.sh           本地回归：在真树上跑 prepare，几组参数一起验
   resolve-*.sh            上游版本解析（每次构建取最新）
 files/ files-<stack>/     rootfs 覆盖，按代理栈叠加
 packages/                 自带配方（如 sing-box-refind）
@@ -115,6 +145,30 @@ cd openwrt && make -j"$(nproc)"
 ```sh
 git clone --depth 1 -b ppe-nss https://github.com/JuliusBairaktaris/openwrt-ppe-nss openwrt
 ```
+
+## 改完脚本先本地回归
+
+`scripts/test-local.sh` 在**真实基座树**上跑 `prepare.sh`，覆盖几组关键参数。
+prepare 阶段只要 1~3 分钟，而同样的错误丢到 CI 上要等二十几分钟，且日志要
+admin 权限才下载得到。
+
+```sh
+scripts/test-local.sh ~/work/imm                  # 默认 none + daed
+scripts/test-local.sh ~/work/imm none daed err    # 指定组合
+scripts/test-local.sh ~/work/ppe nss              # NSS 线，树必须是 ppe-nss
+```
+
+它断言的不是"脚本跑完了"，而是三个真正的失败模式：
+
+- **符号没被静默丢掉** —— defconfig 因为依赖不满足去掉了某个 `=y`
+- **依赖真的进了 `.config`** —— 不只是建了软链（`无符号` 直接判失败）
+- **NSS 线 `kmod-nss-wifi-drv` 确实在 `.config` 里** —— 否则"选了 NSS 等于没选"
+
+`err` 组合是反向用例：故意点一个不存在的包，期望**失败且报错点明包名**。
+
+这套脚本是 2026-10-28 那轮改动的产物，它一次抓出三个只在真树上暴露的问题：
+`extra-packages.sh` 不认识 `PROXY_STACK=none`、`common.config` 里还留着上一代
+NSS 的 21 个符号、反复跑时残留的 small feed 行会让 `feeds install -a` 装下整个 feed。
 
 ## 构建后的校验
 

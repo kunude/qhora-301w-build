@@ -92,7 +92,7 @@
 # ── 环境变量 ────────────────────────────────────────────────────
 #   OPENWRT_DIR     OpenWrt 源码目录（必需）
 #   BUILDER_DIR     本仓库检出目录（必需）
-#   PROXY_STACK     代理栈：passwall2（默认）| homeproxy | dae | daed
+#   PROXY_STACK     代理栈：passwall2（默认）| homeproxy | dae | daed | none
 #   IMM_REF         ImmortalWrt 的分支，默认 master（luci 侧也用它）
 #   IMM_LUCI        immortalwrt/luci 仓库地址
 #   IMM_PKGS        immortalwrt/packages 仓库地址（homeproxy 版取 sing-box 用）
@@ -177,9 +177,14 @@ PW_APP_REPO="${PW_APP_REPO:-https://github.com/Openwrt-Passwall/openwrt-passwall
 PW_PKGS_REPO="${PW_PKGS_REPO:-https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git}"
 
 case "$PROXY_STACK" in
-  passwall2|homeproxy|singbox|dae|daed) ;;
-  *) echo "不认识的 PROXY_STACK：$PROXY_STACK（只支持 passwall2 / homeproxy / singbox / dae / daed）" >&2; exit 1 ;;
+  passwall2|homeproxy|singbox|dae|daed|none) ;;
+  *) echo "不认识的 PROXY_STACK：$PROXY_STACK（只支持 passwall2 / homeproxy / singbox / dae / daed / none）" >&2; exit 1 ;;
 esac
+
+# none = 不带任何代理栈，自然也不碰 sing-box。SINGBOX_MODE 的四档里只有
+# fixed 是"完全不干预"，其余三档都会去动 sing-box 的版本或配方，所以先
+# 归一，否则会被下面那条检查挡下来。
+[[ "$PROXY_STACK" == "none" ]] && SINGBOX_MODE=fixed
 
 case "$SINGBOX_MODE" in
   fixed|latest|builtin|source) ;;
@@ -326,6 +331,37 @@ grep -q "getCPUUsage" "$HP_ACL" \
 log "  首页温度/CPU 已就位：getTempInfo / getCPUInfo / getCPUUsage（luci-base + luci-mod-status）"
 
 # ══════════════════════════════════════════════════════════════
+# ①-2 基座 feed 里缺的 ImmortalWrt 专属包
+# ══════════════════════════════════════════════════════════════
+# 勾了 NSS 的线整树换成 openwrt-ppe-nss（openwrt main 的 fork），它的 luci /
+# packages feed 是**官方 openwrt** 的：dae / daed / homeproxy 这些 ImmortalWrt
+# 专属包一个都没有。不补的话，后面的断言会报
+#     package/feeds/luci/luci-app-daed 不存在
+# 整条构建在 defconfig 之前就挂 —— 而 NSS + daed 正好是默认组合。
+#
+# 判据是「feed 里有没有」，不是「基座是谁」：ImmortalWrt 基座本来就有这些包，
+# 直接跳过；哪天 openwrt 官方收了，这里也自动不再拉。避免按树名硬编码。
+place_imm_extra() {
+  local kind="$1" rel="$2" repo dest
+
+  if [[ -e "feeds/$kind/$rel" ]]; then
+    log "  $kind/$rel 已由基座 feed 提供，跳过补包"
+    return 0
+  fi
+
+  case "$kind" in
+    packages) repo="$IMM_PKGS" ;;
+    luci)     repo="$IMM_LUCI" ;;
+    *) die "place_imm_extra: 不认识的 feed 类型 $kind" ;;
+  esac
+
+  dest="$WORK/imm-$kind-${rel//\//-}"
+  rm -rf "$dest"
+  sparse_clone "$repo" "$dest" "$rel"
+  place "$dest" "feeds/$kind" "$rel" "$rel" "ImmortalWrt 补包（基座 feed 里没有）"
+}
+
+# ══════════════════════════════════════════════════════════════
 # ③ 代理栈的核心组件
 # ══════════════════════════════════════════════════════════════
 # 取版本字段时不能只认 PKG_VERSION：少数组件把版本放在别的变量里
@@ -461,8 +497,11 @@ if [[ "$PROXY_STACK" == "dae" ]]; then
   #    feeds/packages/net/ —— 虽然 dae.config 里这些符号都置了 =n、不会被编进固件，
   #    但那是"多做一遍无用功 + 让 feeds 索引里混进一堆无关包"，
   #    而且一旦哪天有人手滑把它们选中，就会和 dae 抢同一份流量。
+  # openwrt 基座（选了 NSS 的那条线）没有这两个包，先补进来再断言。
+  place_imm_extra packages net/dae
+  place_imm_extra luci     applications/luci-app-dae
   log "代理栈 = dae：全部来自基座官方 feed，不引入任何第三方仓库"
-  ann "::notice title=dae 来源::immortalwrt/packages@${IMM_REF} + immortalwrt/luci@${IMM_REF}（官方 feed，无需外部落位）"
+  ann "::notice title=dae 来源::immortalwrt/packages@${IMM_REF} + immortalwrt/luci@${IMM_REF}（官方 feed，缺则从 immortalwrt 补）"
 elif [[ "$PROXY_STACK" == "daed" ]]; then
   # ════════════════════════════════════════════════════════════
   # ③-D2 代理栈 = daed：同样**一个仓库都不用拉**
@@ -479,8 +518,12 @@ elif [[ "$PROXY_STACK" == "daed" ]]; then
   # 内核前提完全相同（BTF / cls_bpf / act_bpf / XDP），不需要任何额外落位；
   # 两个内核不能同时装（抢 clsact qdisc 上的 eBPF 程序），configs/daed.config
   # 里已把 dae 那组符号显式置 n。
+  # openwrt 基座（选了 NSS 的那条线）没有这两个包，先补进来再断言。
+  # daed 一个 Makefile 出三个包（daed / daed-geoip / daed-geosite），补目录即可。
+  place_imm_extra packages net/daed
+  place_imm_extra luci     applications/luci-app-daed
   log "代理栈 = daed：全部来自基座官方 feed，不引入任何第三方仓库"
-  ann "::notice title=daed 来源::immortalwrt/packages@${IMM_REF} + immortalwrt/luci@${IMM_REF}（官方 feed，无需外部落位）"
+  ann "::notice title=daed 来源::immortalwrt/packages@${IMM_REF} + immortalwrt/luci@${IMM_REF}（官方 feed，缺则从 immortalwrt 补）"
 elif [[ "$PROXY_STACK" == "singbox" ]]; then
   # ════════════════════════════════════════════════════════════
   # ③-S 代理栈 = singbox（纯净内核线）
@@ -735,6 +778,9 @@ elif [[ "$PROXY_STACK" == "daed" ]]; then
 elif [[ "$PROXY_STACK" == "singbox" ]]; then
   log "  · ImmortalWrt 前端 luci-app-{ddns-go,msd_lite}（没有代理前端）"
   log "  · 代理核心        sing-box（reF1nd 源码编译，自带 init + config.json）"
+elif [[ "$PROXY_STACK" == "none" ]]; then
+  log "  · ImmortalWrt 前端 luci-app-{ddns-go,msd_lite}"
+  log "  · 代理核心        无（本线不集成任何代理）"
 else
   log "  · ImmortalWrt 前端 luci-app-{ddns-go,msd_lite}"
   log "  · passwall2       luci-app-passwall2 + ${#pw_rels[@]} 个依赖组件"
