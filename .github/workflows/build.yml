@@ -9,7 +9,7 @@ name: Build QHora-301W
 #   ① 基座      openwrt / immortalwrt
 #   ② NSS       是 → 整树切到 ppe-nss（有线 PPE + Wi-Fi offload 全都有）
 #               否 → 纯上游，不引 feed、不开任何 NSS 符号
-#   ③ 代理栈    daed / dae / homeproxy / singbox / passwall2 / 不集成
+#   ③ 代理栈    daed / dae / honk / homeproxy / singbox / passwall2 / 不集成
 #
 # ⚠️ ② 选「是」时 ① 会失效：ppe-nss 是 openwrt main 的 fork，不是 imm 的
 #    分支。这是有意的 —— NSS 的 Wi-Fi offload 由树内的 nss-wifi-drv 提供，
@@ -32,7 +32,7 @@ on:
       proxy:
         description: '③ 代理栈'
         type: choice
-        options: [daed, dae, homeproxy, singbox, passwall2, none]
+        options: [daed, dae, honk, homeproxy, singbox, passwall2, none]
         default: daed
 
       singbox_mode:
@@ -93,6 +93,9 @@ jobs:
       PROXY_STACK: ${{ inputs.proxy }}
       SINGBOX_MODE: ${{ inputs.singbox_mode }}
       EXTRA_PACKAGES: ${{ inputs.extra_packages }}
+      # prepare 阶段的几个脚本都要查 GitHub API（版本解析 / honk 的构建元数据）。
+      # 不传 token 走的是匿名限额（60 次/小时/IP，runner 是共享 IP）。
+      GH_TOKEN: ${{ github.token }}
 
     steps:
       - name: 释放磁盘空间
@@ -346,11 +349,11 @@ jobs:
             fi
           done
 
-          # BTF：daed / dae 的 eBPF 程序靠 CO-RE 读内核结构，没有 .BTF 段
+          # BTF：daed / dae / honk 的 eBPF 程序靠 CO-RE 读内核结构，没有 .BTF 段
           # 一启动就失败。.config 里开了 DEBUG_INFO 也可能被
           # KERNEL_DEBUG_INFO_REDUCED 挡掉，所以必须查编出来的内核本体。
           case "$PROXY_STACK" in
-            daed|dae)
+            daed|dae|honk)
               vmlinux=$(find openwrt/build_dir -maxdepth 4 -name vmlinux -print -quit 2>/dev/null || true)
               if [[ -n "$vmlinux" ]] && readelf -S "$vmlinux" 2>/dev/null | grep -q '\.BTF'; then
                 echo "::notice title=BTF::内核含 .BTF 段，$PROXY_STACK 的 CO-RE 前提满足"

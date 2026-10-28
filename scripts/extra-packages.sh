@@ -92,7 +92,7 @@
 # ── 环境变量 ────────────────────────────────────────────────────
 #   OPENWRT_DIR     OpenWrt 源码目录（必需）
 #   BUILDER_DIR     本仓库检出目录（必需）
-#   PROXY_STACK     代理栈：passwall2（默认）| homeproxy | dae | daed | none
+#   PROXY_STACK     代理栈：passwall2（默认）| homeproxy | dae | daed | honk | none
 #   IMM_REF         ImmortalWrt 的分支，默认 master（luci 侧也用它）
 #   IMM_LUCI        immortalwrt/luci 仓库地址
 #   IMM_PKGS        immortalwrt/packages 仓库地址（homeproxy 版取 sing-box 用）
@@ -177,8 +177,8 @@ PW_APP_REPO="${PW_APP_REPO:-https://github.com/Openwrt-Passwall/openwrt-passwall
 PW_PKGS_REPO="${PW_PKGS_REPO:-https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git}"
 
 case "$PROXY_STACK" in
-  passwall2|homeproxy|singbox|dae|daed|none) ;;
-  *) echo "不认识的 PROXY_STACK：$PROXY_STACK（只支持 passwall2 / homeproxy / singbox / dae / daed / none）" >&2; exit 1 ;;
+  passwall2|homeproxy|singbox|dae|daed|honk|none) ;;
+  *) echo "不认识的 PROXY_STACK：$PROXY_STACK（只支持 passwall2 / homeproxy / singbox / dae / daed / honk / none）" >&2; exit 1 ;;
 esac
 
 # none = 不带任何代理栈，自然也不碰 sing-box。SINGBOX_MODE 的四档里只有
@@ -706,6 +706,25 @@ elif [[ "$PROXY_STACK" == "homeproxy" ]]; then
   luci_sha="$(git -C "$WORK/luci" rev-parse --short HEAD 2>/dev/null || echo '?')"
   ann "::notice title=HomeProxy 版本::luci-app-homeproxy（取自 immortalwrt/luci@$IMM_REF，commit ${luci_sha}）"
   ann "::notice title=sing-box 版本::sing-box=${sb_ver}（取自 ${sb_desc}）"
+elif [[ "$PROXY_STACK" == "honk" ]]; then
+  # ════════════════════════════════════════════════════════════
+  # ③-K 代理栈 = honk（+ doona 面板）：这里**一个仓库都不拉**
+  # ════════════════════════════════════════════════════════════
+  # honk / luci-app-honk 的配方只在 kenzok8/small，而 small 的接入时机是
+  # `feeds install -a` **之后**（small 里有与官方 feed 同名的包，提前加 feed
+  # 会让 install -a 报 duplicate package），比本脚本晚一步。
+  # 所以 prepare-build.sh 把这两个包名并进 EXTRA_PACKAGES，走 small 那条通用
+  # 链路（依赖闭包、落位核对、未落位判红都是现成的）。
+  #
+  # 本分支存在的唯一目的：**别掉进最后的 passwall2 else** —— 那个分支会拉
+  # openwrt-passwall2 与 openwrt-passwall-packages 两个仓库、落位 18 个组件
+  # 配方，对 honk 线全是无用功（还会让 feeds 索引里混进一堆无关包）。
+  #
+  # 构建元数据（generated-stage.mk / generated-doona-stage.mk /
+  # generated-provenance.json）由 prepare-build.sh 在 small 落位之后补，
+  # 见 scripts/fetch-honk-stage.sh 头部。
+  log "代理栈 = honk：配方由 kenzok8/small 提供（feeds install 之后接入），本步不拉任何仓库"
+  ann "::notice title=honk 来源::kenzok8/small（honk + luci-app-honk，后者自带 doona 面板），构建元数据从 kenzok8/openwrt-honk 的 source-* 发布补齐"
 else
   # ════════════════════════════════════════════════════════════
   # ③-P 代理栈 = passwall2（默认）
@@ -775,6 +794,9 @@ elif [[ "$PROXY_STACK" == "dae" ]]; then
 elif [[ "$PROXY_STACK" == "daed" ]]; then
   log "  · ImmortalWrt 前端 luci-app-{ddns-go,msd_lite}"
   log "  · 代理核心        daed（dae-wing + 内嵌面板，基座官方 feed，未引入第三方仓库）"
+elif [[ "$PROXY_STACK" == "honk" ]]; then
+  log "  · ImmortalWrt 前端 luci-app-{ddns-go,msd_lite}"
+  log "  · 代理核心        honk（预编译核心，kenzok8/small）+ luci-app-honk/doona（本步不拉仓库）"
 elif [[ "$PROXY_STACK" == "singbox" ]]; then
   log "  · ImmortalWrt 前端 luci-app-{ddns-go,msd_lite}（没有代理前端）"
   log "  · 代理核心        sing-box（reF1nd 源码编译，自带 init + config.json）"

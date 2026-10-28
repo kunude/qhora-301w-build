@@ -38,7 +38,10 @@
 #                    而不是 ${NSS_FEED:-...} —— 后者会把空串也当成未设置，
 #                    于是"关掉 NSS"会被静默改回"打开"。
 #   GH_TOKEN         查 GitHub API 用，避免未认证限额（Actions 里默认注入）
-#   PROXY_STACK      代理栈：passwall2（默认）| homeproxy | singbox | dae | daed
+#   PROXY_STACK      代理栈：passwall2（默认）| homeproxy | singbox | dae | daed | honk
+#                    honk = eBPF 透明代理（dae 那一支的新引擎）+ doona 面板；
+#                    两个包都来自 kenzok8/small，构建元数据由
+#                    scripts/fetch-honk-stage.sh 在 small 落位之后补齐。
 #                    singbox = 纯净内核线：不装任何 LuCI 代理前端，只装
 #                    reF1nd 源码编的 sing-box + 它自带的 init/config.json。
 #                    homeproxy 时额外拼接 configs/homeproxy.config（覆盖层），
@@ -179,10 +182,11 @@ case "$PROXY_STACK" in
   dae)       CONFIGS+=( "$BUILDER_DIR/configs/dae.config" ) ;;
   daed)      CONFIGS+=( "$BUILDER_DIR/configs/daed.config" ) ;;
   singbox)   CONFIGS+=( "$BUILDER_DIR/configs/singbox.config" ) ;;
+  honk)      CONFIGS+=( "$BUILDER_DIR/configs/honk.config" ) ;;
   # none：不装任何代理前端，但**仍然**按掉 common.config 里 passwall2 那一组
   # 符号 —— 否则它们会被 select 拉进固件，"不集成代理"就名不副实。
   none)      CONFIGS+=( "$BUILDER_DIR/configs/none.config" ) ;;
-  *) die "不认识的 PROXY_STACK：$PROXY_STACK（只支持 passwall2 / homeproxy / singbox / dae / daed / none）" ;;
+  *) die "不认识的 PROXY_STACK：$PROXY_STACK（只支持 passwall2 / homeproxy / singbox / dae / daed / honk / none）" ;;
 esac
 
 # 可选：再追加覆盖层（同样"后拼接者覆盖前者"）。
@@ -297,6 +301,24 @@ log "安装全部 feed"
 log "feeds install 完成，package/feeds/ 下有："
 ls -1 package/feeds/ 2>/dev/null | sed 's/^/    /' | tee -a "$LOG_FILE" >&3 || true
 
+# ── PROXY_STACK=honk：核心与面板都从 kenzok8/small 取 ────────────
+# honk / luci-app-honk 的配方**只**在 kenzok8/small（基座官方 feed 里没有），
+# 而 small 的接入时机是 `feeds install -a` 之后（下文那段长注释解释了为什么）。
+# 与其在 honk 分支里另写一遍 feeds install / 依赖闭包 / 落位核对，不如把这两个
+# 包名并进 EXTRA_PACKAGES，走已经验证过的同一条链路。
+#
+# 去重是有意义的：用户可能自己在 extra_packages 里点了 luci-app-honk。
+if [[ "$PROXY_STACK" == "honk" ]]; then
+  declare -A _honk_seen=()
+  IFS=', ' read -r -a _honk_cur <<<"${EXTRA_PACKAGES:-}"
+  for p in "${_honk_cur[@]}"; do [[ -n "$p" ]] && _honk_seen["$p"]=1; done
+  _honk_seen["honk"]=1
+  _honk_seen["luci-app-honk"]=1
+  EXTRA_PACKAGES="$(printf '%s\n' "${!_honk_seen[@]}" | LC_ALL=C sort | paste -sd, -)"
+  unset _honk_seen _honk_cur p
+  log "honk 线：并入 small 的包 = $EXTRA_PACKAGES"
+fi
+
 # ── kenzok8/small：按需的额外插件 + 依赖闭包 ────────────────────
 # 位置**必须**在 `feeds install -a` 之后。small 里有 sing-box / homeproxy /
 # daed / luci-app-homeproxy 这类与官方 feed 同名的包；feed 行要是提前加进去，
@@ -404,6 +426,34 @@ if [[ -n "${EXTRA_PACKAGES:-}" ]]; then
   printf '%s\n' "$_closure" > "$EXTRA_DEPS_FILE"
 
   log "额外插件配置层已并入：$EXTRA_PKGS_CONFIG"
+fi
+
+
+# ── honk / doona 的构建元数据（必须晚于 small 落位）─────────────
+# small 里那两个 Makefile 只是骨架：真正的下载地址与哈希在三个**不随仓库提交**的
+# generate 文件里（它们用 `-include` 挂进来）。缺了不是"功能不全"，而是直接编不动：
+#   · generated-stage.mk 缺失 → PKG_SOURCE_URL 还停在已删除的 `staging` 标签（404），
+#     HONK_HASH_* 退化成 SKIP；
+#   · generated-provenance.json 缺失 → honk 的安装段 INSTALL_DATA 找不到源文件；
+#   · generated-doona-stage.mk 缺失 → doona 面板包的地址与哈希同样为空。
+# 三个文件都在 kenzok8/openwrt-honk 的 source-* 发布里，按 small 写死的
+# CORE_COMMIT 去匹配（详见 scripts/fetch-honk-stage.sh 头部）。
+if [[ "$PROXY_STACK" == "honk" ]]; then
+  log "补齐 honk / doona 的构建元数据（generated-*.mk + provenance）"
+  _honk_env="$(dirname "$LOG_FILE")/honk-stage.env"
+  : >"$_honk_env"
+  HONK_STAGE_ENV="$_honk_env" GH_TOKEN="${GH_TOKEN:-}" \
+    bash "$BUILDER_DIR/scripts/fetch-honk-stage.sh" \
+      --pkg-dir  feeds/small/honk \
+      --luci-dir feeds/small/luci-app-honk \
+    || die "honk 构建元数据补齐失败，详见上面的输出" \
+           "（常见原因：small 刚 bump CORE_COMMIT，kenzok8 的 source-* 发布还没跟上）"
+  # shellcheck disable=SC1090
+  . "$_honk_env"
+  _honk_ver="$(sed -n 's/^PKG_VERSION:=//p' feeds/small/honk/Makefile | head -n1)"
+  ann "::notice title=honk 版本::核心 ${HONK_STAGE_COMMIT:0:7}（配方 ${_honk_ver:-?}，发布 ${HONK_STAGE_TAG}）"
+  ann "::notice title=doona 面板版本::${HONK_STAGE_DOONA} → /usr/share/doona（honk 在 127.0.0.1:9527/ui/ 提供）"
+  unset _honk_env _honk_ver
 fi
 
 # 确认这些引入的包真的被 install 认领了（索引没重建的话这一步会漏）。
@@ -536,6 +586,49 @@ elif [[ "$PROXY_STACK" == "daed" ]]; then
     DAED_VERSION="${DAED_VERSION:-2.1.1}" \
     bash "$BUILDER_DIR/scripts/resolve-daed-version.sh" \
     || die "daed 版本渲染失败：DAED_VERSION=${DAED_VERSION:-2.1.1}，详见上面的输出"
+elif [[ "$PROXY_STACK" == "honk" ]]; then
+  # ── honk 版（eBPF 透明代理 + doona 面板）─────────────────────
+  # 与 dae / daed 线最大的不同：那两个包在**基座官方 feed** 里，而 honk 与
+  # luci-app-honk 只在 kenzok8/small。所以核对的位置是 package/feeds/small/ ——
+  # 落到别处就说明下面那步"改挂 small 的版本"没生效，编出来的会是别的东西。
+  for p in luci-app-ddns-go luci-app-msd_lite; do
+    [[ -e "package/feeds/luci/$p" ]] \
+      || die "package/feeds/luci/$p 不存在，引入的包没有被 feeds install 接管"
+  done
+  for p in honk luci-app-honk; do
+    [[ -e "package/feeds/small/$p" ]] \
+      || die "package/feeds/small/$p 不存在 —— honk 线的核心与面板必须来自 kenzok8/small"
+  done
+
+  # 元数据三道断言。缺一个都不是"少个功能"，而是下载 / 装包阶段直接失败：
+  #   generated-stage.mk        下载地址 + 哈希（缺了停在已删除的 staging 标签）
+  #   generated-provenance.json 装包时被 INSTALL_DATA 直接引用
+  #   generated-doona-stage.mk  doona 面板包的地址 + 哈希
+  [[ -s feeds/small/honk/generated-stage.mk ]] \
+    || die "feeds/small/honk/generated-stage.mk 缺失 —— 下载地址会停在已删除的 staging 标签上"
+  [[ -s feeds/small/honk/generated-provenance.json ]] \
+    || die "feeds/small/honk/generated-provenance.json 缺失 —— honk 的安装段 INSTALL_DATA 会失败"
+  [[ -s feeds/small/luci-app-honk/generated-doona-stage.mk ]] \
+    || die "feeds/small/luci-app-honk/generated-doona-stage.mk 缺失 —— doona 面板包没有下载地址"
+  grep -q '^PKG_SOURCE_URL:=.*releases/download/source-' \
+      feeds/small/luci-app-honk/generated-doona-stage.mk \
+    || die "generated-doona-stage.mk 的 PKG_SOURCE_URL 没有指向 source-* 发布（面板包会 404）"
+  grep -q '^HONK_ASSET_AARCH64:=honk-core-' feeds/small/honk/generated-stage.mk \
+    || die "generated-stage.mk 里没有 aarch64 资产 —— QHora-301W 是 aarch64_cortex-a53，编出来装不上"
+
+  # doona 面板不是独立包，它是 luci-app-honk 的安装段装进 /usr/share/doona 的
+  # 静态产物（honk 的 system.dae 里 ui: '/usr/share/doona'）。这句话没了就等于
+  # 面板没了 —— 而 honk 的 preflight 会以 ui_assets_missing 拒绝初始化。
+  grep -q 'usr/share/doona' feeds/small/luci-app-honk/Makefile \
+    || die "luci-app-honk 的 Makefile 里没有 /usr/share/doona 安装段 —— doona 面板会缺失"
+
+  # CO-RE 前提（与 dae / daed 同一套）：内核没有 BTF 时 honk 一样
+  # "编得出来、刷得进去、跑不起来"。真正的证据在产物阶段（vmlinux 的 .BTF 段）。
+  btf_req="$(grep -c '^CONFIG_KERNEL_DEBUG_INFO_BTF=y' "${CONFIGS[@]}" 2>/dev/null | awk -F: '{s+=$2} END{print s+0}')"
+  [[ "${btf_req:-0}" -ge 1 ]] \
+    || die "配置里没有 CONFIG_KERNEL_DEBUG_INFO_BTF=y —— honk 的 CO-RE 前提不成立" \
+           "（检查 configs/honk.config 的内核段）"
+  log "honk + luci-app-honk（doona 面板）已就位；内核 BTF / CGROUP_BPF 已请求"
 elif [[ "$PROXY_STACK" == "singbox" ]]; then
   # ── singbox 版（纯净内核线）────────────────────────────────
   # 这条线**没有代理前端**，所以要核对的东西比其它线少，但每一条都是

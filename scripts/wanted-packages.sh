@@ -92,6 +92,23 @@ case "$PROXY_STACK" in
     add simple-obfs-client v2ray-plugin haproxy lyaml
     add dnsmasq-full kmod-nft-tproxy kmod-nft-socket
     ;;
+  honk)
+    # honk 也是 eBPF 内核态分流的引擎（dae 那一支），清单与 dae / daed 高度
+    # 重合，差别只有两处：
+    #   ① 核心与面板来自 kenzok8/small —— honk + luci-app-honk，后者把 doona
+    #      静态面板装进 /usr/share/doona（不是独立的 doona 包，别去找它）；
+    #   ② UDP 首包暂存走 NFQUEUE（kmod-nft-queue 带出 nfnetlink_queue），
+    #      dae / daed 没有这一条。
+    # 这些全是 honk/files/control.sh 的 check_kernel 逐个点名要 modprobe 的
+    # 模块：sch_ingress / cls_bpf / veth / nft_queue / nfnetlink_queue，
+    # 缺一个面板初始化就报 kernel module unavailable。
+    add honk luci-app-honk
+    add v2ray-geoip v2ray-geosite
+    add kmod-sched-core kmod-sched-bpf kmod-veth kmod-nft-queue
+    # curl：honk 的 initialize_preflight 里是硬检查（command -v curl），
+    # 但配方 DEPENDS 没写它 —— 靠 common.config 的 =y 兜着，这里列出来一起验。
+    add curl ip-full
+    ;;
   none|"")
     ;;
   *)

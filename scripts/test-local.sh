@@ -19,6 +19,7 @@
 #   none      immortalwrt + 无代理 + 两个 small 插件（验证依赖闭包）
 #   daed      immortalwrt + daed（线上在用的那套）
 #   homeproxy immortalwrt + homeproxy（会额外刷规则集，需要联网）
+#   honk      immortalwrt + honk（含 doona 面板；会查 GitHub API 补构建元数据）
 #   nss       ppe-nss 整树 + daed（树必须是 ppe-nss）
 #   err       点一个不存在的包，**期望失败**（验证报错清晰）
 #
@@ -54,6 +55,7 @@ run_case() {
     none)      distro=immortalwrt nss=0 stack=none      extra="luci-app-mosdns,luci-app-nikki" ;;
     daed)      distro=immortalwrt nss=0 stack=daed      extra="luci-app-mosdns" ;;
     homeproxy) distro=immortalwrt nss=0 stack=homeproxy extra="" ;;
+    honk)      distro=immortalwrt nss=0 stack=honk      extra="" ;;
     nss)       distro=openwrt     nss=1 stack=daed      extra="luci-app-mosdns" ;;
     err)       distro=immortalwrt nss=0 stack=none      extra="luci-app-mosdns,luci-app-no-such-pkg"
                expect_fail=1 ;;
@@ -115,6 +117,23 @@ run_case() {
       ok "$case：kmod-nss-wifi-drv 确实进了 .config"
     else
       bad "$case：kmod-nss-wifi-drv 不在 .config 里 —— NSS 等于没开"; bads=1
+    fi
+  fi
+
+  # ④ honk 线的三条硬指标：核心 / 面板进 .config，构建元数据被补齐。
+  #    这三样任何一样缺了，编译阶段都不会"慢慢暴露"—— 直接 make download 就挂。
+  if [[ "$stack" == "honk" ]]; then
+    if grep -qx "CONFIG_PACKAGE_honk=y" "$TREE/.config" 2>/dev/null &&
+       grep -qx "CONFIG_PACKAGE_luci-app-honk=y" "$TREE/.config" 2>/dev/null; then
+      ok "$case：honk + luci-app-honk（doona 面板）都进了 .config"
+    else
+      bad "$case：honk / luci-app-honk 不在 .config 里"; bads=1
+    fi
+    if [[ -s "$TREE/feeds/small/honk/generated-stage.mk" &&
+          -s "$TREE/feeds/small/luci-app-honk/generated-doona-stage.mk" ]]; then
+      ok "$case：generated-stage.mk / generated-doona-stage.mk 已补齐"
+    else
+      bad "$case：honk 的构建元数据没补齐（make download 必挂）"; bads=1
     fi
   fi
 

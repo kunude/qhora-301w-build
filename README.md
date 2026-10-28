@@ -11,7 +11,7 @@ Actions → **Build QHora-301W** → Run workflow，填三个选择：
 |---|---|---|---|
 | ① | `distro` | `immortalwrt` / `openwrt` | 检出哪棵上游树 |
 | ② | `nss` | 是 / 否 | 是否换成 ppe-nss 整树（见下） |
-| ③ | `proxy` | `daed` `dae` `homeproxy` `singbox` `passwall2` `none` | 装哪套透明代理 |
+| ③ | `proxy` | `daed` `dae` `honk` `homeproxy` `singbox` `passwall2` `none` | 装哪套透明代理 |
 
 另外两个可选项：`extra_packages`（额外插件，逗号分隔）、`release`（成功后发 Release）。
 
@@ -45,6 +45,34 @@ nss=否  →  纯上游树       →  不引 NSS feed、不开任何 NSS 符号
 > sing-box 是 userspace），PPE/NSS 加速对它们**无效**——它只加速 fw4
 > flowtable 里的直连流量。所以「为了代理更快」去开 NSS 是方向错的；
 > NSS 真正帮到的是不走代理的 LAN↔WAN 大流量（NAS、IPTV）。
+
+## 代理栈之间只能选一个
+
+`daed` / `dae` / `honk` 是同一族（eBPF 内核态分流，抢 clsact / NFQUEUE），
+`homeproxy` / `passwall2` / `singbox` 是另一族（userspace + TPROXY/nft），
+任何两套同时装都会互相打架，所以 ③ 只能选一个。
+
+### honk + doona（2026-10-28 新增）
+
+`honk` 是 [daeuniverse/honk](https://github.com/daeuniverse/honk) —— dae 那一支的
+Rust 重写，配置语法沿用 dae，出站组 / Clash 兼容 API 借自 sing-box。
+`doona` 是它的静态 Web 面板（不单独成包，装在 `/usr/share/doona`，
+由 honk 自己在 `127.0.0.1:9527/ui/` 提供）。
+
+| | |
+|---|---|
+| 包从哪来 | `kenzok8/small` 的 `honk` + `luci-app-honk`（后者自带 doona） |
+| 核心形态 | 预编译 aarch64 二进制（kenzok8 CI 从上游源码交叉编译），**不拉 Rust 工具链** |
+| 内核前提 | Linux ≥ 6.12（当前三棵树都是 6.18）、BTF、`CGROUP_BPF`、cls_bpf、NFQUEUE |
+| 首次使用 | 面板里先「初始化」再「启用」—— 包默认 `enabled=0`，不在开机时自启 |
+
+⚠️ 上游自述 **alpha**（核心 0.0.1-alpha），量产前自己压测。
+
+small 里那两个 Makefile 只是骨架：**下载地址与哈希在三个不随仓库提交的
+`generated-*.mk` / `provenance.json` 里**，而它们默认指向一个已经删掉的
+`staging` 标签（实测 404）。所以 `scripts/fetch-honk-stage.sh` 会在 feeds 落位之后，
+按 small 写死的 `CORE_COMMIT` 去 `kenzok8/openwrt-honk` 的 `source-*` 发布里
+**匹配资产名**（不是取最新：取错就是 404），把三个文件补齐并校验后落位。
 
 ### 防静默降级
 
@@ -121,6 +149,7 @@ scripts/
   prepare-build.sh        feeds / .config / 符号校验 / 覆盖文件 / 内核补丁
   resolve-deps.sh         展开插件依赖闭包（small feed 内部递归）
   wanted-packages.sh      当前变体「必须进固件」的包清单 → 产物校验用
+  fetch-honk-stage.sh     补齐 honk / doona 的构建元数据（generated-*.mk）
   extra-packages.sh       ddns-go / msd_lite / passwall2 组件落位
   test-local.sh           本地回归：在真树上跑 prepare，几组参数一起验
   resolve-*.sh            上游版本解析（每次构建取最新）
@@ -154,7 +183,7 @@ admin 权限才下载得到。
 
 ```sh
 scripts/test-local.sh ~/work/imm                  # 默认 none + daed
-scripts/test-local.sh ~/work/imm none daed err    # 指定组合
+scripts/test-local.sh ~/work/imm none daed honk err   # 指定组合
 scripts/test-local.sh ~/work/ppe nss              # NSS 线，树必须是 ppe-nss
 ```
 
@@ -178,7 +207,7 @@ NSS 的 21 个符号、反复跑时残留的 small feed 行会让 `feeds install
    之后的结果比对，丢一个就失败并打印该符号在 kconfig 里的定义。
 2. **产物**：`wanted-packages.sh` 按变体生成包清单，逐个查包文件
    （apk 后端 `.apk` / opkg 后端 `.ipk`）与 rootfs 的 `.manifest`。
-3. **内核前提**：`daed` / `dae` 的 eBPF 程序靠 CO-RE 读内核结构，必须查
+3. **内核前提**：`daed` / `dae` / `honk` 的 eBPF 程序靠 CO-RE 读内核结构，必须查
    `vmlinux` 里真的有 `.BTF` 段 —— `.config` 开了 `DEBUG_INFO` 也可能被
    `KERNEL_DEBUG_INFO_REDUCED` 挡掉。
 
