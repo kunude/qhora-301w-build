@@ -54,11 +54,16 @@ concurrency:
 
 env:
   IMM_REPOSITORY: immortalwrt/immortalwrt
-  IMM_BASE_REF: ${{ github.event.inputs.imm_ref || 'da63f7d6ac4207e534c9b92ba3d2b555a8edce8d' }}
+  # 不再钉 commit：以前钉在 da63f7d 是为了配合 archive/patches/immortalwrt-nss/
+  # 那份补丁，补丁已经退出构建（NSS 改成整树切换），钉版本的理由也就没了。
+  IMM_BASE_REF: ${{ github.event.inputs.imm_ref || 'master' }}
   IMM_REF: master
   IMM_LUCI: ""
   IMM_PKGS: ""
-  NSS_FEED: src-git nss https://github.com/JuliusBairaktaris/nss-packages.git;edma-nss
+  # 这里**不要**再写 NSS_FEED：这条线不编 NSS，prepare.sh 会把它显式置空。
+  # 写了反而会让 prepare-build.sh 去追加 edma-nss feed 并等 feeds/nss 就位。
+  DISTRO: immortalwrt
+  NSS: '0'
   TARGET: qualcommax
   SUBTARGET: ipq807x
   DEVICE: qnap_301w
@@ -126,7 +131,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          bash "$BUILDER_DIR/scripts/prepare-build-imm-nss.sh"
+          # 走统一入口：这条线只是 PROXY_STACK=singbox / NSS=0 的一个特例，
+          # 没有理由再维护一份自己的准备脚本。
+          bash "$BUILDER_DIR/scripts/prepare.sh"
 
       - name: 回放准备日志
         if: always()

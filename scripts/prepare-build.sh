@@ -31,7 +31,12 @@
 #   OPENWRT_DIR      已检出的 OpenWrt 源码目录（必须是 git 工作区）
 #   BUILDER_DIR      本仓库的检出目录
 # 可选：
-#   NSS_FEED         NSS feed 的 src-git 行，默认指向 edma-nss 分支
+#   NSS_FEED         NSS feed 的 src-git 行。**不设置**时默认指向 edma-nss
+#                    分支（老线的行为）；**显式设为空串**表示这条线不要 NSS，
+#                    后面所有 feed 追加 / feeds/nss 守卫 / CONFIG_FEED_* 关闭
+#                    全部跳过。两种状态必须能区分，所以下面用 ${NSS_FEED-...}
+#                    而不是 ${NSS_FEED:-...} —— 后者会把空串也当成未设置，
+#                    于是"关掉 NSS"会被静默改回"打开"。
 #   GH_TOKEN         查 GitHub API 用，避免未认证限额（Actions 里默认注入）
 #   PROXY_STACK      代理栈：passwall2（默认）| homeproxy | singbox | dae | daed
 #                    singbox = 纯净内核线：不装任何 LuCI 代理前端，只装
@@ -43,10 +48,10 @@
 #                    files-homeproxy/（不存在就跳过）。
 #   DDNS_GO_VERSION  钉死 ddns-go 版本，例如 6.17.7（默认跟随上游最新 release）
 #   MSD_LITE_SHA     钉死 msd_lite 的 commit sha（默认跟随上游 master HEAD）
-#   EXTRA_CONFIG     再追加一层 .config 覆盖层（后拼接者覆盖前者）。只有
-#                    immortalwrt 线（scripts/prepare-build-imm-nss.sh）会设它：
-#                    换成 ImmortalWrt 基座后个别符号与 openwrt 不同，那些差异
-#                    只对那条线成立，不能写进 common.config。不设则行为不变。
+#   EXTRA_CONFIG     再追加一层 .config 覆盖层（后拼接者覆盖前者）。
+#                    scripts/prepare.sh 会传：基座的差异层（configs/imm.config，
+#                    仅 immortalwrt + NSS=0 时）+ ppe-nss 树的
+#                    seeds/qualcommax-nss-wifi.seed（仅 NSS=1 时）。
 #   RULESETS_REFRESH 仅 PROXY_STACK=homeproxy 有意义。1（默认）= 构建时从上游
 #                    拉最新 .srs；0 = 只用仓库内置的固定版（完全不联网）。
 #   RULESETS_STRICT  仅 PROXY_STACK=homeproxy 有意义。1 = 规则集没拿到最新版
@@ -139,7 +144,8 @@ trap '_on_error "$LINENO" "$BASH_COMMAND"' ERR
 
 OPENWRT_DIR="${OPENWRT_DIR:?OPENWRT_DIR 未设置}"
 BUILDER_DIR="${BUILDER_DIR:?BUILDER_DIR 未设置}"
-NSS_FEED="${NSS_FEED:-src-git nss https://github.com/JuliusBairaktaris/nss-packages.git;edma-nss}"
+# 注意是 `-` 不是 `:-`：空串代表"不要 NSS"，不能被默认值盖回去。
+NSS_FEED="${NSS_FEED-src-git nss https://github.com/JuliusBairaktaris/nss-packages.git;edma-nss}"
 
 # log/warn 同时进日志和 CI 控制台，这样远程也能看到进度。
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*" | tee -a "$LOG_FILE" >&3; }
@@ -173,19 +179,30 @@ case "$PROXY_STACK" in
   dae)       CONFIGS+=( "$BUILDER_DIR/configs/dae.config" ) ;;
   daed)      CONFIGS+=( "$BUILDER_DIR/configs/daed.config" ) ;;
   singbox)   CONFIGS+=( "$BUILDER_DIR/configs/singbox.config" ) ;;
-  *) die "不认识的 PROXY_STACK：$PROXY_STACK（只支持 passwall2 / homeproxy / singbox / dae / daed）" ;;
+  # none：不装任何代理前端，但**仍然**按掉 common.config 里 passwall2 那一组
+  # 符号 —— 否则它们会被 select 拉进固件，"不集成代理"就名不副实。
+  none)      CONFIGS+=( "$BUILDER_DIR/configs/none.config" ) ;;
+  *) die "不认识的 PROXY_STACK：$PROXY_STACK（只支持 passwall2 / homeproxy / singbox / dae / daed / none）" ;;
 esac
 
-# 可选：再追加一层覆盖层（同样"后拼接者覆盖前者"）。
-# 只有 immortalwrt 线（scripts/prepare-build-imm-nss.sh）会设它 —— 基座换成
-# ImmortalWrt 之后，个别包名 / 符号取值与 openwrt 不同，那些差异只对那条线
-# 成立，写进 common.config 会连累两条老线，所以单独放一层。
+# 可选：再追加覆盖层（同样"后拼接者覆盖前者"）。
+# 由 scripts/prepare.sh 传入：immortalwrt 的符号差异层（configs/imm.config）、
+# ppe-nss 的 seed（NSS=1 时）。两者性质不同 —— 一个是"基座差异"、一个是
+# "功能开关集"，混进同一个文件会让"哪条符号是谁加的"不可追溯。
 #
 # ⚠️ 不设 EXTRA_CONFIG 时以下代码一行都不执行 —— 两条老线的行为与以前**完全一致**。
+#
+# 支持空格分隔的多个文件（按顺序叠加，后拼接者覆盖前者），单文件用法不变。
+# 统一入口 scripts/prepare.sh 会同时传两层：基座的 config 差异层 + NSS 的
+# seed（ppe-nss 树的 seeds/qualcommax-nss-wifi.seed）。两种东西性质不同，
+# 混进一个文件会让"哪条符号是谁加的"变得不可追溯。
 if [[ -n "${EXTRA_CONFIG:-}" ]]; then
-  [[ -f "$EXTRA_CONFIG" ]] || die "EXTRA_CONFIG 指向的配置文件不存在：$EXTRA_CONFIG"
-  log "追加覆盖层：${EXTRA_CONFIG##*/}"
-  CONFIGS+=( "$EXTRA_CONFIG" )
+  for _layer in $EXTRA_CONFIG; do
+    [[ -f "$_layer" ]] || die "EXTRA_CONFIG 指向的配置文件不存在：$_layer"
+    log "追加覆盖层：${_layer##*/}"
+    CONFIGS+=( "$_layer" )
+  done
+  unset _layer
 fi
 
 # 关于符号校验：不在这里维护一份"我认为重要的符号"清单。
@@ -201,11 +218,23 @@ done
 # ── 1. feed ──────────────────────────────────────────────────
 [[ -f "$OPENWRT_DIR/feeds.conf" ]] || cp "$OPENWRT_DIR/feeds.conf.default" "$OPENWRT_DIR/feeds.conf"
 
-if ! grep -qxF "$NSS_FEED" "$OPENWRT_DIR/feeds.conf"; then
-  log "追加 NSS feed：$NSS_FEED"
-  printf '%s\n' "$NSS_FEED" >> "$OPENWRT_DIR/feeds.conf"
+if [[ -n "$NSS_FEED" ]]; then
+  if ! grep -qxF "$NSS_FEED" "$OPENWRT_DIR/feeds.conf"; then
+    log "追加 NSS feed：$NSS_FEED"
+    printf '%s\n' "$NSS_FEED" >> "$OPENWRT_DIR/feeds.conf"
+  else
+    log "NSS feed 已存在，跳过追加"
+  fi
 else
-  log "NSS feed 已存在，跳过追加"
+  log "NSS_FEED 为空 —— 本线不引入 NSS feed"
+fi
+
+# src-git <name> <url>;… 的第二列。下面两处要用它，只算一次；
+# 空 NSS_FEED 时留空，"要不要 NSS"就只由这一个变量决定。
+if [[ -n "$NSS_FEED" ]]; then
+  NSS_FEED_NAME="$(awk '{print $2}' <<<"$NSS_FEED")"
+else
+  NSS_FEED_NAME=""
 fi
 
 cd "$OPENWRT_DIR"
@@ -253,6 +282,56 @@ log "安装全部 feed"
 
 log "feeds install 完成，package/feeds/ 下有："
 ls -1 package/feeds/ 2>/dev/null | sed 's/^/    /' | tee -a "$LOG_FILE" >&3 || true
+
+# ── kenzok8/small：按需的额外插件 ──────────────────────────────
+# 位置**必须**在 `feeds install -a` 之后。small 里有 sing-box / homeproxy /
+# daed / luci-app-homeproxy 这类与官方 feed 同名的包；feed 行要是提前加进去，
+# 上面那句 install -a 会把 small 里二十多个包全部 link 一遍，撞名会让 make
+# 报 "duplicate package"，而且报的位置离这里很远。
+#
+# 不设版本：每次构建 `feeds update small` 拿的就是当时最新的源码。
+EXTRA_PKGS_CONFIG=""
+if [[ -n "${EXTRA_PACKAGES:-}" ]]; then
+  log "接入 kenzok8/small（只装 EXTRA_PACKAGES 点名的包）：$EXTRA_PACKAGES"
+
+  SMALL_FEED="src-git small https://github.com/kenzok8/small.git;master"
+  if ! grep -q 'github.com/kenzok8/small' feeds.conf; then
+    printf '%s\n' "$SMALL_FEED" >> feeds.conf
+    log "追加 small feed：$SMALL_FEED"
+  fi
+  ./scripts/feeds update small
+
+  EXTRA_PKGS_CONFIG="$(dirname "$LOG_FILE")/extra-packages.config"
+  : > "$EXTRA_PKGS_CONFIG"
+
+  IFS=', ' read -r -a _want <<<"$EXTRA_PACKAGES"
+  for p in "${_want[@]}"; do
+    [[ -n "$p" ]] || continue
+
+    # 同名包的既有来源：feeds 下的是软链，可以摘掉换成 small 的；
+    # 主树里的真目录不能动（那是基座源码），遇到就保留主树版本。
+    for existing in package/feeds/*/"$p"; do
+      [[ -L "$existing" ]] || continue
+      warn "额外插件 $p 已由 ${existing#package/feeds/} 提供，改挂 small 的版本"
+      rm -f "$existing"
+    done
+
+    if [[ -d "package/$p" ]]; then
+      warn "额外插件 $p 在基座主树里自带（package/$p），保留主树版本，跳过 small"
+    else
+      ./scripts/feeds install -p small "$p" \
+        || die "额外插件 $p 在 kenzok8/small 里找不到 —— 名字拼错了？"
+      log "额外插件 $p ← kenzok8/small"
+    fi
+
+    # 点名装进固件。包不存在时 defconfig 会自动丢掉这个符号，
+    # 随后的「校验符号」步骤会当场 die —— 那正是我们想要的失败方式。
+    echo "CONFIG_PACKAGE_$p=y" >> "$EXTRA_PKGS_CONFIG"
+  done
+
+  CONFIGS+=("$EXTRA_PKGS_CONFIG")
+  log "额外插件配置层已并入：$EXTRA_PKGS_CONFIG"
+fi
 
 # 确认这些引入的包真的被 install 认领了（索引没重建的话这一步会漏）。
 for p in ddns-go msd_lite; do
@@ -435,8 +514,13 @@ else
   done
 fi
 
-# 没有这个 feed，ATH11K_NSS_SUPPORT 会因依赖不满足而无法在 menuconfig 里选中。
-[[ -d "$OPENWRT_DIR/feeds/nss" ]] || die "NSS feed 没有就位（feeds/nss 不存在），检查上面的 feeds 步骤"
+# 引入 NSS feed 的线才要求它真的就位。名字从 NSS_FEED 里取，不写死 nss。
+# edma-nss 老栈缺这个 feed 会让 ATH11K_NSS_SUPPORT 因依赖不满足而选不中；
+# ppe-nss 新栈的 nss-wifi-drv 在树里，但 nss-firmware 仍由这个 feed 提供。
+if [[ -n "$NSS_FEED_NAME" ]]; then
+  [[ -d "$OPENWRT_DIR/feeds/$NSS_FEED_NAME" ]] \
+    || die "NSS feed 没有就位（feeds/$NSS_FEED_NAME 不存在），检查上面的 feeds 步骤"
+fi
 
 # ── 2. 组装 .config ──────────────────────────────────────────
 log "生成 .config：$(for f in "${CONFIGS[@]}"; do printf '%s ' "${f##*/}"; done)"
@@ -474,9 +558,10 @@ fi
 log "配置文件请求的符号全部保留"
 
 # ── 4. 不要把整个自定义 feed 打进镜像 ───────────────────────
-feed_name="$(awk '{print $2}' <<<"$NSS_FEED")"
-log "关闭 CONFIG_FEED_${feed_name}（只保留 .config 里显式选中的包）"
-sed -i "s/^CONFIG_FEED_${feed_name}=.*/# CONFIG_FEED_${feed_name} is not set/" .config
+if [[ -n "$NSS_FEED_NAME" ]]; then
+  log "关闭 CONFIG_FEED_${NSS_FEED_NAME}（只保留 .config 里显式选中的包）"
+  sed -i "s/^CONFIG_FEED_${NSS_FEED_NAME}=.*/# CONFIG_FEED_${NSS_FEED_NAME} is not set/" .config
+fi
 
 # ── 5. 出厂预置守卫：不许出现凭据 / 订阅链接 ─────────────────
 # 固件是公开产物：覆盖层里任何节点地址 / 密码 / 订阅链接都会随镜像公开。
