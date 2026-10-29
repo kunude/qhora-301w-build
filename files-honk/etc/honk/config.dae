@@ -58,13 +58,21 @@ dns {
     # ipversion_prefer: 4
 }
 
-# 分流：私有网段 / 国内 IP / 国内域名走直连，其余按 fallback。
+# 分流：私有网段 / 国内 IP / 国内域名走直连，**其余全部交给 proxy 组**。
+#
+# ⚠️ fallback 是「上面所有规则都没命中」的那部分流量。kenzok8 包里自带的
+#    上游配置写的是 `fallback: direct` —— 照抄过来就是「装了代理栈也永远不出国」：
+#    进程在跑、doona 面板能开、日志一句报错没有，只是所有墙外流量都直连超时。
+#    这里与 dae 线（files-dae/config.dae 的 `fallback: proxy`）对齐，改成 proxy。
+#
+#    还没填订阅时 proxy 组是空的，墙外照样不通 —— 那是预期行为（没节点可用），
+#    不是这份配置的问题。想临时全直连（比如排障）就改回 direct 再重启 honk。
 routing {
     dip(224.0.0.0/3, 'ff00::/8') -> direct
     dip(geoip: private) && !dport(53) -> direct(must)
     dip(geoip: cn) && !dport(53) -> direct(must)
     domain(geosite: cn) -> direct
-    fallback: direct
+    fallback: proxy
 }
 
 # ── 订阅：需要你自己填 ────────────────────────────────────────────────────

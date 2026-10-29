@@ -920,6 +920,18 @@ if [[ -d files/etc/honk ]]; then
   log "honk 配置权限已收紧为 0600（与 dae 同一套要求）"
 fi
 
+# honk 维护页的「恢复出厂配置」用 `cp /usr/share/honk/default-config.dae`，
+# 而包装进去的那份是 **upstream 的 config.dae**（`fallback: direct`，全直连）。
+# 不替换它的话，用户点一次「重置配置」就把默认出口又改回直连 —— 刚修好的
+# 「出国不通」会被一次恢复出厂复活，而且照样没有任何报错。
+# 用同一份文件生成副本，避免维护两份内容然后慢慢走样。
+if [[ "$PROXY_STACK" == "honk" && -f files/etc/honk/config.dae ]]; then
+  mkdir -p files/usr/share/honk
+  cp -a files/etc/honk/config.dae files/usr/share/honk/default-config.dae
+  chmod 0644 files/usr/share/honk/default-config.dae
+  log "honk 恢复出厂模板已对齐：/usr/share/honk/default-config.dae = 出厂 config.dae（默认出口 proxy）"
+fi
+
 # ── 6a. dae 覆盖层的两道断言 ───────────────────────────────────
 # files-<PROXY_STACK>/ 是"目录不存在就静默跳过"的，写错目录名不会报错，
 # 只会编出一份**没有骨架配置**的固件 —— 刷进去 dae 一启动就因为找不到
@@ -966,7 +978,19 @@ if [[ "$PROXY_STACK" == "honk" ]]; then
            "（缺了它就没有 native_api：doona 面板 404，wan/lan 接口也失去明确指定）"
   grep -qE '^[[:space:]]*system\.dae[[:space:]]*$' "$hk_conf" \
     || die "$hk_conf 的 include 块里没有 system.dae"
-  log "honk 出厂配置就位：config.dae 含 include system.dae（native_api + doona）"
+
+  # 默认出口必须是 proxy。upstream 那份 config.dae 写的是 `fallback: direct`，
+  # 照抄过来的后果是**静默**的：honk 进程在跑、doona 面板能开、日志没有报错，
+  # 只是所有墙外流量直连超时 —— 用户只会说「出国不通」，而构建、刷机全绿。
+  # 唯一能在构建期识破的就是这一条。
+  grep -qE '^[[:space:]]*fallback:[[:space:]]*proxy([[:space:]]|$)' "$hk_conf" \
+    || die "$hk_conf 的 routing 默认出口不是 proxy —— 装了代理栈也不会出国" \
+           "upstream 默认写的是 fallback: direct（全直连）；把 routing 块最后一行改成 proxy"
+  if grep -qE '^[[:space:]]*fallback:[[:space:]]*direct([[:space:]]|$)' "$hk_conf"; then
+    die "$hk_conf 里还有 fallback: direct —— 命中它的流量永不出国" \
+        "（routing 块最后一行应该是 proxy；direct 只保留在上面那几条明确规则里）"
+  fi
+  log "honk 出厂配置就位：config.dae 含 include system.dae（native_api + doona），默认出口 proxy"
 fi
 
 # ── 6a-4. passwall 覆盖层：出厂补丁必须晚于厂商脚本 ───────────────

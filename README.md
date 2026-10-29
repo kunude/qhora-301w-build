@@ -65,9 +65,22 @@ Rust 重写，配置语法沿用 dae，出站组 / Clash 兼容 API 借自 sing-
 | 包从哪来 | `kenzok8/small` 的 `honk` + `luci-app-honk`（后者自带 doona） |
 | 核心形态 | 预编译 aarch64 二进制（kenzok8 CI 从上游源码交叉编译），**不拉 Rust 工具链** |
 | 内核前提 | Linux ≥ 6.12（当前三棵树都是 6.18）、BTF、`CGROUP_BPF`、cls_bpf、NFQUEUE |
+| 默认出口 | `fallback: proxy` —— 填了订阅就能出国。上游自带配置是 `direct`（全直连），照抄会「装完也不出国」，见下 |
 | 首次使用 | 面板里先「初始化」再「启用」—— 包默认 `enabled=0`，不在开机时自启 |
+| 订阅 | 包不带任何节点，**必须自己导入**：LuCI「服务 → Honk」里填订阅，或设备上往 `/etc/honk/config.dae` 的 `subscription` 块里填（0600） |
 
 ⚠️ 上游自述 **alpha**（核心 0.0.1-alpha），量产前自己压测。
+
+**刷完机「出国不通」的两个必查点**（都不是 bug，是 honk 的默认姿态）：
+
+1. **服务没起** —— `honk` 出厂 `enabled=0` / `initialized=0`，`/etc/init.d/honk start`
+   会直接拒绝启动并在 syslog 里留一行 `refusing to start before explicit initialization`。
+   先初始化再启用（LuCI「服务 → Honk」，等价命令是 `/usr/share/honk/control.sh initialize`）。
+2. **没有节点** —— 预置里只有注释掉的订阅示例（公开仓库不能放真链接）。没订阅时
+   `proxy` 组是空的，墙外流量必然不通。
+
+排查用 `/usr/share/honk/control.sh diagnose`：它把 `kernel_requirements_unmet` /
+`lan_network_unavailable` / `proxy_conflict` 这些原因一次性列出来，比翻日志快。
 
 small 里那两个 Makefile 只是骨架：**下载地址与哈希在三个不随仓库提交的
 `generated-*.mk` / `provenance.json` 里**，而它们默认指向一个已经删掉的
