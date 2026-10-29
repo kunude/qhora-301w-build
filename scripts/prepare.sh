@@ -15,7 +15,10 @@
 #                 1 = 全功能：整棵树换成 JuliusBairaktaris/openwrt-ppe-nss@ppe-nss
 #                     有线 PPE 加速 + NSS Wi-Fi offload 全都在，不打补丁。
 #                 0 = 纯上游：不引 feed、不打补丁、不开任何 NSS 符号。
-#   PROXY_STACK   daed（默认）| dae | homeproxy | singbox | passwall2 | honk | none
+#   PROXY_STACK   daed（默认）| dae | honk | homeproxy | singbox | passwall |
+#                 passwall2 | none
+#                 passwall  = v1（Lua 界面，luci-app-passwall）
+#                 passwall2 = v2（ucode 界面，luci-app-passwall2）
 #   SINGBOX_MODE  builtin（默认，仅 homeproxy）| source（仅 singbox）
 #                 其余代理栈一律按 fixed 处理 —— 它们不碰 sing-box
 #   EXTRA_PACKAGES  逗号分隔，从 kenzok8/small 取的额外插件（可空）
@@ -44,7 +47,7 @@ DISTRO="${DISTRO:-immortalwrt}"
 NSS="${NSS:-1}"
 PROXY_STACK="${PROXY_STACK:-daed}"
 # SINGBOX_MODE 只对 homeproxy / singbox 有意义。其余栈（daed / dae / honk /
-# passwall2 / none）根本不碰 sing-box，传它一个 builtin 会被 extra-packages.sh
+# passwall / passwall2 / none）根本不碰 sing-box，传它一个 builtin 会被 extra-packages.sh
 # 里的断言直接拒绝（"builtin 只对 homeproxy / singbox 有意义"）。
 # workflow 的 singbox_mode 是个全局默认值，不分栈，所以这里统一归一 ——
 # 与其让调用方每次都记得传对，不如在这里兜住。
@@ -73,8 +76,8 @@ case "$NSS" in
   *) die "NSS 只能是 0 或 1，收到：$NSS" ;;
 esac
 case "$PROXY_STACK" in
-  daed|dae|homeproxy|singbox|passwall2|honk|none) ;;
-  *) die "PROXY_STACK 不认识：$PROXY_STACK" ;;
+  daed|dae|honk|homeproxy|singbox|passwall|passwall2|none) ;;
+  *) die "PROXY_STACK 不认识：$PROXY_STACK（只支持 daed / dae / honk / homeproxy / singbox / passwall / passwall2 / none）" ;;
 esac
 
 [[ -d "$OPENWRT_DIR" ]] || die "基座源码目录不存在：$OPENWRT_DIR"

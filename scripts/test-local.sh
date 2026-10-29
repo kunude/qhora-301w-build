@@ -20,6 +20,8 @@
 #   daed      immortalwrt + daed（线上在用的那套）
 #   homeproxy immortalwrt + homeproxy（会额外刷规则集，需要联网）
 #   honk      immortalwrt + honk（含 doona 面板；会查 GitHub API 补构建元数据）
+#   passwall  immortalwrt + passwall v1（Lua 界面 + luci-compat + Xray）
+#   passwall2 immortalwrt + passwall v2（默认栈，ucode 界面；v1/v2 共用组件仓库）
 #   nss       ppe-nss 整树 + daed（树必须是 ppe-nss）
 #   err       点一个不存在的包，**期望失败**（验证报错清晰）
 #
@@ -27,7 +29,7 @@
 #
 set -Eeuo pipefail
 
-TREE="${1:?用法：$0 <基座源码目录> [none|daed|homeproxy|nss|err ...]}"
+TREE="${1:?用法：$0 <基座源码目录> [none|daed|homeproxy|honk|passwall|passwall2|nss|err ...]}"
 shift || true
 CASES=("$@")
 ((${#CASES[@]})) || CASES=(none daed)
@@ -56,6 +58,8 @@ run_case() {
     daed)      distro=immortalwrt nss=0 stack=daed      extra="luci-app-mosdns" ;;
     homeproxy) distro=immortalwrt nss=0 stack=homeproxy extra="" ;;
     honk)      distro=immortalwrt nss=0 stack=honk      extra="" ;;
+    passwall)  distro=immortalwrt nss=0 stack=passwall  extra="" ;;
+    passwall2) distro=immortalwrt nss=0 stack=passwall2 extra="" ;;
     nss)       distro=openwrt     nss=1 stack=daed      extra="luci-app-mosdns" ;;
     err)       distro=immortalwrt nss=0 stack=none      extra="luci-app-mosdns,luci-app-no-such-pkg"
                expect_fail=1 ;;
@@ -117,6 +121,32 @@ run_case() {
       ok "$case：kmod-nss-wifi-drv 确实进了 .config"
     else
       bad "$case：kmod-nss-wifi-drv 不在 .config 里 —— NSS 等于没开"; bads=1
+    fi
+  fi
+
+  # ③-b passwall v1 线的四条硬指标。最容易出的错是"v2 被顺手也装进来"和
+  #      "Lua 界面缺 luci-compat, 页面 404" —— 两者都编得过, 只有刷进去才发现。
+  if [[ "$stack" == "passwall" ]]; then
+    local v1ok=1
+    grep -qx "CONFIG_PACKAGE_luci-app-passwall=y" "$TREE/.config" 2>/dev/null || v1ok=0
+    grep -qx "CONFIG_PACKAGE_luci-i18n-passwall-zh-cn=y" "$TREE/.config" 2>/dev/null || v1ok=0
+    if ((v1ok)); then
+      ok "$case：luci-app-passwall + 中文翻译都进了 .config"
+    else
+      bad "$case：luci-app-passwall / 翻译不在 .config 里"; bads=1
+    fi
+    if grep -qx "CONFIG_PACKAGE_luci-app-passwall2=y" "$TREE/.config" 2>/dev/null; then
+      bad "$case：passwall2 也被选进来了（两代不能同装，会抢 nft 表与 dnsmasq）"; bads=1
+    else
+      ok "$case：passwall2 已被按掉（没有两代同装）"
+    fi
+    local luaok=1
+    grep -qx "CONFIG_PACKAGE_luci-compat=y" "$TREE/.config" 2>/dev/null || luaok=0
+    grep -qx "CONFIG_PACKAGE_xray-core=y" "$TREE/.config" 2>/dev/null || luaok=0
+    if ((luaok)); then
+      ok "$case：luci-compat（CBI 兼容层）与 xray-core 都在 .config 里"
+    else
+      bad "$case：luci-compat 或 xray-core 缺失（v1 的页面/节点会起不来）"; bads=1
     fi
   fi
 

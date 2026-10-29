@@ -49,12 +49,33 @@
 #     fs/uci/ubus 与 luci-base 自带的 luci.sys / luci.core / luci.version /
 #     luci.zoneinfo —— 同包发布，不会缺模块。
 #
-# ── ③ passwall2（项目 + 依赖组件）→ 上游自己的仓库 ───────────────
+# ── ③ passwall / passwall2（项目 + 依赖组件）→ 上游自己的仓库 ──────
 # 注意仓库归属：passwall 项目已从个人账号 xiaorouji 迁到
 # **Openwrt-Passwall** 组织（xiaorouji/... 现在返回 404）。三个仓库各司其职：
-#   openwrt-passwall2          只含 luci-app-passwall2（界面 + 运行脚本）
+#   openwrt-passwall2          只含 luci-app-passwall2（v2：ucode/JS 界面）
+#   openwrt-passwall           只含 luci-app-passwall （v1：Lua CBI 界面）
 #   openwrt-passwall-packages  17 个依赖组件的配方（xray-core / sing-box / …）
-#   openwrt-passwall           只含 v1 的 luci-app-passwall，本仓库不用
+#                              **v1 与 v2 共用这一份**，不重复拉
+#
+# 两版的关系：v2 是重写版（split routing 用 sing-box route.rules），v1 是
+# 老界面（分流靠 dnsmasq + chinadns-ng + 核心规则），配置项/配置文件名都不同：
+#   v1  /etc/config/passwall     + /etc/config/passwall_server   界面「服务 → PassWall」
+#   v2  /etc/config/passwall2                                    界面「服务 → PassWall2」
+# 两者不能同装（抢同一套 nft 表与 dnsmasq 劫持点），所以 PROXY_STACK 只能选一个。
+#
+# ⚠️ ImmortalWrt 的 luci feed **自己也带** applications/luci-app-passwall（v1）。
+#    我们仍然从 openwrt-passwall 取，并落在**同一路径**上覆盖它：
+#      · 同一路径 ⇒ 不会出现 duplicate package；
+#      · 覆盖 ⇒ 两条基座（imm / openwrt+ppe-nss）拿到的是同一个版本，
+#        而官方 openwrt 的 luci feed 里根本没有这个包，不覆盖就没法用；
+#      · 代价 ⇒ feeds/luci 变成"工作区脏"，所以 prepare-build.sh 在
+#        `feeds update -a` 之前会把 feeds/<feed> 还原成干净检出（见那一段）。
+#
+# v1 是 **Lua** 的（luasrc + CBI），所以它比 v2 多三条硬依赖：
+#   luci-compat   提供 CBI 兼容层（19.07 之后 luci 主树把 CBI 挪走了）
+#   lua / libuci-lua  运行 UCI 的 Lua 绑定
+# 这三条上游写在 LUCI_DEPENDS 里，feeds install 会解析进来；但**编译期**能不能
+# 编出来取决于 feed 里有没有它们 —— 所以 prepare-build.sh 会额外核对 luci-compat。
 #
 # 为什么不自己写 passwall 的配方（像 ① 那样）：这些组件的配方和上游版本是
 # **同步维护**的 —— 上游 bump 版本时 PKG_VERSION / PKG_HASH / 编译标签是一起改的，
@@ -92,7 +113,11 @@
 # ── 环境变量 ────────────────────────────────────────────────────
 #   OPENWRT_DIR     OpenWrt 源码目录（必需）
 #   BUILDER_DIR     本仓库检出目录（必需）
-#   PROXY_STACK     代理栈：passwall2（默认）| homeproxy | dae | daed | honk | none
+#   PROXY_STACK     代理栈：passwall2（默认）| passwall | homeproxy | dae | daed
+#                   | honk | none
+#                   passwall  = v1（Lua 界面，luci-app-passwall）
+#                   passwall2 = v2（ucode 界面，luci-app-passwall2）
+#                   两者共用 openwrt-passwall-packages 里的组件配方。
 #   IMM_REF         ImmortalWrt 的分支，默认 master（luci 侧也用它）
 #   IMM_LUCI        immortalwrt/luci 仓库地址
 #   IMM_PKGS        immortalwrt/packages 仓库地址（homeproxy 版取 sing-box 用）
@@ -127,8 +152,9 @@
 #   SINGBOX_VERSION SINGBOX_MODE=latest 时的目标版本（如 1.14.3）。留空则沿用
 #                   官方配方自带版本，只打补丁、不换版本。
 #   PW_REF          passwall 三个仓库的分支，默认 main
-#   PW_APP_REPO     openwrt-passwall2 仓库地址
-#   PW_PKGS_REPO    openwrt-passwall-packages 仓库地址
+#   PW_APP_REPO     openwrt-passwall2 仓库地址（PROXY_STACK=passwall2）
+#   PW_V1_REPO      openwrt-passwall  仓库地址（PROXY_STACK=passwall，v1）
+#   PW_PKGS_REPO    openwrt-passwall-packages 仓库地址（v1 / v2 共用）
 #
 # ── PROXY_STACK=homeproxy 时有什么不同（默认 passwall2，行为完全不变）──
 #   ② 段多稀疏检出一个目录：immortalwrt/luci 的 applications/luci-app-homeproxy。
@@ -174,11 +200,12 @@ SINGBOX_SRC_REF="${SINGBOX_SRC_REF:-testing}"
 SINGBOX_SRC_BASE="${SINGBOX_SRC_BASE:-1.14.0}"
 PW_REF="${PW_REF:-main}"
 PW_APP_REPO="${PW_APP_REPO:-https://github.com/Openwrt-Passwall/openwrt-passwall2.git}"
+PW_V1_REPO="${PW_V1_REPO:-https://github.com/Openwrt-Passwall/openwrt-passwall.git}"
 PW_PKGS_REPO="${PW_PKGS_REPO:-https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git}"
 
 case "$PROXY_STACK" in
-  passwall2|homeproxy|singbox|dae|daed|honk|none) ;;
-  *) echo "不认识的 PROXY_STACK：$PROXY_STACK（只支持 passwall2 / homeproxy / singbox / dae / daed / honk / none）" >&2; exit 1 ;;
+  passwall2|passwall|homeproxy|singbox|dae|daed|honk|none) ;;
+  *) echo "不认识的 PROXY_STACK：$PROXY_STACK（只支持 passwall2 / passwall / homeproxy / singbox / dae / daed / honk / none）" >&2; exit 1 ;;
 esac
 
 # none = 不带任何代理栈，自然也不碰 sing-box。SINGBOX_MODE 的四档里只有
@@ -725,14 +752,32 @@ elif [[ "$PROXY_STACK" == "honk" ]]; then
   # 见 scripts/fetch-honk-stage.sh 头部。
   log "代理栈 = honk：配方由 kenzok8/small 提供（feeds install 之后接入），本步不拉任何仓库"
   ann "::notice title=honk 来源::kenzok8/small（honk + luci-app-honk，后者自带 doona 面板），构建元数据从 kenzok8/openwrt-honk 的 source-* 发布补齐"
-else
+elif [[ "$PROXY_STACK" == "passwall2" || "$PROXY_STACK" == "passwall" ]]; then
   # ════════════════════════════════════════════════════════════
-  # ③-P 代理栈 = passwall2（默认）
+  # ③-P 代理栈 = passwall2（默认）or passwall（v1）
   # ════════════════════════════════════════════════════════════
-  # ③-a 界面：openwrt-passwall2 的 <根>/luci-app-passwall2 → feeds/luci/applications/
-  #     注意源在仓库根目录、目标要落到 applications/ 下，两边层级不同。
-  clone_shallow "$PW_APP_REPO" "$WORK/passwall2" "openwrt-passwall2"
-  place "$WORK/passwall2" feeds/luci luci-app-passwall2 applications/luci-app-passwall2 "passwall2"
+  # 两版的界面包在**两个不同的仓库**里，但目录层级一致（都在仓库根下、
+  # 目录名就是包名），依赖组件也共用 openwrt-passwall-packages 那一份。
+  # 所以这里只把「仓库 + 包名」参数化，其余流程（组件遍历 / 落位 / 版本注解）
+  # 一个字都不用改。
+  #
+  # ⚠️ 别把这里当 fallback：`else` 会被任何未知 PROXY_STACK 吃掉，
+  #    于是 honk / none 之类会被静默装上一套 passwall —— 那些分支在上面都
+  #    显式写了 elif，最后剩下的只有这两版。
+  if [[ "$PROXY_STACK" == "passwall" ]]; then
+    pw_app_repo="$PW_V1_REPO"
+    pw_app_pkg="luci-app-passwall"
+    pw_app_label="passwall v1（Lua 界面）"
+  else
+    pw_app_repo="$PW_APP_REPO"
+    pw_app_pkg="luci-app-passwall2"
+    pw_app_label="passwall2 v2（ucode 界面）"
+  fi
+
+  # ③-a 界面：<仓库>/<根>/<包名> → feeds/luci/applications/<包名>
+  #     源在仓库根目录、目标要落到 applications/ 下，两边层级不同。
+  clone_shallow "$pw_app_repo" "$WORK/$pw_app_pkg" "$pw_app_pkg"
+  place "$WORK/$pw_app_pkg" feeds/luci "$pw_app_pkg" "applications/$pw_app_pkg" "$pw_app_label"
 
   # ③-b 依赖组件：openwrt-passwall-packages 顶层每个含 Makefile 的目录都是一个包。
   # 清单**不写死** —— 上游加新组件时这里自动跟上，也不用改这个脚本。
@@ -755,11 +800,11 @@ else
   done
   log "passwall 组件落位完成，共 ${#pw_rels[@]} 个：${pw_rels[*]}"
 
-  # 不是所有组件都会被编进固件（只有 luci-app-passwall2 选中/依赖的那些），
+  # 不是所有组件都会被编进固件（只有前端包选中/依赖的那些），
   # 这里列的是"本仓库引入的配方版本"。
-  app_ver="$(pkg_ver_of feeds/luci/applications/luci-app-passwall2/Makefile)"
-  app_rel="$(sed -n 's/^PKG_RELEASE:=\s*//p' feeds/luci/applications/luci-app-passwall2/Makefile 2>/dev/null | head -n1)"
-  ann "::notice title=passwall2 项目版本::luci-app-passwall2=${app_ver:-未知}${app_rel:+-${app_rel}}（取自 $PW_APP_REPO@$PW_REF）"
+  app_ver="$(pkg_ver_of feeds/luci/applications/$pw_app_pkg/Makefile)"
+  app_rel="$(sed -n 's/^PKG_RELEASE:=\s*//p' feeds/luci/applications/$pw_app_pkg/Makefile 2>/dev/null | head -n1)"
+  ann "::notice title=$PROXY_STACK 项目版本::$pw_app_pkg=${app_ver:-未知}${app_rel:+-${app_rel}}（取自 $pw_app_repo@$PW_REF）"
 
   pw_summary=""
   for rel in "${pw_rels[@]}"; do
@@ -803,8 +848,8 @@ elif [[ "$PROXY_STACK" == "singbox" ]]; then
 elif [[ "$PROXY_STACK" == "none" ]]; then
   log "  · ImmortalWrt 前端 luci-app-{ddns-go,msd_lite}"
   log "  · 代理核心        无（本线不集成任何代理）"
-else
+elif [[ "$PROXY_STACK" == "passwall2" || "$PROXY_STACK" == "passwall" ]]; then
   log "  · ImmortalWrt 前端 luci-app-{ddns-go,msd_lite}"
-  log "  · passwall2       luci-app-passwall2 + ${#pw_rels[@]} 个依赖组件"
+  log "  · $PROXY_STACK       $pw_app_pkg + ${#pw_rels[@]} 个依赖组件（$pw_app_label）"
 fi
 warn "别忘了接着跑：./scripts/feeds update -i -a   # 重建索引，install 才看得到这些包"

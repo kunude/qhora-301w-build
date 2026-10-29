@@ -38,7 +38,12 @@
 #                    而不是 ${NSS_FEED:-...} —— 后者会把空串也当成未设置，
 #                    于是"关掉 NSS"会被静默改回"打开"。
 #   GH_TOKEN         查 GitHub API 用，避免未认证限额（Actions 里默认注入）
-#   PROXY_STACK      代理栈：passwall2（默认）| homeproxy | singbox | dae | daed | honk
+#   PROXY_STACK      代理栈：passwall2（默认）| passwall | homeproxy | singbox
+#                    | dae | daed | honk
+#                    passwall  = v1（Lua 界面，luci-app-passwall，配置 /etc/config/passwall）
+#                    passwall2 = v2（ucode 界面，luci-app-passwall2，配置 /etc/config/passwall2）
+#                    两版共用 openwrt-passwall-packages 里的组件配方，但符号集不同，
+#                    所以各自有一层 config（configs/passwall.config）。
 #                    honk = eBPF 透明代理（dae 那一支的新引擎）+ doona 面板；
 #                    两个包都来自 kenzok8/small，构建元数据由
 #                    scripts/fetch-honk-stage.sh 在 small 落位之后补齐。
@@ -178,6 +183,8 @@ CONFIGS=(
 )
 case "$PROXY_STACK" in
   passwall2) ;;
+  # passwall v1：把 common.config 里那组 passwall2 符号整组按掉，换 v1 的。
+  passwall)  CONFIGS+=( "$BUILDER_DIR/configs/passwall.config" ) ;;
   homeproxy) CONFIGS+=( "$BUILDER_DIR/configs/homeproxy.config" ) ;;
   dae)       CONFIGS+=( "$BUILDER_DIR/configs/dae.config" ) ;;
   daed)      CONFIGS+=( "$BUILDER_DIR/configs/daed.config" ) ;;
@@ -186,7 +193,7 @@ case "$PROXY_STACK" in
   # none：不装任何代理前端，但**仍然**按掉 common.config 里 passwall2 那一组
   # 符号 —— 否则它们会被 select 拉进固件，"不集成代理"就名不副实。
   none)      CONFIGS+=( "$BUILDER_DIR/configs/none.config" ) ;;
-  *) die "不认识的 PROXY_STACK：$PROXY_STACK（只支持 passwall2 / homeproxy / singbox / dae / daed / honk / none）" ;;
+  *) die "不认识的 PROXY_STACK：$PROXY_STACK（只支持 passwall / passwall2 / homeproxy / singbox / dae / daed / honk / none）" ;;
 esac
 
 # 可选：再追加覆盖层（同样"后拼接者覆盖前者"）。
@@ -260,6 +267,34 @@ fi
 # 把实际生效的 feed 配置打进日志：配置错误会让 feeds 在解析阶段直接 die。
 log "feeds.conf 实际内容："
 sed 's/^/    /' feeds.conf | tee -a "$LOG_FILE" >&3
+
+# ── 上一轮落位留下的「脏 feeds」────────────────────────────────
+# extra-packages.sh 会把第三方包**拷进 feeds/<feed>/ 里**（同名时先删再拷，
+# 这是有意的覆盖行为）。代价是 feeds/<feed> 变成「工作区脏」的 git 仓库，
+# 而且脏的往往是**上游也有的同名文件**（例如 feeds/packages/net/sing-box、
+# feeds/luci/applications/luci-app-passwall）。
+#
+# 上游一旦前进，`git pull` 会因为
+#     error: Your local changes to the following files would be overwritten
+#     error: Untracked working tree files would be overwritten
+# 直接失败 —— 而 `feeds update -a` 的退出码此时是 1，可索引又照样重建，
+# 于是报错点离原因很远（2026-10-29 本地回归就栽在这里：日志最后一行是
+# "Create index file './feeds/video.index'"，真正的原因在几十行之前）。
+#
+# CI 每次都是全新 clone，永远碰不到；本地反复跑必踩。
+# 处理方式：进 update 之前把 feeds/<feed> 还原成干净检出，语义与 CI 对齐 ——
+# feeds/ 里只该有 feeds.conf 说的东西，别的都由本脚本重新落位。
+# 用 -fd 而不是 -fdx：保留 .gitignore 里的文件（没有任何构建产物住在这儿，
+# 但少一个 -x 就少一分误删的可能）。
+for _fd in feeds/*/; do
+  [[ -d "${_fd}.git" ]] || continue
+  if [[ -n "$(git -C "$_fd" status --porcelain 2>/dev/null)" ]]; then
+    git -C "$_fd" checkout -q -- . 2>/dev/null || true
+    git -C "$_fd" clean -fdq 2>/dev/null || true
+    log "还原脏 feed：${_fd%/}（上一轮落位的包会重新落一遍）"
+  fi
+done
+unset _fd
 
 log "更新全部 feed（最耗时的一步）"
 ./scripts/feeds update -a
@@ -668,16 +703,46 @@ elif [[ "$PROXY_STACK" == "singbox" ]]; then
 
   log "sing-box 源码配方已就位：$(sed -n 's/^PKG_VERSION:=\s*//p' "$sb_mk" | head -n1)（纯净内核线，无前端）"
 else
-  for p in luci-app-ddns-go luci-app-msd_lite luci-app-passwall2; do
+  # none 也走到这里（它没有专属分支）：这种时候只有 ddns-go / msd_lite 两个前端，
+  # 没有任何代理前端要核对 —— 所以 pw_app 留空，下面的循环自然只查那两个。
+  # （2026-10-29 第一版把它写死成 luci-app-passwall2，none 组合当场红：
+  #   "package/feeds/luci/luci-app-passwall2 不存在"。而它以前能过，纯粹是因为
+  #   extra-packages.sh 的老 else 把 none 也当成 passwall2 装了 —— 那才是 bug。）
+  pw_app=""
+  case "$PROXY_STACK" in
+    passwall)  pw_app="luci-app-passwall" ;;
+    passwall2) pw_app="luci-app-passwall2" ;;
+  esac
+  for p in luci-app-ddns-go luci-app-msd_lite $pw_app; do
     [[ -e "package/feeds/luci/$p" ]] \
       || die "package/feeds/luci/$p 不存在，引入的包没有被 feeds install 接管"
   done
+  # v1 是 Lua CBI 界面：luci-compat 缺了页面直接 404（luci 主树 19.07 之后就把 CBI
+  # 挪出去了），lua / libuci-lua 是跑 UCI 的绑定。上游写在 LUCI_DEPENDS 里，
+  # 理论上 feeds install 会解析进来；这里实际核一遍，比等两小时后发现页面打不开强。
+  #
+  # 三条依赖的**落位各不相同**，所以查法也不一样（2026-10-29 第一版就查错了：
+  # lua 根本不在 feed 里，libuci-lua 更不是目录而是一个子包）：
+  #   luci-compat   feeds/luci 下的独立包  → 看目录
+  #   lua           基座主树 package/utils/lua → 看主树，不在 feed
+  #   libuci-lua    uci 包里的**子包**（define Package/libuci-lua）→ 只能 grep
+  if [[ "$pw_app" == "luci-app-passwall" ]]; then
+    [[ -e "package/feeds/luci/luci-compat" ]] \
+      || die "package/feeds/luci/luci-compat 不存在 —— passwall v1 是 Lua CBI 界面，缺它页面打不开"
+    compgen -G "package/*/lua" >/dev/null \
+      || die "基座主树里没有 lua 包（package/*/lua）—— passwall v1 的 CBI 跑不起来"
+    grep -q '^define Package/libuci-lua$' package/system/uci/Makefile 2>/dev/null \
+      || die "基座主树的 uci 包里没有 libuci-lua 子包 —— passwall v1 的 Lua UCI 绑定缺失"
+  fi
   # passwall 的依赖组件是个会变的集合（上游加组件时 extra-packages.sh 自动带上），
   # 所以这里只抽查几个**稳定必需**的，剩下的交给 .config 符号校验和产物校验。
-  for p in xray-core sing-box chinadns-ng v2ray-geodata geoview tcping; do
-    [[ -e "package/feeds/packages/$p" ]] \
-      || die "package/feeds/packages/$p 不存在，passwall 组件没有被 feeds install 接管"
-  done
+  # 只在真有代理前端时查：none 线不落位任何组件，这些目录在官方 feed 里也可能不存在。
+  if [[ -n "$pw_app" ]]; then
+    for p in xray-core sing-box chinadns-ng v2ray-geodata geoview tcping; do
+      [[ -e "package/feeds/packages/$p" ]] \
+        || die "package/feeds/packages/$p 不存在，passwall 组件没有被 feeds install 接管"
+    done
+  fi
 fi
 
 # 引入 NSS feed 的线才要求它真的就位。名字从 NSS_FEED 里取，不写死 nss。

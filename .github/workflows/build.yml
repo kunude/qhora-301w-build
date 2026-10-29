@@ -9,7 +9,9 @@ name: Build QHora-301W
 #   ① 基座      openwrt / immortalwrt
 #   ② NSS       是 → 整树切到 ppe-nss（有线 PPE + Wi-Fi offload 全都有）
 #               否 → 纯上游，不引 feed、不开任何 NSS 符号
-#   ③ 代理栈    daed / dae / honk / homeproxy / singbox / passwall2 / 不集成
+#   ③ 代理栈    daed / dae / honk / homeproxy / singbox / passwall / passwall2 / 不集成
+#               passwall  = v1（Lua 界面，luci-app-passwall）
+#               passwall2 = v2（ucode 界面，luci-app-passwall2）
 #
 # ⚠️ ② 选「是」时 ① 会失效：ppe-nss 是 openwrt main 的 fork，不是 imm 的
 #    分支。这是有意的 —— NSS 的 Wi-Fi offload 由树内的 nss-wifi-drv 提供，
@@ -32,7 +34,7 @@ on:
       proxy:
         description: '③ 代理栈'
         type: choice
-        options: [daed, dae, honk, homeproxy, singbox, passwall2, none]
+        options: [daed, dae, honk, homeproxy, singbox, passwall, passwall2, none]
         default: daed
 
       singbox_mode:

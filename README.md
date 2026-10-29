@@ -11,7 +11,7 @@ Actions → **Build QHora-301W** → Run workflow，填三个选择：
 |---|---|---|---|
 | ① | `distro` | `immortalwrt` / `openwrt` | 检出哪棵上游树 |
 | ② | `nss` | 是 / 否 | 是否换成 ppe-nss 整树（见下） |
-| ③ | `proxy` | `daed` `dae` `honk` `homeproxy` `singbox` `passwall2` `none` | 装哪套透明代理 |
+| ③ | `proxy` | `daed` `dae` `honk` `homeproxy` `singbox` `passwall` `passwall2` `none` | 装哪套透明代理 |
 
 另外两个可选项：`extra_packages`（额外插件，逗号分隔）、`release`（成功后发 Release）。
 
@@ -49,8 +49,9 @@ nss=否  →  纯上游树       →  不引 NSS feed、不开任何 NSS 符号
 ## 代理栈之间只能选一个
 
 `daed` / `dae` / `honk` 是同一族（eBPF 内核态分流，抢 clsact / NFQUEUE），
-`homeproxy` / `passwall2` / `singbox` 是另一族（userspace + TPROXY/nft），
+`homeproxy` / `passwall` / `passwall2` / `singbox` 是另一族（userspace + TPROXY/nft），
 任何两套同时装都会互相打架，所以 ③ 只能选一个。
+`passwall` 与 `passwall2` 是同一项目的两代（见下），连配置命名空间都不同，更不能并存。
 
 ### honk + doona（2026-10-28 新增）
 
@@ -73,6 +74,31 @@ small 里那两个 Makefile 只是骨架：**下载地址与哈希在三个不�
 `staging` 标签（实测 404）。所以 `scripts/fetch-honk-stage.sh` 会在 feeds 落位之后，
 按 small 写死的 `CORE_COMMIT` 去 `kenzok8/openwrt-honk` 的 `source-*` 发布里
 **匹配资产名**（不是取最新：取错就是 404），把三个文件补齐并校验后落位。
+
+### passwall 与 passwall2 是两代，不是两个皮肤
+
+同一个项目（[Openwrt-Passwall](https://github.com/Openwrt-Passwall)）的两代前端：
+
+| | `passwall`（v1） | `passwall2`（v2） |
+|---|---|---|
+| 界面实现 | **Lua CBI**（`luasrc` + `luci-compat` + `lua`） | ucode / JS |
+| 配置 | `/etc/config/passwall` + `passwall_server` | `/etc/config/passwall2` |
+| 分流 | dnsmasq + chinadns-ng + 核心规则 | sing-box `route.rules` |
+| 核心 | **Xray 与 sing-box 都带**（按节点选） | 只带 sing-box（省 20MB） |
+| 仓库 | `openwrt-passwall` | `openwrt-passwall2` |
+
+两者的**依赖组件共用** `openwrt-passwall-packages`（17 个配方），所以切换只影响
+前端包与 `.config` 里的符号组：`configs/passwall.config` 会把 common.config 里
+那组 v2 符号整组按掉、换成 v1 的（`INCLUDE_Xray` / `INCLUDE_SingBox` / …）。
+
+v1 为什么带 Xray：它的核心是**按节点选**的，社区里的老配置绝大多数是 Xray 节点；
+只带 sing-box 会"编得出来、刷得进去、节点起不来"。想省空间就把
+`configs/passwall.config` 里 `INCLUDE_Xray` 那行改成 `n`（sing-box 覆盖
+SS / VMess / VLESS / Trojan / Hysteria2）。
+
+两条线都**不带出厂预置**给 v1 —— `files-passwall2/` 那份分流模板是 v2 的配置格式，
+v1 的字段完全不同，混用会解析失败。v1 起来就是上游默认值（`enabled=0`），
+在「服务 → PassWall」里自行配置。
 
 ### 防静默降级
 
@@ -142,6 +168,7 @@ configs/
   qhora_301w.config       机型
   imm.config              immortalwrt 差异层（仅 distro=imm 且 nss=否 时挂）
   nss.config              NSS 线的减法层（仅 nss=是 时挂，在 seed 之后）
+  passwall.config         passwall v1 的符号层（把 v2 那组按掉、换 v1 的）
   none.config             不集成代理（把 passwall2 全家 + Rust 工具链按掉）
   daed.config 等          各代理栈的覆盖层
 scripts/
@@ -150,7 +177,7 @@ scripts/
   resolve-deps.sh         展开插件依赖闭包（small feed 内部递归）
   wanted-packages.sh      当前变体「必须进固件」的包清单 → 产物校验用
   fetch-honk-stage.sh     补齐 honk / doona 的构建元数据（generated-*.mk）
-  extra-packages.sh       ddns-go / msd_lite / passwall2 组件落位
+  extra-packages.sh       ddns-go / msd_lite / passwall(v1|v2) 组件落位
   test-local.sh           本地回归：在真树上跑 prepare，几组参数一起验
   resolve-*.sh            上游版本解析（每次构建取最新）
 files/ files-<stack>/     rootfs 覆盖，按代理栈叠加

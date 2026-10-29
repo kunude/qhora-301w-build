@@ -85,12 +85,37 @@ case "$PROXY_STACK" in
     add sing-box kmod-tun kmod-inet-diag
     ;;
   passwall2)
+    # v2（ucode 界面）。核心只留 sing-box —— configs/common.config 里
+    # Basic_Core_SingBox=y、xray 不选，所以这里也不列 xray-core。
     add luci-app-passwall2 luci-i18n-passwall2-zh-cn
     add sing-box shadowsocks-rust-sslocal
     add chinadns-ng geoview tcping
     add v2ray-geoip v2ray-geosite shadowsocksr-libev-ssr-local
     add simple-obfs-client v2ray-plugin haproxy lyaml
     add dnsmasq-full kmod-nft-tproxy kmod-nft-socket
+    ;;
+  passwall)
+    # v1（Lua CBI 界面）。与 v2 的差别全部来自它的 LUCI_DEPENDS 与配方里的
+    # select，逐条对应（configs/passwall.config）：
+    #   xray-core + unzip   INCLUDE_Xray（v1 的核心按节点选，默认带 Xray）
+    #   dns2socks           老式 socks 转发，v1 的 LUCI_DEPENDS 点名要它
+    #   microsocks          SOCKS5 服务端，同上
+    #   ipt2socks           nftables/iptables 两条透明代理通道都 select 它
+    #   nftables            v1 的 nft 模式直接调 nft 命令（v2 走 ucode 封装）
+    #   shadowsocksr-libev-ssr-redir  INCLUDE_ShadowsocksR_Libev_Client 一起 select
+    #   luci-compat + lua   v1 是 Lua CBI 界面，缺了页面直接 404
+    # 故意不列：kmod-nf-reject / kmod-nf-reject6（内核心基础项，恒在）、
+    #           coreutils* / resolveip（base 里的常驻小包）。
+    add luci-app-passwall luci-i18n-passwall-zh-cn
+    add xray-core sing-box unzip
+    add shadowsocks-rust-sslocal
+    add chinadns-ng dns2socks microsocks geoview tcping lyaml ip-full
+    add v2ray-geoip v2ray-geosite
+    add shadowsocksr-libev-ssr-local shadowsocksr-libev-ssr-redir
+    add simple-obfs-client v2ray-plugin haproxy
+    add dnsmasq-full nftables ipt2socks
+    add kmod-nft-tproxy kmod-nft-socket kmod-nft-nat
+    add luci-compat lua
     ;;
   honk)
     # honk 也是 eBPF 内核态分流的引擎（dae 那一支），清单与 dae / daed 高度
