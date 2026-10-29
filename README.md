@@ -82,6 +82,20 @@ Rust 重写，配置语法沿用 dae，出站组 / Clash 兼容 API 借自 sing-
 排查用 `/usr/share/honk/control.sh diagnose`：它把 `kernel_requirements_unmet` /
 `lan_network_unavailable` / `proxy_conflict` 这些原因一次性列出来，比翻日志快。
 
+**命令行重启有个坑（实测于 2026-10-30，QHora-301W）**：`/etc/init.d/honk restart`
+是 `stop` 紧接着 `start`，而旧实例在收到 TERM 后还要把 4 条连接 drain 完（最长 5s）
+才删掉 `dae0`。新实例的 preflight 看到 `dae0 已存在` 就直接拒绝启动，表现为
+`status` 说 stopped、`pgrep honk-core` 空、局域网全直连。LuCI 页面的「重启」
+走的是 rpcd 的 `honk_lifecycle_restart`（带 30s 等待），没有这个问题。命令行改完
+配置请用：
+
+```sh
+/etc/init.d/honk stop; while pidof honk-core >/dev/null; do sleep 1; done; /etc/init.d/honk start
+```
+
+已经卡住时不用慌：残留的 `dae0` 会在旧进程退出后由下一次 preflight 自动回收，
+再 `start` 一次就正常。
+
 small 里那两个 Makefile 只是骨架：**下载地址与哈希在三个不随仓库提交的
 `generated-*.mk` / `provenance.json` 里**，而它们默认指向一个已经删掉的
 `staging` 标签（实测 404）。所以 `scripts/fetch-honk-stage.sh` 会在 feeds 落位之后，
