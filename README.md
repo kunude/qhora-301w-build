@@ -9,23 +9,29 @@ Actions → **Build QHora-301W** → Run workflow，填三个选择：
 
 | 层 | 输入 | 取值 | 作用 |
 |---|---|---|---|
-| ① | `distro` | `immortalwrt` / `openwrt` | 检出哪棵上游树 |
-| ② | `nss` | 是 / 否 | 是否换成 ppe-nss 整树（见下） |
+| ① | `distro` | `immortalwrt` / `openwrt` | 发行版，**优先级最高**：固件 `DISTRIB_ID` 就是它 |
+| ② | `nss` | 是 / 否（默认否） | 仅 ①=`openwrt` 可用：换成 ppe-nss 整树（见下） |
 | ③ | `proxy` | `daed` `dae` `honk` `homeproxy` `singbox` `passwall` `passwall2` `none` | 装哪套透明代理 |
 
 另外两个可选项：`extra_packages`（额外插件，逗号分隔）、`release`（成功后发 Release）。
 
-### ②选「是」时，①会失效
+### ① 优先，② 是它的子开关
 
-`nss=是` 时检出的是 `JuliusBairaktaris/openwrt-ppe-nss@ppe-nss` —— 它是
-**openwrt main 的 fork**，不是 immortalwrt 的分支。所以这时候 ① 选的
-immortalwrt 拿不到，imm 特有的包也不会有。这是刻意的，不是 bug。
+② 只在 ①=`openwrt` 时有意义。① 选 `immortalwrt` 时勾「是」不会悄悄换成
+openwrt —— 构建会在第一个步骤失败，提示二选一。
+
+为什么不能反过来：NSS 的 Wi-Fi offload 由 `nss-wifi-drv` 提供，它只存在于
+`JuliusBairaktaris/openwrt-ppe-nss@ppe-nss`（**openwrt main 的 fork**，不是
+imm 的分支），还改了 mac80211 的 ath11k 源码。补丁补不出来，只能整树用。
+所以「imm + NSS」这个组合物理上不存在，早失败比编出一个「imm 但不带 NSS」
+的固件好 —— 后者能开机、能刷、日志一句报错没有，只是发行版和 NSS 都不是
+你选的那个。
 
 ## NSS 只有两态，没有中间态
 
 ```
-nss=是  →  ppe-nss 整树   →  有线 PPE 加速 + Wi-Fi offload（NSS 核心跑 Wi-Fi 数据面）
-nss=否  →  纯上游树       →  不引 NSS feed、不开任何 NSS 符号
+openwrt + nss=是  →  ppe-nss 整树   →  有线 PPE 加速 + Wi-Fi offload（NSS 核心跑 Wi-Fi 数据面）
+nss=否            →  该基座原始树   →  不引 NSS feed、不开任何 NSS 符号
 ```
 
 以前有过第三种「immortalwrt + NSS 补丁」，现在不成立了，因为情况变了：
@@ -232,8 +238,9 @@ feed 内跟依赖、跳过 `@条件`、也不处理 `+COND:pkg` 里的条件包�
 只点名包会写进 `.config`（`CONFIG_PACKAGE_*=y`），依赖不写——由 defconfig 顺着
 `select` 精确带出。这样既不会漏，也不会把整个闭包硬塞进镜像。
 
-`NSS=是` 时还有一层：ppe-nss 是 openwrt main 的 fork，它的 luci / packages feed
-是**官方 openwrt** 的，没有 `dae` / `daed` / `homeproxy` 这些 ImmortalWrt 专属包。
+`NSS=是`（即 openwrt + ppe-nss 整树）时还有一层：ppe-nss 是 openwrt main 的
+fork，它的 luci / packages feed 是**官方 openwrt** 的，没有 `dae` / `daed` /
+`homeproxy` 这些 ImmortalWrt 专属包。
 `extra-packages.sh` 会按「feed 里有没有」判断，缺了才从 immortalwrt 稀疏检出补进来
 （`place_imm_extra`）—— 判据是 feed 而不是树名，ImmortalWrt 基座直接跳过。
 
@@ -246,8 +253,8 @@ feed 内跟依赖、跳过 `@条件`、也不处理 `+COND:pkg` 里的条件包�
 configs/
   common.config           所有变体共用
   qhora_301w.config       机型
-  imm.config              immortalwrt 差异层（仅 distro=imm 且 nss=否 时挂）
-  nss.config              NSS 线的减法层（仅 nss=是 时挂，在 seed 之后）
+  imm.config              immortalwrt 差异层（仅 distro=imm 时挂）
+  nss.config              NSS 线的减法层（仅 openwrt + nss=是 时挂，在 seed 之后）
   passwall.config         passwall v1 的符号层（把 v2 那组按掉、换 v1 的）
   none.config             不集成代理（把 passwall2 全家 + Rust 工具链按掉）
   daed.config 等          各代理栈的覆盖层
@@ -278,10 +285,11 @@ OPENWRT_DIR=$PWD/openwrt BUILDER_DIR=$PWD \
 cd openwrt && make -j"$(nproc)"
 ```
 
-`NSS=1` 时把第一行换成：
+`NSS=1` 时 **DISTRO 必须是 `openwrt`**，且把第一行换成 ppe-nss：
 
 ```sh
 git clone --depth 1 -b ppe-nss https://github.com/JuliusBairaktaris/openwrt-ppe-nss openwrt
+# 然后 DISTRO=openwrt NSS=1 ...（DISTRO=immortalwrt NSS=1 会直接失败）
 ```
 
 ## 改完脚本先本地回归
@@ -302,7 +310,8 @@ scripts/test-local.sh ~/work/ppe nss              # NSS 线，树必须是 ppe-n
 - **依赖真的进了 `.config`** —— 不只是建了软链（`无符号` 直接判失败）
 - **NSS 线 `kmod-nss-wifi-drv` 确实在 `.config` 里** —— 否则"选了 NSS 等于没选"
 
-`err` 组合是反向用例：故意点一个不存在的包，期望**失败且报错点明包名**。
+两个反向用例，都是期望**失败且报错点明原因**：`err`（点一个不存在的包）、
+`conflict`（`immortalwrt` + `NSS=1`，验证 ① 优先的规则真的挡住了）。
 
 这套脚本是 2026-10-28 那轮改动的产物，它一次抓出三个只在真树上暴露的问题：
 `extra-packages.sh` 不认识 `PROXY_STACK=none`、`common.config` 里还留着上一代

@@ -10,11 +10,12 @@
 #   OPENWRT_DIR   已检出的基座源码目录（必需）
 #   BUILDER_DIR   本仓库的检出目录（必需）
 #
-#   DISTRO        openwrt | immortalwrt（默认 immortalwrt）
-#   NSS           1（默认）| 0
-#                 1 = 全功能：整棵树换成 JuliusBairaktaris/openwrt-ppe-nss@ppe-nss
+#   DISTRO        immortalwrt（默认）| openwrt
+#                 决定发行版本身（固件 DISTRIB_ID），优先级最高。
+#   NSS           0（默认）| 1   —— 仅 DISTRO=openwrt 可用
+#                 1 = 整棵树换成 JuliusBairaktaris/openwrt-ppe-nss@ppe-nss
 #                     有线 PPE 加速 + NSS Wi-Fi offload 全都在，不打补丁。
-#                 0 = 纯上游：不引 feed、不打补丁、不开任何 NSS 符号。
+#                 0 = 该基座的原始树：不引 feed、不打补丁、不开任何 NSS 符号。
 #   PROXY_STACK   daed（默认）| dae | honk | homeproxy | singbox | passwall |
 #                 passwall2 | none
 #                 passwall  = v1（Lua 界面，luci-app-passwall）
@@ -36,7 +37,9 @@
 # 是 ppe-nss 树内的包，还改了 mac80211 的 ath11k 源码 —— 那是补丁补不出来的
 # 量级，只能整树用。两头一夹，中间态就没了。
 #
-# 换句话说：选 NSS = 接受 ppe-nss 这棵树，DISTRO 的基座选择在 NSS=1 时失效。
+# 换句话说：NSS 是 openwrt 基座上的一个开关，**不能反过来决定发行版**。
+# DISTRO=immortalwrt 时没有 NSS 可用（imm 树里根本没有 nss-wifi-drv），
+# 传 NSS=1 直接失败，不静默降级 —— 「以为开了 NSS」比没有 NSS 更糟。
 #
 set -Eeuo pipefail
 
@@ -44,7 +47,7 @@ OPENWRT_DIR="${OPENWRT_DIR:?OPENWRT_DIR 未设置}"
 BUILDER_DIR="${BUILDER_DIR:?BUILDER_DIR 未设置}"
 
 DISTRO="${DISTRO:-immortalwrt}"
-NSS="${NSS:-1}"
+NSS="${NSS:-0}"
 PROXY_STACK="${PROXY_STACK:-daed}"
 # SINGBOX_MODE 只对 homeproxy / singbox 有意义。其余栈（daed / dae / honk /
 # passwall / passwall2 / none）根本不碰 sing-box，传它一个 builtin 会被 extra-packages.sh
@@ -84,14 +87,40 @@ esac
 
 export PROXY_STACK SINGBOX_MODE NSS DISTRO EXTRA_PACKAGES
 
-# ── 树指纹：靠树里有没有这几样，判断检出的到底是哪棵树 ──────────
-# 不信任调用方传进来的 DISTRO/NSS，直接看树。这比读变量可靠：
+# ── 树指纹：不信任调用方传进来的 DISTRO/NSS，直接看树 ──────────
 # workflow 里 checkout 和 prepare 是两个步骤，中间任何一处写错都会让
-# "以为开了 NSS" 和 "实际没开" 对不上，而那种不一致编出来是好好的固件。
+# 「以为选的是 imm」和「实际检出 ppe-nss」对不上，而那种不一致编出来是
+# 好好的固件 —— 只是发行版和 NSS 都不是你要的那个。所以三样一起看：
+#   · include/version.mk 里 VERSION_DIST 的兜底值 → 这棵树自称哪个发行版
+#   · package/kernel/nss-wifi-drv、seeds/*.seed   → 是不是 ppe-nss 整树
 HAS_NSS_WIFI_DRV=0
 [[ -d "$OPENWRT_DIR/package/kernel/nss-wifi-drv" ]] && HAS_NSS_WIFI_DRV=1
 HAS_PPE_SEED=0
 [[ -f "$OPENWRT_DIR/seeds/qualcommax-nss-wifi.seed" ]] && HAS_PPE_SEED=1
+
+# 树的身份就是 VERSION_DIST 的兜底值：openwrt main 是 OpenWrt、immortalwrt
+# 是 ImmortalWrt、ppe-nss（openwrt main 的 fork）也是 OpenWrt。取不到就留空，
+# 按「没有指纹」处理 —— 宁可不查，也不拿猜出来的值当断言依据。
+TREE_DIST=""
+if [[ -f "$OPENWRT_DIR/include/version.mk" ]]; then
+  TREE_DIST="$(sed -n 's/^[[:space:]]*VERSION_DIST:=\$(if \$(VERSION_DIST),\$(VERSION_DIST),\([A-Za-z0-9_]*\)).*/\1/p' \
+                 "$OPENWRT_DIR/include/version.mk" | head -n1)"
+  TREE_DIST="$(printf '%s' "$TREE_DIST" | tr '[:upper:]' '[:lower:]')"
+fi
+
+# ── ① = immortalwrt：不许有 NSS ────────────────────────────────
+# NSS 的 Wi-Fi offload 由 ppe-nss 树内的 nss-wifi-drv 提供，还改了 mac80211
+# 的 ath11k 源码 —— 补丁补不出来，只能整树用。所以 imm + NSS 这个组合物理上
+# 不存在：要么静默编出一个"imm 但不带 NSS"的固件（用户以为拿到了 NSS），
+# 要么当场失败。选后者。
+if [[ "$DISTRO" == "immortalwrt" ]]; then
+  [[ "$NSS" == "0" ]] || die \
+    "① = immortalwrt 时不支持 NSS：nss-wifi-drv 只存在于 JuliusBairaktaris/openwrt-ppe-nss 整树（openwrt main 的 fork），补丁补不出来。" \
+    "二选一：要 ImmortalWrt 就把 NSS 设为 0；要 NSS 就把 DISTRO 改成 openwrt。"
+  if (( HAS_NSS_WIFI_DRV )) || (( HAS_PPE_SEED )); then
+    die "① = immortalwrt 但检出的是 ppe-nss 树（package/kernel/nss-wifi-drv 存在）—— 编出来会是 OpenWrt，不是 ImmortalWrt"
+  fi
+fi
 
 # ── NSS=1：必须是 ppe-nss 树，且两样东西都得在 ─────────────────
 # 这两条断言是本脚本最值钱的部分。ppe-nss 的 .config 里有一堆 imm/openwrt
@@ -106,14 +135,6 @@ if [[ "$NSS" == "1" ]]; then
     "NSS=1 但 $OPENWRT_DIR 里没有 seeds/qualcommax-nss-wifi.seed —— ppe-nss 分支选错了？"
   [[ -d "$OPENWRT_DIR/target/linux/qualcommax" ]] || die \
     "NSS=1 但树里没有 target/linux/qualcommax —— 检出的不是这个 target 的源码"
-
-  if [[ "$DISTRO" == "immortalwrt" ]]; then
-    warn "NSS=1：基座已换成 openwrt-ppe-nss@ppe-nss，$DISTRO 的差异不会被包含"
-    warn "（这正是「选 NSS 就是全功能」的含义；要 imm 特有的包就别勾 NSS）"
-    # 同时打到 Actions 注解里：光在日志里 warn，页面顶上那条标题照样写着
-    # immortalwrt，刷完机看到 DISTRIB_ID=OpenWrt 又会怀疑一遍。
-    printf '::notice title=基座被覆盖::② = 是 → ① 的 %s 不生效：检出的是 ppe-nss（openwrt main 的 fork），固件 DISTRIB_ID 是 OpenWrt，不是 ImmortalWrt\n' "$DISTRO"
-  fi
 
   # ppe-nss 的 nss-packages 分支只提供 nss-firmware，驱动在树里。
   export NSS_FEED="src-git nss https://github.com/JuliusBairaktaris/nss-packages.git;ppe-nss"
@@ -138,17 +159,28 @@ else
   EXTRA_LAYERS=()
 fi
 
+# ── 树指纹核对：DISTRO 与树的自我声明必须一致 ──────────────────
+# imm 线上这一条最要紧：固件的 DISTRIB_ID 就取自这里。树检错了，
+# 编出来的固件照样能开机、什么报错都没有，只是发行版不是你要的那个。
+if [[ -n "$TREE_DIST" ]]; then
+  expect_dist=openwrt
+  if [[ "$DISTRO" == "immortalwrt" ]]; then expect_dist=immortalwrt; fi
+  [[ "$TREE_DIST" == "$expect_dist" ]] || die \
+    "树与参数不一致：DISTRO=$DISTRO 期望 ${expect_dist} 树，但 include/version.mk 的 VERSION_DIST 兜底值是 ${TREE_DIST}"
+  log "树指纹核对通过：${TREE_DIST}$([[ "$NSS" == "1" ]] && echo '（ppe-nss 整树）' || echo '')"
+fi
+
 # ── 基座的 config 差异层 ────────────────────────────────────────
-# 只有「immortalwrt + 不开 NSS」这一格需要：换成 imm 之后个别包名 / 符号
-# 取值与 openwrt 不同，那些差异只对这条线成立，写进 common.config 会连累
-# 其他线。NSS=1 时树是 openwrt main 的 fork，imm 那层反而不能挂。
-if [[ "$DISTRO" == "immortalwrt" && "$NSS" == "0" ]]; then
+# 只有 immortalwrt 需要：换成 imm 之后个别包名 / 符号取值与 openwrt 不同，
+# 那些差异只对这条线成立，写进 common.config 会连累其他线。
+# （imm 线不可能是 NSS=1，上面的断言已经挡掉了，所以这里只看 DISTRO。）
+if [[ "$DISTRO" == "immortalwrt" ]]; then
   base_layer="$BUILDER_DIR/configs/imm.config"
   [[ -f "$base_layer" ]] || die "缺少 immortalwrt 的 config 覆盖层：$base_layer"
   EXTRA_LAYERS=("$base_layer" "${EXTRA_LAYERS[@]}")
 fi
 
-if [[ "$NSS" == "1" ]]; then tree_label="ppe-nss"; else tree_label="上游"; fi
+if [[ "$NSS" == "1" ]]; then tree_label="ppe-nss 整树"; else tree_label="${DISTRO} 原始树"; fi
 log "基座=$DISTRO  NSS=$NSS（树=$tree_label）  代理栈=$PROXY_STACK  sing-box=$SINGBOX_MODE"
 [[ -n "$EXTRA_PACKAGES" ]] && log "额外插件（kenzok8/small）：$EXTRA_PACKAGES"
 

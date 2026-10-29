@@ -5,31 +5,32 @@ name: Build QHora-301W
 # archive/workflows/ 留档。现在所有差异都收敛成下面这几组输入，实际拼装
 # 由 scripts/prepare.sh 完成。
 #
-# 三层选择：
-#   ① 基座      openwrt / immortalwrt
-#   ② NSS       是 → 整树切到 ppe-nss（有线 PPE + Wi-Fi offload 全都有）
-#               否 → 纯上游，不引 feed、不开任何 NSS 符号
+# 三层选择，① 决定发行版（优先级最高）：
+#   ① 基座      immortalwrt / openwrt      固件 DISTRIB_ID 就是它
+#   ② NSS       仅 ①=openwrt 可用。是 → 整树切到 ppe-nss（有线 PPE +
+#               Wi-Fi offload）；否 → 纯上游 openwrt，不开任何 NSS 符号
 #   ③ 代理栈    daed / dae / honk / homeproxy / singbox / passwall / passwall2 / 不集成
 #               passwall  = v1（Lua 界面，luci-app-passwall）
 #               passwall2 = v2（ucode 界面，luci-app-passwall2）
 #
-# ⚠️ ② 选「是」时 ① 会失效：ppe-nss 是 openwrt main 的 fork，不是 imm 的
-#    分支。这是有意的 —— NSS 的 Wi-Fi offload 由树内的 nss-wifi-drv 提供，
-#    还改了 mac80211 的 ath11k 源码，补丁补不出来，只能整树用。
+# ⚠️ ① = immortalwrt 时 ② 必须为「否」，勾了「是」会当场失败（不静默降级）：
+#    NSS 的 Wi-Fi offload 由 ppe-nss 树内的 nss-wifi-drv 提供（openwrt main
+#    的 fork，不是 imm 的分支），还改了 mac80211 的 ath11k 源码 —— 补丁补不
+#    出来，只能整树用。所以「imm 想要 NSS」这件事物理上不存在，二选一。
 
 on:
   workflow_dispatch:
     inputs:
       distro:
-        description: '① 基座'
+        description: '① 基座（决定发行版，优先级最高）'
         type: choice
         options: [immortalwrt, openwrt]
         default: immortalwrt
 
       nss:
-        description: '② 集成 NSS（全功能：有线 PPE + Wi-Fi offload，会整树切到 ppe-nss）'
+        description: '② 集成 NSS（仅 ①=openwrt 可用；整树切到 ppe-nss）'
         type: boolean
-        default: true
+        default: false
 
       proxy:
         description: '③ 代理栈'
@@ -49,12 +50,12 @@ on:
         default: ''
 
       imm_ref:
-        description: 'immortalwrt 基座 ref（仅 ①=immortalwrt 且 ②=否 时生效）'
+        description: 'immortalwrt 基座 ref（仅 ①=immortalwrt 时生效）'
         type: string
         default: 'master'
 
       ppe_ref:
-        description: 'ppe-nss 分支（仅 ②=是 时生效）'
+        description: 'ppe-nss 分支（仅 ①=openwrt 且 ②=是 时生效）'
         type: string
         default: 'ppe-nss'
 
@@ -85,15 +86,18 @@ env:
 
 jobs:
   build:
-    # ⚠️ 标题里不要写 distro：② = 是时 ① 被整树覆盖（ppe-nss 是 openwrt main 的
-    # fork），编出来的固件 DISTRIB_ID=OpenWrt。以前这里写的是
-    # `NSS · immortalwrt · honk`，Actions 页面上看着像"选了 imm 编成 openwrt"，
-    # 每次都要重新怀疑一遍。标题只写**实际树**，distro 在 NSS=0 时才有意义。
-    name: ${{ inputs.nss && 'NSS(ppe-nss)' || inputs.distro }} · ${{ inputs.proxy }}
+    # 标题同时写「基座」和「NSS」，因为 NSS 现在是 ① 的下属开关而不是
+    # 覆盖 ① 的东西：imm 线永远没有 NSS，openwrt 线才有加不加的选择。
+    # 以前 ② 覆盖 ① 时标题只能写树名，看起来就像"选了 imm 编成 openwrt"。
+    name: ${{ inputs.distro }}${{ inputs.nss && ' + NSS' || '' }} · ${{ inputs.proxy }}
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
     env:
+      # 两个名字是同一件事：prepare.sh 读 NSS，workflow 里的 shell 判断读
+      # NSS_FLAG。以前只有 NSS_FLAG，脚本一直拿不到这个参数，全靠它自己的
+      # 默认值 —— ② 一改成「否」就会因为「NSS=1 但树里没有 nss-wifi-drv」炸掉。
+      NSS: ${{ inputs.nss && '1' || '0' }}
       NSS_FLAG: ${{ inputs.nss && '1' || '0' }}
       DISTRO: ${{ inputs.distro }}
       PROXY_STACK: ${{ inputs.proxy }}
@@ -104,6 +108,17 @@ jobs:
       GH_TOKEN: ${{ github.token }}
 
     steps:
+      # 参数组合先校验，别等 20 分钟才在 prepare 里炸。imm + NSS 不存在，
+      # 与其静默降级成「imm 但不带 NSS」（用户以为拿到了 NSS），不如当场拒绝。
+      - name: 校验参数组合
+        run: |
+          set -euo pipefail
+          echo "① 基座 = ${DISTRO}    ② NSS = $([[ "$NSS_FLAG" == "1" ]] && echo 是 || echo 否)"
+          if [[ "$DISTRO" == "immortalwrt" && "$NSS_FLAG" == "1" ]]; then
+            echo "::error title=参数冲突::① = immortalwrt 没有 NSS 可集成 —— nss-wifi-drv 只存在于 ppe-nss 整树（openwrt main 的 fork），补丁补不出来。二选一：要 ImmortalWrt 就把 ② 改成「否」；要 NSS 就把 ① 改成 openwrt。" >&2
+            exit 1
+          fi
+
       - name: 释放磁盘空间
         # 全量编译约需 25-35GB，runner 根分区默认不够。
         run: |
@@ -126,13 +141,14 @@ jobs:
           sudo apt-get install -y \
             bzip2 g++ gawk gcc git glibc-source libncurses-dev make patch python3
 
-      # ── 源码树：NSS 决定检出哪一棵 ────────────────────────────
-      # 这里的三分支表达式就是「② 覆盖 ①」的唯一实现处。
+      # ── 源码树：① 决定发行版，② 只在 ①=openwrt 时换树 ──────────
+      # 顺序就是优先级：先看 ①=imm → imm 树（NSS 无意义，上面已挡住）；
+      # 否则 ①=openwrt → 看 ②：是则 ppe-nss 整树，否则 openwrt main。
       - name: 检出基座源码
         uses: actions/checkout@v7
         with:
-          repository: ${{ inputs.nss && 'JuliusBairaktaris/openwrt-ppe-nss' || (inputs.distro == 'openwrt' && 'openwrt/openwrt' || 'immortalwrt/immortalwrt') }}
-          ref: ${{ inputs.nss && inputs.ppe_ref || (inputs.distro == 'openwrt' && 'main' || inputs.imm_ref) }}
+          repository: ${{ inputs.distro == 'immortalwrt' && 'immortalwrt/immortalwrt' || (inputs.nss && 'JuliusBairaktaris/openwrt-ppe-nss' || 'openwrt/openwrt') }}
+          ref: ${{ inputs.distro == 'immortalwrt' && inputs.imm_ref || (inputs.nss && inputs.ppe_ref || 'main') }}
           fetch-depth: 1
           path: openwrt
 
@@ -310,9 +326,9 @@ jobs:
             echo
             echo "- 实际源码：\`$(git -C openwrt remote get-url origin)\` @ \`$(git -C openwrt rev-parse --short HEAD)\`"
             if [[ "$NSS_FLAG" == "1" ]]; then
-              echo "- NSS：集成（ppe-nss 整树）—— 输入 ① 的 \`$DISTRO\` **已被忽略**，固件是 OpenWrt SNAPSHOT"
+              echo "- NSS：集成（ppe-nss 整树 = openwrt main + Wi-Fi offload，① 仍为 openwrt）"
             else
-              echo "- NSS：不集成（基座 \`$DISTRO\`）"
+              echo "- NSS：不集成（① = \`$DISTRO\` 的原始树）"
             fi
             echo "- 代理栈：\`${PROXY_STACK}\` / sing-box：\`${SINGBOX_MODE}\`"
             echo
@@ -396,7 +412,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: qhora-301w-${{ inputs.nss && 'nss' || 'noups' }}-${{ inputs.proxy }}-${{ github.run_number }}
+          name: qhora-301w-${{ inputs.nss && 'nss' || (inputs.distro == 'immortalwrt' && 'imm' || 'openwrt') }}-${{ inputs.proxy }}-${{ github.run_number }}
           path: |
             openwrt/bin/targets/qualcommax/ipq807x/*qnap_301w*
             openwrt/bin/targets/qualcommax/ipq807x/*.manifest
@@ -413,7 +429,10 @@ jobs:
         if: inputs.release
         id: tag
         run: |
-          echo "tag=qhora-301w-$([[ "$NSS_FLAG" == "1" ]] && echo nss || echo noups)-${PROXY_STACK}-$(date -u +%Y%m%d)-${GITHUB_RUN_NUMBER}" >>"$GITHUB_OUTPUT"
+          if [[ "$NSS_FLAG" == "1" ]]; then flavor=nss
+          elif [[ "$DISTRO" == "immortalwrt" ]]; then flavor=imm
+          else flavor=openwrt; fi
+          echo "tag=qhora-301w-${flavor}-${PROXY_STACK}-$(date -u +%Y%m%d)-${GITHUB_RUN_NUMBER}" >>"$GITHUB_OUTPUT"
 
       - name: 生成 Release 说明
         if: inputs.release
@@ -433,17 +452,13 @@ jobs:
           OW_VER="$(sed -n 's/^RELEASE:=//p' openwrt/include/version.mk 2>/dev/null | head -n1)"
 
           {
-            printf '# QHora-301W · %s 固件\n\n' "$([[ "$NSS_FLAG" == "1" ]] && echo 'NSS' || echo '上游')"
+            printf '# QHora-301W · %s 固件\n\n' "$([[ "$NSS_FLAG" == "1" ]] && echo 'openwrt + NSS' || echo "$DISTRO")"
             printf '| | |\n|---|---|\n'
             printf '| **编译时间** | %s（北京时间） |\n' "$DATE_CN"
-            printf '| **NSS** | %s |\n' "$([[ "$NSS_FLAG" == "1" ]] && echo '集成（PPE 有线 + Wi-Fi offload）' || echo '不集成')"
+            printf '| **发行版** | `%s`%s |\n' "$DISTRO" "$([[ "$NSS_FLAG" == "1" ]] && echo '（② = 是）' || echo '')"
+            printf '| **NSS** | %s |\n' "$([[ "$NSS_FLAG" == "1" ]] && echo '集成（PPE 有线 + Wi-Fi offload，整树 ppe-nss）' || echo '不集成')"
             printf '| **代理栈** | `%s` |\n' "$PROXY_STACK"
             printf '| **源码** | `%s` @ `%s` |\n' "$(git -C openwrt remote get-url origin)" "$UP_COMMIT"
-            if [[ "$NSS_FLAG" == "1" ]]; then
-              printf '| **基座输入** | `%s`（② = 是，**已被 ppe-nss 覆盖**，固件 `DISTRIB_ID=OpenWrt`） |\n' "$DISTRO"
-            else
-              printf '| **基座输入** | `%s`（即实际源码） |\n' "$DISTRO"
-            fi
             printf '| **OpenWrt** | %s |\n\n' "${OW_VER:-未知}"
             printf '## 组件版本（取自固件 rootfs 清单）\n\n| 组件 | 版本 |\n|---|---|\n'
             for p in $(DISTRO="$DISTRO" NSS="$NSS_FLAG" PROXY_STACK="$PROXY_STACK" \

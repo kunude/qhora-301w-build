@@ -17,7 +17,8 @@
 # ⚠️ NSS 相关的包名分两代，不要混：
 #   老 edma-nss 栈：kmod-qca-nss-drv / kmod-qca-nss-ecm / nssqos / nss-tools
 #   新 ppe-nss 栈：kmod-nss-wifi-drv / nss-firmware-ipq807x / qca-ppe-qos
-#   本脚本只跟新栈。选 NSS 走的是 ppe-nss 整树，老栈的包名在树里根本不存在。
+#   本脚本只跟新栈。NSS=1 只可能出现在 openwrt 基座（ppe-nss 整树）上，
+#   老栈的包名在那棵树里根本不存在。
 #
 set -Eeuo pipefail
 

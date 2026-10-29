@@ -22,8 +22,9 @@
 #   honk      immortalwrt + honk（含 doona 面板；会查 GitHub API 补构建元数据）
 #   passwall  immortalwrt + passwall v1（Lua 界面 + luci-compat + Xray）
 #   passwall2 immortalwrt + passwall v2（默认栈，ucode 界面；v1/v2 共用组件仓库）
-#   nss       ppe-nss 整树 + daed（树必须是 ppe-nss）
+#   nss       openwrt + ppe-nss 整树 + daed（树必须是 ppe-nss）
 #   err       点一个不存在的包，**期望失败**（验证报错清晰）
+#   conflict  immortalwrt + NSS=1，**期望失败**（① 优先：imm 没有 NSS）
 #
 # 退出码 0 = 全通过。任何一步不符合预期即失败并打印该步日志尾部。
 #
@@ -52,7 +53,7 @@ pass=0 fail=0
 declare -a FAILED=()
 
 run_case() {
-  local case="$1" distro nss stack extra expect_fail=0 logf
+  local case="$1" distro nss stack extra expect_fail=0 expect_msg="" logf
   case "$case" in
     none)      distro=immortalwrt nss=0 stack=none      extra="luci-app-mosdns,luci-app-nikki" ;;
     daed)      distro=immortalwrt nss=0 stack=daed      extra="luci-app-mosdns" ;;
@@ -62,7 +63,10 @@ run_case() {
     passwall2) distro=immortalwrt nss=0 stack=passwall2 extra="" ;;
     nss)       distro=openwrt     nss=1 stack=daed      extra="luci-app-mosdns" ;;
     err)       distro=immortalwrt nss=0 stack=none      extra="luci-app-mosdns,luci-app-no-such-pkg"
-               expect_fail=1 ;;
+               expect_fail=1 expect_msg="既不在 kenzok8/small" ;;
+    # ① 优先：imm 没有 NSS 可集成，这个组合必须当场失败，不能静默降级
+    conflict)  distro=immortalwrt nss=1 stack=none      extra=""
+               expect_fail=1 expect_msg="① = immortalwrt 时不支持 NSS" ;;
     *) bad "不认识的组合：$case"; fail=$((fail+1)); FAILED+=("$case"); return 0 ;;
   esac
 
@@ -77,14 +81,14 @@ run_case() {
 
   if ((expect_fail)); then
     if ((rc == 0)); then
-      bad "$case：期望失败但成功了（点不存在的包应该当场报错）"
+      bad "$case：期望失败但成功了（这类参数组合不该产出固件）"
       fail=$((fail+1)); FAILED+=("$case")
-    elif ! grep -q "既不在 kenzok8/small" "$OUT/$case.out"; then
-      bad "$case：确实失败了，但报错信息不清晰（没指出包名找不到）"
+    elif ! grep -qF "$expect_msg" "$OUT/$case.out"; then
+      bad "$case：确实失败了，但报错信息对不上（找不到「$expect_msg」）"
       tail -n 5 "$OUT/$case.out" | sed 's/^/      /'
       fail=$((fail+1)); FAILED+=("$case")
     else
-      ok "$case：按预期失败，且报错点明了包名"
+      ok "$case：按预期失败，且报错点明了原因"
       pass=$((pass+1))
     fi
     return 0
