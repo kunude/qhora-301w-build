@@ -124,6 +124,34 @@ run_case() {
     fi
   fi
 
+  # ④ 出厂预置：变体覆盖目录里的每个文件都必须真的落到 <树>/files/，
+  #    并且权限要符合 verify-presets.sh 里的期望表。
+  #    覆盖目录不存在时 prepare-build.sh 是静默跳过的，所以这一步是唯一
+  #    能在 prepare 阶段发现"目录名写错 / 文件没进仓库"的地方。
+  local ov="$BUILDER_DIR/files-$stack" rel miss=0
+  if [[ -d "$ov" ]]; then
+    while IFS= read -r -d '' f; do
+      rel="${f#"$ov"/}"
+      if [[ ! -e "$TREE/files/$rel" ]]; then
+        bad "$case：覆盖层 $rel 没落到 <树>/files/"; miss=1
+      fi
+    done < <(find "$ov" -type f -print0)
+    if ((miss == 0)); then
+      ok "$case：变体覆盖层 files-$stack/ 全部落位"
+    else
+      bads=1
+    fi
+  fi
+  # 权限即功能：uci-defaults 不可执行 = 首启不跑，dae/honk 配置不是 0600 = 服务拒绝启动。
+  # --self-test 会拿覆盖层造一个假 rootfs 跑完整比对，不需要真编译。
+  if bash "$BUILDER_DIR/scripts/verify-presets.sh" --self-test --overlay "$TREE/files" \
+       >>"$OUT/$case.out" 2>&1; then
+    ok "$case：覆盖层权限表与比对逻辑自检通过"
+  else
+    bad "$case：verify-presets.sh 自检失败（权限不符或比对逻辑坏）"; bads=1
+    tail -n 6 "$OUT/$case.out" | sed 's/^/      /'
+  fi
+
   # ③-b passwall v1 线的四条硬指标。最容易出的错是"v2 被顺手也装进来"和
   #      "Lua 界面缺 luci-compat, 页面 404" —— 两者都编得过, 只有刷进去才发现。
   if [[ "$stack" == "passwall" ]]; then
@@ -134,6 +162,11 @@ run_case() {
       ok "$case：luci-app-passwall + 中文翻译都进了 .config"
     else
       bad "$case：luci-app-passwall / 翻译不在 .config 里"; bads=1
+    fi
+    if [[ -x "$TREE/files/etc/uci-defaults/zz-passwall-preset" ]]; then
+      ok "$case：passwall 出厂补丁已落位且可执行"
+    else
+      bad "$case：zz-passwall-preset 缺失或不可执行（首启不会跑，出厂设置等于没做）"; bads=1
     fi
     if grep -qx "CONFIG_PACKAGE_luci-app-passwall2=y" "$TREE/.config" 2>/dev/null; then
       bad "$case：passwall2 也被选进来了（两代不能同装，会抢 nft 表与 dnsmasq）"; bads=1
@@ -164,6 +197,13 @@ run_case() {
       ok "$case：generated-stage.mk / generated-doona-stage.mk 已补齐"
     else
       bad "$case：honk 的构建元数据没补齐（make download 必挂）"; bads=1
+    fi
+    # 出厂配置：必须 include system.dae（native_api + doona 面板靠它）
+    if [[ -f "$TREE/files/etc/honk/config.dae" ]] &&
+       grep -qE '^[[:space:]]*system\.dae[[:space:]]*$' "$TREE/files/etc/honk/config.dae"; then
+      ok "$case：honk 出厂 config.dae 已落位，且 include system.dae"
+    else
+      bad "$case：honk 出厂 config.dae 缺失或没 include system.dae（doona 面板会 404）"; bads=1
     fi
   fi
 

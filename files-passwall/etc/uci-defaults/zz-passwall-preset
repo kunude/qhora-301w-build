@@ -1,0 +1,75 @@
+#!/bin/sh
+#
+# ═══════════════════════════════════════════════════════════════════════════
+#  QHora-301W 出厂预置：passwall v1（Lua 界面）的初始设置
+#  ─────────────────────────────────────────────────────────────────────────
+#  为什么是脚本、不是直接塞一份 /etc/config/passwall：
+#
+#  passwall v1 的出厂配置不是「随包发布的静态文件」，而是包内的
+#  /etc/uci-defaults/luci-app-passwall 在首次开机时生成的 ——
+#
+#      [ ! -s "/etc/config/passwall" ] && \
+#          cp -f /usr/share/passwall/0_default_config /etc/config/passwall
+#
+#  之后那段脚本还会就地做一串**字段迁移**（tcp_node → node、
+#  log_tcp → log_node、给 socks / acl_rule / subscribe_list 换成带随机后缀的
+#  段名……）。也就是说 v1 的配置 schema 是「版本相关、由上游脚本负责演进」的。
+#
+#  如果我们直接覆盖一份静态 /etc/config/passwall，会踩两个坑：
+#    ① `[ ! -s ]` 判定不再成立 → 上游那份带分流总节点（myshunt）与
+#       三套 shunt_rules 的默认配置**整份不会被用到**，我们得自己维护 6KB；
+#    ② 上游每次改 schema，我们这份静态文件就成了旧格式，而迁移脚本只认
+#       它自己的字段名，修不回来。
+#
+#  所以这里只做「在厂商默认配置之上打一层薄补丁」，而且必须晚于上游脚本执行
+#  —— 这就是文件名用 zz- 前缀的原因：/etc/uci-defaults/* 是按文件名排序跑的，
+#  上游那个叫 luci-app-passwall（'l'），zz 排在它后面。prepare-build.sh 里有
+#  一条断言专门守着这个顺序，改名字会被判红。
+#
+#  上游默认值本身是合理的（dns_shunt=chinadns-ng、chn_list=direct、
+#  prefer_nft=1、分流总节点 myshunt 已存在），所以这里只强调三件事：
+#    · 不自动启动（没有节点时开启会把 DNS 劫持到不通的链路上）
+#    · nftables 优先（本固件编了 nftables + kmod-nft-tproxy，没编 iptables 全家）
+#    · 日志收敛到 error（v1 的 log_node=1 会把每个连接刷进 logread）
+# ═══════════════════════════════════════════════════════════════════════════
+
+# 上游没生成配置（包没装 / 用户已删）就什么都不做。
+[ -s /etc/config/passwall ] || exit 0
+command -v uci >/dev/null 2>&1 || exit 0
+
+# uci 取不到就是不存在 —— 用来避免凭空造出一个残缺的段。
+have() { uci -q show "passwall.$1" >/dev/null 2>&1; }
+
+# ── 主开关：保持关闭 ──────────────────────────────────────────────────────
+# v1 在没有节点时开启，会照常写 nft 规则并把 dnsmasq 的上游指到一条走不通的
+# 代理链上；症状是「国内网站也打不开」，看起来像固件坏了。
+if have '@global[0]'; then
+	uci -q set passwall.@global[0].enabled='0'
+	# 国内域名走直连解析、其余按代理侧解析（上游默认值，这里写明是为了
+	# 让「出厂就是这套口径」这件事可查，避免以后被默认值漂移带走）
+	uci -q set passwall.@global[0].dns_shunt='chinadns-ng'
+	uci -q set passwall.@global[0].use_default_dns='direct'
+	uci -q set passwall.@global[0].chn_list='direct'
+	uci -q set passwall.@global[0].filter_proxy_ipv6='1'
+	# 日志：error 级、不逐连接记录。v1 默认 log_node='0'，但上游模板改过几次，
+	# 显式写死一次更稳。
+	uci -q set passwall.@global[0].loglevel='error'
+	uci -q set passwall.@global[0].log_node='0'
+
+	# 主节点指向厂商默认配置里那个分流总节点（config nodes 'myshunt'）。
+	# 只在「用户没选过节点」且该段确实存在时才写，不覆盖已有选择。
+	if [ -z "$(uci -q get passwall.@global[0].node)" ] && have myshunt; then
+		uci -q set passwall.@global[0].node='myshunt'
+	fi
+fi
+
+# ── 转发：nftables ────────────────────────────────────────────────────────
+if have '@global_forwarding[0]'; then
+	uci -q set passwall.@global_forwarding[0].prefer_nft='1'
+	uci -q set passwall.@global_forwarding[0].tcp_proxy_way='redirect'
+	uci -q set passwall.@global_forwarding[0].udp_no_redir_ports='disable'
+fi
+
+uci -q commit passwall
+
+exit 0

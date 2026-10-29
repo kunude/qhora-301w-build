@@ -369,6 +369,20 @@ jobs:
           [[ "$bad" -eq 0 ]] || { echo "::error::有 $bad 项校验未通过"; exit 1; }
           echo "功能包与内核前提全部通过"
 
+      # ── 出厂预置是否真的进了镜像 ──────────────────────────────
+      # 覆盖层是**静默合并**的：prepare-build.sh 的 `cp -a files-<栈>/. files/`
+      # 对不存在的目录直接跳过，目录名拼错、被 .gitignore 吃掉都不报错。
+      # 编出来的固件照样能刷能开机，只是打开配置页面是空的 —— 只有刷完机
+      # 才发现，代价一个固件周期。
+      #
+      # 已有的守卫只覆盖一半：check-no-credentials.sh 管"里面有没有凭据"，
+      # prepare-build.sh 的断言只管 dae / daed / honk / passwall 那几个点名文件。
+      # 这一步是**按覆盖层逐个文件**核对拼镜像之前的 root-*：
+      # 存在性、逐字节内容、以及那几条「权限即功能」的期望值
+      # （uci-defaults 不可执行 = 首启不跑；dae/honk 配置不是 0600 = 服务拒绝启动）。
+      - name: 校验出厂预置是否进了镜像
+        run: bash "$BUILDER_DIR/scripts/verify-presets.sh" --tree openwrt
+
       - name: 上传镜像（artifact）
         # always()：校验失败也要能拿到固件，否则白编两小时。
         if: always()

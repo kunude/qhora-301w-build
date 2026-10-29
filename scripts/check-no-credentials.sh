@@ -25,6 +25,15 @@
 #   · 特征串兜底：分享链接协议头（vless:// vmess:// ss:// ssr:// trojan:// …）
 #     以及常见机场域名特征（jmssub / getsub.php）
 #
+#   · dae 语法的配置文件（etc/dae/config.dae、etc/honk/config.dae）另有一套口径：
+#     它们不是 uci 格式，所以按 dae 的语法单独扫 ——
+#     ① 任何分享链接协议头都算命中；
+#     ② `url:` 这个键在 dae / honk 里**只**出现在 subscription 块内
+#        （dns 用 default: / remote:，routing 用 dip()/domain()），
+#        所以出现非注释的 url: 就是订阅链接。
+#     这层是 2026-10-29 补的：原来只扫 etc/config/，config.dae 完全没被看过，
+#     而它恰恰是天生要填订阅的那个文件。
+#
 set -Eeuo pipefail
 
 BUILDER_DIR="${BUILDER_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
@@ -35,11 +44,13 @@ for d in "$BUILDER_DIR"/files "$BUILDER_DIR"/files-*; do
   [[ -d "$d" ]] || continue
   while IFS= read -r f; do
     CONFIGS+=("$f")
-  done < <(find "$d" -type f -path '*/etc/config/*' 2>/dev/null | sort)
+  done < <(find "$d" -type f \
+             \( -path '*/etc/config/*' -o -path '*/etc/dae/*.dae' -o -path '*/etc/honk/*.dae' \) \
+             2>/dev/null | sort)
 done
 
 if ((${#CONFIGS[@]} == 0)); then
-  echo "（没有找到 files*/etc/config/ 下的预置文件，跳过检查）"
+  echo "（没有找到 files*/etc/config/ 或 etc/{dae,honk}/*.dae 下的预置文件，跳过检查）"
   exit 0
 fi
 
@@ -88,8 +99,34 @@ scan_config() {
   ' "$1"
 }
 
+# dae / honk 语法扫描器（config.dae 这类）。
+# 只看非注释行；两条判据写在上面头部说明里。
+scan_dae() {
+  awk '
+    /^[ \t]*#/ { next }
+    {
+      line = $0
+      if (line ~ /(vless|vmess|ssr|ss|trojan|hysteria2|hysteria|hy2|tuic|anytls):\/\//) {
+        printf ":%d: %s  <- 疑似分享链接 / 订阅特征串\n", NR, line
+        next
+      }
+      if (line ~ /^[ \t]*url[ \t]*:/) {
+        printf ":%d: %s  <- 订阅链接（dae 语法里 url: 只出现在 subscription 块）\n", NR, line
+      }
+    }
+  ' "$1"
+}
+
 hits=0
 for f in "${CONFIGS[@]}"; do
+  if [[ "$f" == *.dae ]]; then
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      printf '%s%s\n' "${f#"$BUILDER_DIR"/}" "$line"
+      hits=$((hits + 1))
+    done < <(scan_dae "$f")
+    continue
+  fi
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
     printf '%s%s\n' "${f#"$BUILDER_DIR"/}" "$line"

@@ -838,6 +838,8 @@ log "$cred_report"
 #                      files-homeproxy/  → etc/config/homeproxy + 9 个 .srs
 #                      files-dae/        → etc/dae/config.dae + SSH 修复脚本
 #                      files-daed/       → etc/daed/wing.db（构建时生成，见 6a）
+#                      files-honk/       → etc/honk/config.dae（见 6a-3）
+#                      files-passwall/   → etc/uci-defaults/zz-passwall-preset（见 6a-4）
 # 目录不存在就跳过；先叠共用、后叠变体，变体里的同名文件覆盖共用。
 # ── 6-0. daed 线的出厂数据库（必须在叠加覆盖层之前生成）────────────
 # daed 2.x 把 global / dns / routing / 分组全存在 <config-dir>/wing.db
@@ -858,6 +860,20 @@ if [[ "$PROXY_STACK" == "daed" ]]; then
     --out "$BUILDER_DIR/files-daed/etc/daed/wing.db" \
     --src "$BUILDER_DIR/configs/daed" \
     || die "wing.db 生成失败（configs/daed/ 下的三段配置结构不对，见上面的输出）"
+fi
+
+# ── 6-1. 覆盖层目录是构建产物：每次重建 ─────────────────────────
+# <树>/files/ 的内容**完全**由仓库的 files/ + files-<PROXY_STACK>/ 决定，
+# 但原来的实现是"只增不减"：换一个变体重跑，上一次变体的文件会留在里面 ——
+# dae 的 97-ssh-login-fix、homeproxy 的 9 个 .srs、passwall 的 zz 补丁、
+# honk 的 config.dae 会一起混进**下一个变体**的镜像。CI 每次全新 clone 碰不到，
+# 本地连着跑几个组合必踩（与 feeds 那处「脏工作区」同一类问题）。
+#
+# 所以进拷贝之前先删干净。自定义文件请放进仓库的 files/，不要直接写树的 files/
+# —— 后者是产物，下一次 prepare 就没了。
+if [[ -d files ]]; then
+  rm -rf files
+  log "重建覆盖层目录 <树>/files/（清掉上一次变体留下的文件）"
 fi
 
 overlay_variant="$BUILDER_DIR/files-$PROXY_STACK"
@@ -896,6 +912,14 @@ if [[ -d files/etc/dae ]]; then
   log "dae 配置权限已收紧为 0600（dae validate 只接受 0640/0600）"
 fi
 
+# honk 与 dae 同源：配置里天生要放订阅链接，同样不接受 group/other 可读。
+# 包自带的 INSTALL_CONF 本来会给 0600，但覆盖层是 prepare_rootfs 阶段
+# cp -a 铺上去的、权限来自 git 检出（Windows 上是 0777），所以必须在这里补。
+if [[ -d files/etc/honk ]]; then
+  find files/etc/honk -type f -name '*.dae' -exec chmod 0600 {} + 2>/dev/null || true
+  log "honk 配置权限已收紧为 0600（与 dae 同一套要求）"
+fi
+
 # ── 6a. dae 覆盖层的两道断言 ───────────────────────────────────
 # files-<PROXY_STACK>/ 是"目录不存在就静默跳过"的，写错目录名不会报错，
 # 只会编出一份**没有骨架配置**的固件 —— 刷进去 dae 一启动就因为找不到
@@ -923,6 +947,51 @@ if [[ "$PROXY_STACK" == "dae" ]]; then
         "把值删掉、只保留注释掉的示例；真正的节点在设备上填"
   fi
   log "dae 出厂配置就位：无有效订阅/节点链接（订阅留空，实测该配置能通过 dae validate）"
+fi
+
+# ── 6a-3. honk 覆盖层：config.dae 的结构 ─────────────────────────
+# honk 的出厂配置是**两份拼起来**的：
+#   /etc/honk/config.dae   ← 我们的（出站分组 / DNS / 分流 / 订阅占位）
+#   /etc/honk/system.dae   ← 包的（wan/lan 接口、data_dir、native_api + doona）
+# config.dae 必须第一件事就 include 它，否则 honk 起来没有 native_api，
+# doona 面板直接 404 —— 而这个失败在构建期完全看不出来，只会在浏览器里
+# 表现为"页面打不开"，非常难倒查。
+if [[ "$PROXY_STACK" == "honk" ]]; then
+  hk_conf="files/etc/honk/config.dae"
+  [[ -f "$hk_conf" ]] || die \
+    "PROXY_STACK=honk 但覆盖层里没有 $hk_conf" \
+    "（files-honk/ 没被叠加？检查目录名拼写 —— 目录不存在时本脚本是静默跳过的）"
+  grep -qE '^[[:space:]]*include[[:space:]]*\{' "$hk_conf" \
+    || die "$hk_conf 里没有 include 块 —— system.dae 不会被加载" \
+           "（缺了它就没有 native_api：doona 面板 404，wan/lan 接口也失去明确指定）"
+  grep -qE '^[[:space:]]*system\.dae[[:space:]]*$' "$hk_conf" \
+    || die "$hk_conf 的 include 块里没有 system.dae"
+  log "honk 出厂配置就位：config.dae 含 include system.dae（native_api + doona）"
+fi
+
+# ── 6a-4. passwall 覆盖层：出厂补丁必须晚于厂商脚本 ───────────────
+# v1 的 /etc/config/passwall **不是**随包发布的静态文件，而是包内的
+# /etc/uci-defaults/luci-app-passwall 在首启时从 /usr/share/passwall/0_default_config
+# 生成、随后就地做一串字段迁移（tcp_node→node 等）。我们的补丁只改几个选项，
+# 所以必须**在它之后**执行：/etc/uci-defaults/* 按文件名排序跑，'l' < 'z'。
+# 这条断言防的是"有人把它改名成 99-passwall-preset" —— 那时配置文件还没生成，
+# 脚本第一行 `[ -s /etc/config/passwall ] || exit 0` 直接退出，补丁静默失效，
+# 而构建、刷机、开机全都正常，只是出厂设置没生效。
+if [[ "$PROXY_STACK" == "passwall" ]]; then
+  pw_uc="files/etc/uci-defaults/zz-passwall-preset"
+  pw_name="$(basename "$pw_uc")"
+  [[ -f "$pw_uc" ]] || die \
+    "PROXY_STACK=passwall 但覆盖层里没有 $pw_uc" \
+    "（files-passwall/ 没被叠加？检查目录名拼写）"
+  [[ -x "$pw_uc" ]] || die \
+    "$pw_uc 没有执行位 —— uci-defaults 只跑可执行文件，补丁等于没做" \
+    "（prepare-build.sh 上面那段 chmod 0755 应该已经处理，检查是不是被跳过）"
+  [[ "$pw_name" > "luci-app-passwall" ]] || die \
+    "passwall 出厂补丁叫 $pw_name，排在 luci-app-passwall **之前**" \
+    "uci-defaults 按文件名排序执行，改名后会在配置文件还没生成时就退出、静默失效"
+  grep -q 'passwall\.@global\[0\]\.enabled' "$pw_uc" \
+    || die "$pw_uc 里没有设置主开关 enabled —— 没有节点就自动启用会让 DNS 走不通的代理链"
+  log "passwall v1 出厂补丁就位：$pw_name（排在 luci-app-passwall 之后执行）"
 fi
 
 # ── 6a-2. daed 覆盖层：wing.db 的形状与内容 ──────────────────────

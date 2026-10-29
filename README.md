@@ -96,9 +96,62 @@ v1 为什么带 Xray：它的核心是**按节点选**的，社区里的老配�
 `configs/passwall.config` 里 `INCLUDE_Xray` 那行改成 `n`（sing-box 覆盖
 SS / VMess / VLESS / Trojan / Hysteria2）。
 
-两条线都**不带出厂预置**给 v1 —— `files-passwall2/` 那份分流模板是 v2 的配置格式，
-v1 的字段完全不同，混用会解析失败。v1 起来就是上游默认值（`enabled=0`），
-在「服务 → PassWall」里自行配置。
+两条线**不共用出厂预置**：`files-passwall2/` 那份分流模板是 v2 的配置格式，
+v1 的字段完全不同，混用会解析失败。v1 的预置改用**薄补丁**的方式
+（`files-passwall/etc/uci-defaults/zz-passwall-preset`），原因与做法见下面
+「出厂预置」一节 —— 一句话：v1 的 `/etc/config/passwall` 不是随包发布的静态文件，
+而是包内脚本在首启时生成并做字段迁移的，覆盖静态文件会把上游那份带分流总节点的
+默认配置整份顶掉。
+
+## 出厂预置
+
+固件不是"装了一堆包的空系统"：刷完机就能用的东西，都在 `files/` 与
+`files-<栈>/` 里，由 `prepare-build.sh` 第 6 步合并进源码树的 `files/`，
+OpenWrt 在拼 rootfs 时原样铺上去。`etc/uci-defaults/*` 里的脚本在**首次开机**
+跑一次、跑完自动删除。
+
+| 层 | 内容 |
+|---|---|
+| `files/`（所有变体） | 主机名 `QHora-301W`、LAN 改 `192.168.35.1/24`、ddns-go 与 msd_lite 开机自启、温度采集打开、`sshd_config` |
+| `files-daed/` | `wing.db` —— 构建期从 `configs/daed/*.dae` 编出来的 SQLite（DNS / 路由 / 分组 / 管理员口令哈希），刷完机 daed 一起来就是配好的 |
+| `files-dae/` | `config.dae` 骨架（订阅留空）、`dae-geo-update`、`dae-switch`、配置 0600、SSH 登录修复 |
+| `files-homeproxy/` | `/etc/config/homeproxy` + 9 个本地 `.srs` 规则集（**必须 local**，remote 会在服务启动时才下载，任一条失败即断网） |
+| `files-singbox/` | `/etc/config/sing-box` + 配置模板 + 开机启用 |
+| `files-passwall2/` | `/etc/config/passwall2` 分流模板（Direct / Proxy / Reject + URLTest 组） |
+| `files-passwall/` | `zz-passwall-preset` —— 在厂商默认配置之上打的薄补丁（见下） |
+| `files-honk/` | `/etc/honk/config.dae` —— 分组 / DNS / 分流 / 订阅占位，`include system.dae`（native_api + doona） |
+
+### 两个非显而易见的取舍
+
+**honk 的配置是"两份拼起来"的。** 我们的 `config.dae` 只管出站分组、DNS、分流和
+订阅占位；`system.dae`（包的，管 wan/lan 接口、`data_dir`、`native_api` 与 doona 的
+`ui` 路径）靠第一行的 `include` 挂进来。少这一行不会有任何报错，只是 doona 面板 404
+—— 所以 `prepare-build.sh` 有一条断言专门查它。
+
+**passwall v1 的预置是脚本、不是静态配置。** v1 的 `/etc/config/passwall` 由包内的
+`/etc/uci-defaults/luci-app-passwall` 在首启时从 `/usr/share/passwall/0_default_config`
+生成，随后就地做字段迁移（`tcp_node`→`node` 等）。直接塞一份静态文件会踩两个坑：
+`[ ! -s ]` 判定不再成立 → 上游那份带分流总节点（`myshunt`）和三套 shunt_rules 的
+默认配置整份用不上；schema 一变，我们这份就成了旧格式。所以只在它之后打一层
+薄补丁，文件名用 `zz-` 前缀 —— `/etc/uci-defaults/*` 按文件名排序执行，`'l' < 'z'`。
+改名会被 `prepare-build.sh` 判红（改名后脚本会在配置文件还没生成时就退出，静默失效）。
+
+### 三道守卫，防"编得出来、刷得进去、配置空白"
+
+1. **`check-no-credentials.sh`** —— 覆盖层里不许出现节点凭据或订阅链接。
+   扫 `etc/config/*`（uci 语法）与 `etc/{dae,honk}/*.dae`（dae 语法，`url:` 只出现在
+   subscription 块内）。固件是公开产物，写进去就等于公开你的机场。
+2. **`prepare-build.sh` 的断言** —— dae / daed / honk / passwall 四条线各自点名核对
+   关键文件的结构（例如 honk 必须 `include system.dae`、passwall 补丁必须排在厂商
+   脚本之后）。
+3. **`verify-presets.sh`** —— 构建后按覆盖层**逐个文件**核对 `build_dir` 里的
+   `root-*`：存在性、逐字节内容、以及「权限即功能」的期望值
+   （`uci-defaults` 不可执行 = 首启不跑；dae/honk 配置不是 0600 = 服务拒绝启动）。
+   这条是唯一能兜住"目录名拼错 / 被 .gitignore 吃掉"的守卫 —— 覆盖层合并是静默的，
+   出错时固件照样能刷能开机，只是页面空白。
+
+本地没编译也能验 2、3 的逻辑：`scripts/verify-presets.sh --self-test` 会拿覆盖层
+造一个假 rootfs 跑完整比对，先确认全通过、再删一个文件确认能判红。
 
 ### 防静默降级
 
@@ -177,10 +230,12 @@ scripts/
   resolve-deps.sh         展开插件依赖闭包（small feed 内部递归）
   wanted-packages.sh      当前变体「必须进固件」的包清单 → 产物校验用
   fetch-honk-stage.sh     补齐 honk / doona 的构建元数据（generated-*.mk）
+  verify-presets.sh       核对覆盖层是否原样进了镜像（存在 + 内容 + 权限）
+  check-no-credentials.sh 出厂预置安全闸：不许有节点凭据 / 订阅链接
   extra-packages.sh       ddns-go / msd_lite / passwall(v1|v2) 组件落位
   test-local.sh           本地回归：在真树上跑 prepare，几组参数一起验
   resolve-*.sh            上游版本解析（每次构建取最新）
-files/ files-<stack>/     rootfs 覆盖，按代理栈叠加
+files/ files-<stack>/     rootfs 覆盖，按代理栈叠加（files-honk / files-passwall 见「出厂预置」）
 packages/                 自带配方（如 sing-box-refind）
 patches/kernel/           内核补丁
 archive/                  旧的 11 个 workflow、旧 NSS 补丁与脚本
@@ -228,7 +283,7 @@ NSS 的 21 个符号、反复跑时残留的 small feed 行会让 `feeds install
 
 ## 构建后的校验
 
-`.config` 里写 `=y` 只证明「被选中」，不证明「编出来了」。所以有三道独立核对：
+`.config` 里写 `=y` 只证明「被选中」，不证明「编出来了」。所以有四道独立核对：
 
 1. **符号**：`prepare-build.sh` 把配置文件请求的每个 `=y` 符号与 `make defconfig`
    之后的结果比对，丢一个就失败并打印该符号在 kconfig 里的定义。
@@ -237,6 +292,8 @@ NSS 的 21 个符号、反复跑时残留的 small feed 行会让 `feeds install
 3. **内核前提**：`daed` / `dae` / `honk` 的 eBPF 程序靠 CO-RE 读内核结构，必须查
    `vmlinux` 里真的有 `.BTF` 段 —— `.config` 开了 `DEBUG_INFO` 也可能被
    `KERNEL_DEBUG_INFO_REDUCED` 挡掉。
+4. **出厂预置**：`verify-presets.sh` 把覆盖层里每个文件拿去拼镜像前的 `root-*` 核对
+   （存在 + 内容一致 + 权限），见上面「出厂预置」一节。
 
 ## 归档
 
