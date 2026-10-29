@@ -110,6 +110,9 @@ if [[ "$NSS" == "1" ]]; then
   if [[ "$DISTRO" == "immortalwrt" ]]; then
     warn "NSS=1：基座已换成 openwrt-ppe-nss@ppe-nss，$DISTRO 的差异不会被包含"
     warn "（这正是「选 NSS 就是全功能」的含义；要 imm 特有的包就别勾 NSS）"
+    # 同时打到 Actions 注解里：光在日志里 warn，页面顶上那条标题照样写着
+    # immortalwrt，刷完机看到 DISTRIB_ID=OpenWrt 又会怀疑一遍。
+    printf '::notice title=基座被覆盖::② = 是 → ① 的 %s 不生效：检出的是 ppe-nss（openwrt main 的 fork），固件 DISTRIB_ID 是 OpenWrt，不是 ImmortalWrt\n' "$DISTRO"
   fi
 
   # ppe-nss 的 nss-packages 分支只提供 nss-firmware，驱动在树里。

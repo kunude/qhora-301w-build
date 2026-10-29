@@ -85,7 +85,11 @@ env:
 
 jobs:
   build:
-    name: ${{ inputs.nss && 'NSS' || '上游' }} · ${{ inputs.distro }} · ${{ inputs.proxy }}
+    # ⚠️ 标题里不要写 distro：② = 是时 ① 被整树覆盖（ppe-nss 是 openwrt main 的
+    # fork），编出来的固件 DISTRIB_ID=OpenWrt。以前这里写的是
+    # `NSS · immortalwrt · honk`，Actions 页面上看着像"选了 imm 编成 openwrt"，
+    # 每次都要重新怀疑一遍。标题只写**实际树**，distro 在 NSS=0 时才有意义。
+    name: ${{ inputs.nss && 'NSS(ppe-nss)' || inputs.distro }} · ${{ inputs.proxy }}
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
@@ -304,8 +308,12 @@ jobs:
           {
             echo "## ${DEVICE_LABEL} 构建产物"
             echo
-            echo "- 基座：\`$(git -C openwrt remote get-url origin)\` @ \`$(git -C openwrt rev-parse --short HEAD)\`"
-            echo "- NSS：$([[ "$NSS_FLAG" == "1" ]] && echo "集成（ppe-nss 整树）" || echo "不集成")"
+            echo "- 实际源码：\`$(git -C openwrt remote get-url origin)\` @ \`$(git -C openwrt rev-parse --short HEAD)\`"
+            if [[ "$NSS_FLAG" == "1" ]]; then
+              echo "- NSS：集成（ppe-nss 整树）—— 输入 ① 的 \`$DISTRO\` **已被忽略**，固件是 OpenWrt SNAPSHOT"
+            else
+              echo "- NSS：不集成（基座 \`$DISTRO\`）"
+            fi
             echo "- 代理栈：\`${PROXY_STACK}\` / sing-box：\`${SINGBOX_MODE}\`"
             echo
             echo '```'
@@ -431,6 +439,11 @@ jobs:
             printf '| **NSS** | %s |\n' "$([[ "$NSS_FLAG" == "1" ]] && echo '集成（PPE 有线 + Wi-Fi offload）' || echo '不集成')"
             printf '| **代理栈** | `%s` |\n' "$PROXY_STACK"
             printf '| **源码** | `%s` @ `%s` |\n' "$(git -C openwrt remote get-url origin)" "$UP_COMMIT"
+            if [[ "$NSS_FLAG" == "1" ]]; then
+              printf '| **基座输入** | `%s`（② = 是，**已被 ppe-nss 覆盖**，固件 `DISTRIB_ID=OpenWrt`） |\n' "$DISTRO"
+            else
+              printf '| **基座输入** | `%s`（即实际源码） |\n' "$DISTRO"
+            fi
             printf '| **OpenWrt** | %s |\n\n' "${OW_VER:-未知}"
             printf '## 组件版本（取自固件 rootfs 清单）\n\n| 组件 | 版本 |\n|---|---|\n'
             for p in $(DISTRO="$DISTRO" NSS="$NSS_FLAG" PROXY_STACK="$PROXY_STACK" \
