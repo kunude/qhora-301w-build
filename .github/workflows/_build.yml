@@ -83,18 +83,32 @@ jobs:
 
     steps:
       - name: 释放磁盘空间
-        # 全量编译约需 25-35GB，runner 根分区默认不够。
+        # 全量编译约需 25-35GB（common.config 里 DEVEL=y + USE_LTO=y 会再往上顶），
+        # runner 根分区默认 ~14GB 可用 —— 不够。
+        #
+        # ⚠️ 满盘的症状很坑：包级报 "failed to build"，但日志里**没有编译错误**
+        #    （写不进去所以报不出来），看起来像配方问题。本仓库为此专门在失败时
+        #    打 df/free（见「编译」步骤），这里则尽量把空间腾足。
+        #
+        # 本工作流不依赖 runner 预装的任何 SDK（工具链全部由 OpenWrt 自建、
+        # 宿主依赖走 apt），所以把 hostedtoolcache 整个清掉是安全的。
         run: |
           set -euo pipefail
           df -h / | tail -1
           sudo rm -rf \
+            /opt/hostedtoolcache \
             /usr/share/dotnet \
             /usr/local/lib/android \
+            /usr/share/swift \
             /opt/ghc \
+            /usr/local/.ghcup \
+            /opt/az \
+            /usr/share/miniconda \
             /usr/local/share/boost \
-            /opt/hostedtoolcache/CodeQL || true
+            /usr/local/share/powershell || true
           sudo apt-get clean
           df -h / | tail -1
+          free -g | head -2
 
       - name: 安装构建依赖
         run: |
@@ -230,6 +244,17 @@ jobs:
           # 故意不加 -e：make 失败要自己接住，好决定是否单线程重跑。
           set -uo pipefail
           : >"$BUILD_LOG"
+          # 起编前先看一眼余量：宁可在这里明确红掉，也不要编一小时以后
+          # 以"某个包 failed to build"的形式失败 —— 那种报错会把人带偏。
+          # 阈值取 8 GiB：另一条线在 ~14 GiB 上编成功过，卡太严会把好构建也拦掉。
+          avail_mb=$(df -Pm / | awk 'NR==2{print $4}')
+          echo "可用空间：${avail_mb} MiB"
+          if (( avail_mb < 8192 )); then
+            echo "::error::根分区只剩 ${avail_mb} MiB，全量编译必然中途写满；先清理磁盘再跑"
+            exit 1
+          elif (( avail_mb < 15360 )); then
+            echo "::warning::根分区只剩 ${avail_mb} MiB，可能不够全量编译（历史成功值 ~14 GiB+）"
+          fi
           make -j"$(nproc)" 2>&1 | tee -a "$BUILD_LOG"
           rc=${PIPESTATUS[0]}
           if (( rc != 0 )); then
@@ -239,7 +264,23 @@ jobs:
           fi
           staging_dir/host/bin/ccache -s 2>&1 | tee -a "$BUILD_LOG" || true
           if (( rc != 0 )); then
-            echo "编译失败：make 最终退出码 $rc。完整日志见下一步「回放编译日志」。"
+            # 失败现场的三样东西，缺一样就得靠猜：
+            #   ① 资源 —— 满盘的典型症状是"包级报错但没有编译错误"，很容易
+            #      被误判成配方问题（本仓库真实踩过：C 盘满导致解包截断）。
+            #   ② 失败包自己的日志 —— config.log 里有 configure 的真实原因。
+            #   ③ build.log 尾部 —— 由下一步回放。
+            {
+              echo "===== 失败现场 ====="
+              df -h / "$RUNNER_TEMP" 2>/dev/null || df -h /
+              free -g 2>/dev/null || true
+              echo "--- 最近改动的包构建目录（含 configure 日志尾部）---"
+              for d in $(find build_dir/target-* build_dir/hostpkg -maxdepth 1 -mindepth 1 -type d \
+                           -newermt '-40 minutes' 2>/dev/null | head -6); do
+                echo "### $d"
+                [ -f "$d/config.log" ] && tail -12 "$d/config.log"
+              done
+            } 2>&1 | tee -a "$BUILD_LOG"
+            echo "编译失败：make 最终退出码 $rc。完整日志见下一步「回放编译日志」，并作为 artifact 上传。"
             exit "$rc"
           fi
           echo "编译通过"
@@ -254,11 +295,25 @@ jobs:
             exit 0
           fi
           # 作业日志要 admin 权限才能从 API 取，注解是公开可读的。
-          grep -nE '(\*\*\* \[.*\] Error|ERROR: |error: |No rule to make target)' "$BUILD_LOG" |
-            tail -20 | while IFS= read -r line; do
+          # 模式要宽：只有 4 条的老写法漏掉了"满盘 / 被 kill / 缺工具"这三类
+          # ——它们不打印 "error:"，恰恰是最难猜的。顺序有意义：越靠后越具体。
+          grep -nE '(No space left on device|Killed|Out of memory|Cannot allocate memory|command not found|: not found|Permission denied|No rule to make target|undefined reference to|cannot find -l|fatal error:|\*\*\* \[.*\] Error [0-9]+|ERROR: )' "$BUILD_LOG" |
+            tail -25 | while IFS= read -r line; do
               echo "::error title=编译报错::$line"
             done || true
           tail -40 "$BUILD_LOG"
+
+      # 注解只装得下几十行，且失败原因往往在更早的位置。build.log 落成
+      # artifact 之后，没有仓库 admin 权限也能拿到（actions/jobs/{id}/logs
+      # 对公开仓库同样返回 403，实测过）。
+      - name: 上传编译日志
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-log-${{ inputs.flavor }}-${{ inputs.proxy }}-${{ github.run_number }}
+          path: ${{ runner.temp }}/build.log
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: 收集并校验产物
         run: |

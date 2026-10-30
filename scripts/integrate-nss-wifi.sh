@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # 把 NSS 的 Wi-Fi 卸载支持移植到「不是 ppe-nss 整树」的基座上
-# （immortalwrt / openwrt main 都能用）。ppe-nss 树里它是四样东西，逐样搬：
+# （immortalwrt / openwrt main 都能用）。ppe-nss 树里它是五样东西，逐样搬：
 #
 #   ① package/kernel/nss-wifi-drv
 #      NSS 固件宿主驱动 + `/etc/config/nss-wifi` + 开机脚本。DEPENDS 里有
@@ -13,13 +13,17 @@
 #      没有它们补丁根本不会被应用、`kmod-nss-wifi-drv` 也不会被依赖带出来。
 #      症状是「一切正常、固件照出」，只是 Wi-Fi 还在 CPU 上 —— 所以本脚本
 #      的每一步之后都要回读断言，锚点对不上就当场失败。
-#   ④ 内核侧：EDMA/PPE 驱动 + NSS 的 reserved-memory
+#   ④ 内核侧：EDMA/PPE 驱动
 #      驱动不是只跟 mac80211 打交道，它直接调内核里 qca_edma / qca_ppe 的
 #      导出符号（`qca_edma_cpu_queues_to_ring`、`qca_ppe_fw_booted`、
 #      `qca_ppe_fw_carrier_set`）—— 让 NSS 固件和 host 共用接收 ring、把
 #      flow 交给固件处理。这几个函数在上游 main 里**不存在**：上游的 qca_edma
 #      走的是另一套（DSA switch ops + flow offload），同名头文件的路径和内容
 #      都不同。所以内核侧也得换。
+#   ⑤ 设备树：`ipq8074-nss.dtsi` + 目标 dts 的 include + **nss_region 标签**
+#      前两样在 files/ 和 dts/ 里，第三样是上游的一个内核补丁（0931），
+#      漏了 DTB 就编不过（引用不存在的 label nss_region），而那时**包已经
+#      全编完了**，看起来像镜像阶段的问题。见 ④c。
 #
 # 为什么内核侧是「整块覆盖」而不是打补丁：两边是同一条基线的两个快照，
 # ppe-nss 那边就是在这份代码上加 NSS 支持 —— 实测差集约 300 行新增、删改
@@ -92,6 +96,7 @@ printf '%s\n' \
   "target/linux/qualcommax/files/drivers/net/ethernet/qualcomm/" \
   "target/linux/qualcommax/files/include/linux/soc/" \
   "target/linux/qualcommax/files/arch/arm64/boot/dts/qcom/ipq8074-nss.dtsi" \
+  "target/linux/qualcommax/patches-6.18/0931-arm64-dts-ipq8074-rename-nss-region.patch" \
   "target/linux/qualcommax/dts/$NSS_DTS.dts" \
   >"$NSS_WIFI_SRC/.git/info/sparse-checkout"
 git -C "$NSS_WIFI_SRC" fetch -q --depth 1 --filter=blob:none origin "$NSS_WIFI_REF"
@@ -281,8 +286,18 @@ grep -rqs 'qca_ppe_fw_booted' "$KQF" ||
   die "内核侧找不到 qca_ppe_fw_booted —— PPE 固件接口没搬进来"
 
 # ── ④b 设备树：NSS 的 reserved-memory ────────────────────────
-# 驱动要从设备树拿 NSS 固件区的物理地址。上游的 301w dts 没有这一段，
-# 只有一个 include 的差别（实测就一行）。
+# 驱动要从设备树拿 NSS 固件区的物理地址（`memory-region = <&nss_region>`）。
+# 这一步是两件事，缺一件 DTB 就编不出来：
+#
+#   (1) 把 $dtsi（ipq8074-nss.dtsi）放进 files/，并给目标设备 dts 加 include；
+#   (2) **给 reserved-memory 里的 nss@40000000 加上 `nss_region` 这个 label。**
+#
+# (2) 容易被漏掉，因为它是上游的一个**内核补丁**（0931-…-rename-nss-region），
+# 不在 files/ 里。漏了的表现很具体：dtc 报
+#   ipq8074-nss.dtsi: ERROR (phandle_references):
+#   /soc@0/nss-common: Reference to non-existent node or label "nss_region"
+# 然后整个 target/install 红掉 —— 而**所有包都已经编完了**，看起来像镜像阶段
+# 的问题，其实是一条 dts 引用没落地。
 if [[ "$NSS_DTS" == ipq60* ]]; then dtsi=ipq6018-nss.dtsi; else dtsi=ipq8074-nss.dtsi; fi
 dtsf="$OPENWRT_DIR/target/linux/qualcommax/dts/$NSS_DTS.dts"
 [[ -f "$dtsf" ]] || die "$dtsf 不存在 —— NSS_DTS=$NSS_DTS 选错设备了？"
@@ -312,7 +327,39 @@ PY
 
 grep -qF "$dtsi" "$dtsf" || die "$NSS_DTS.dts 里没有 $dtsi —— 设备树没挂上"
 
-# ── 回读断言：写完的文件真的带上了这五处 ──────────────────────
+# ── ④c 给 reserved-memory 补上 nss_region 标签 ────────────────
+# 上游那个补丁只改一行（`nss@40000000 {` → `nss_region: memory@40000000 {`），
+# 但它是 $dtsi 能被解析的前提。落地方式二选一：
+#   · 基座内核已经带了 label（上游以后合进去了）→ 什么都不做；
+#   · 否则把 ppe-nss 的那个补丁原样放进基座的 kernel patches 目录。
+# 不自己改 $dtsi 的引用来绕（比如 `<&{/reserved-memory/nss@40000000}>`）：
+# 那样 $dtsi 就不再和上游一致，下次同步时要多记一笔差异。
+kpat_dir="$(ls -d "$OPENWRT_DIR"/target/linux/qualcommax/patches-6.* 2>/dev/null | head -1)"
+[[ -n "$kpat_dir" ]] || die "找不到 $OPENWRT_DIR/target/linux/qualcommax/patches-6.* —— 目录结构漂移"
+
+# ⚠️ 只认 **本 SoC** 的补丁：imm 自带的 0135 是给 ipq6018 加 reserved-memory 的，
+# 名字里也有 `nss_region:`。按 "$kpat_dir/*.patch" 全局找会把 ipq8074 这一支
+# 误判成"已经有标签"从而跳过，然后照样红在 DTB。
+soc=ipq8074; [[ "$NSS_DTS" == ipq60* ]] && soc=ipq6018
+
+if grep -q 'nss_region:' \
+     "$OPENWRT_DIR/target/linux/qualcommax/files/arch/arm64/boot/dts/qcom/$soc.dtsi" 2>/dev/null ||
+   grep -lq 'nss_region:' "$kpat_dir"/*"$soc"*.patch 2>/dev/null; then
+  log "reserved-memory 已有 $soc 的 nss_region 标签，跳过"
+else
+  nr_patch="$src_kern/patches-6.18/0931-arm64-dts-ipq8074-rename-nss-region.patch"
+  [[ -f "$nr_patch" ]] || die \
+    "取不到 0931-arm64-dts-ipq8074-rename-nss-region.patch —— $dtsi 会引用不存在的 nss_region，DTB 编不过"
+  # 补丁改的是 ipq8074.dtsi 里 reserved-memory 的 nss@40000000 节点；基座要是没有
+  # 这个节点，补丁打不上，同样会红在 DTB 阶段 —— 提前说清楚。
+  grep -rq 'nss@40000000' "$OPENWRT_DIR/target/linux/qualcommax/files/arch/arm64/boot/dts/qcom/ipq8074.dtsi" \
+    "$kpat_dir"/*ipq8074*.patch 2>/dev/null ||
+    die "基座里找不到 reserved-memory 的 nss@40000000 节点 —— 0931 补丁会打不上"
+  cp -a "$nr_patch" "$kpat_dir/"
+  log "补上 reserved-memory 的 nss_region 标签：$(basename "$nr_patch") → ${kpat_dir##*/}"
+fi
+
+# ── 回读断言：写完的文件真的带上了这几处 ──────────────────────
 check() { grep -qF "$2" "$1" || die "$1 里没有「$3」—— 挂钩没写进去"; }
 check "$MAC/Makefile" "PKG_BUILD_DEPENDS:=ATH11K_NSS_WIFI:nss-wifi-drv" "构建依赖"
 check "$MAC/Makefile" '$(call PatchDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/nss-wifi,nss-wifi/)' "PatchDir"
@@ -320,8 +367,15 @@ check "$MAC/ath.mk" "config ATH11K_NSS_WIFI" "Kconfig 开关"
 check "$MAC/ath.mk" "+kmod-nss-wifi-drv))" "ath11k 依赖 nss-wifi-drv"
 check "$MAC/ath.mk" '$(if $(CONFIG_ATH11K_NSS_WIFI),,$(call AutoProbe,ath11k_ahb))' "ahb 不自启"
 
+# nss_region 标签：$dtsi 里的 `memory-region = <&nss_region>` 靠它解析。
+# 这一步只查「有没有」（同样只认本 SoC 的补丁），真正的验证是 DTB 能不能过 —— 那是 make 的事。
+grep -q 'nss_region:' \
+  "$OPENWRT_DIR/target/linux/qualcommax/files/arch/arm64/boot/dts/qcom/$soc.dtsi" 2>/dev/null ||
+  grep -lq 'nss_region:' "$kpat_dir"/*"$soc"*.patch 2>/dev/null ||
+  die "nss_region 标签没落地 —— $dtsi 会引用不存在的 label，DTB 编不过"
+
 # 依赖关系是这套移植唯一的「顺序保证」：nss-wifi-drv 先装头文件，ath11k 后编。
 grep -q 'PKG_BUILD_DEPENDS:=ATH11K_NSS_WIFI:nss-wifi-drv' "$MAC/Makefile" ||
   die "缺 PKG_BUILD_DEPENDS：ath11k 会在驱动装头文件之前开始编"
 
-log "NSS 移植完成：$(du -sh "$OPENWRT_DIR/package/kernel/nss-wifi-drv" | cut -f1) 驱动 + $n_patch 个补丁 + 内核侧 EDMA/PPE + $dtsi"
+log "NSS 移植完成：$(du -sh "$OPENWRT_DIR/package/kernel/nss-wifi-drv" | cut -f1) 驱动 + $n_patch 个补丁 + 内核侧 EDMA/PPE + $dtsi + nss_region 标签"
