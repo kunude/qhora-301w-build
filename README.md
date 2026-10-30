@@ -1,51 +1,42 @@
 # QHora-301W 固件构建
 
 为 **QNAP QHora-301W**（`qualcommax` / `ipq807x` / `qnap_301w`，IPQ8072A + NSS）
-编译 OpenWrt / ImmortalWrt 固件。一条 workflow，三层参数，选完就唯一确定一个固件。
+编译 OpenWrt / ImmortalWrt 固件。两条线，各自一个入口，代理栈在两边都能选。
 
 ## 怎么用
 
-Actions → **Build QHora-301W** → Run workflow，填三个选择：
+Actions 里两个入口，按基座选：
 
-| 层 | 输入 | 取值 | 作用 |
-|---|---|---|---|
-| ① | `distro` | `immortalwrt` / `openwrt` | 发行版，**优先级最高**：固件 `DISTRIB_ID` 就是它 |
-| ② | `nss` | 是 / 否（默认否） | 仅 ①=`openwrt` 可用：换成 ppe-nss 整树（见下） |
-| ③ | `proxy` | `daed` `dae` `honk` `homeproxy` `singbox` `passwall` `passwall2` `none` | 装哪套透明代理 |
+| 入口 | 基座 | NSS 怎么来 |
+|---|---|---|
+| **Build ImmortalWrt** | `immortalwrt/immortalwrt` | **移植**：构建时把 ppe-nss 的 `nss-wifi-drv` + 18 个 mac80211 补丁搬进来（`nss` 可选，默认开） |
+| **Build OpenWrt (NSS)** | `JuliusBairaktaris/openwrt-ppe-nss@ppe-nss` | **整树**：直接编那棵树，组件本来就在里面 |
 
-另外两个可选项：`extra_packages`（额外插件，逗号分隔）、`release`（成功后发 Release）。
+两边的 `proxy` 取值一样：`daed` `dae` `honk` `homeproxy` `singbox` `passwall`
+`passwall2` `none`。另有 `extra_packages`（额外插件，逗号分隔）和 `release`。
 
-### ① 优先，② 是它的子开关
+## NSS：一套东西，两种落法
 
-② 只在 ①=`openwrt` 时有意义。① 选 `immortalwrt` 时勾「是」不会悄悄换成
-openwrt —— 构建会在第一个步骤失败，提示二选一。
-
-为什么不能反过来：NSS 的 Wi-Fi offload 由 `nss-wifi-drv` 提供，它只存在于
-`JuliusBairaktaris/openwrt-ppe-nss@ppe-nss`（**openwrt main 的 fork**，不是
-imm 的分支），还改了 mac80211 的 ath11k 源码。补丁补不出来，只能整树用。
-所以「imm + NSS」这个组合物理上不存在，早失败比编出一个「imm 但不带 NSS」
-的固件好 —— 后者能开机、能刷、日志一句报错没有，只是发行版和 NSS 都不是
-你选的那个。
-
-## NSS 只有两态，没有中间态
+NSS 的 Wi-Fi 卸载不是一个 feed 包，而是四样：`nss-wifi-drv` 包 + 18 个
+mac80211/ath11k 补丁 + mac80211 里的三处挂钩 + 内核侧的 EDMA/PPE 驱动。
 
 ```
-openwrt + nss=是  →  ppe-nss 整树   →  有线 PPE 加速 + Wi-Fi offload（NSS 核心跑 Wi-Fi 数据面）
-nss=否            →  该基座原始树   →  不引 NSS feed、不开任何 NSS 符号
+openwrt 基座  →  ppe-nss 整树直接编  →  四样都在树里，上游维护
+imm 基座      →  scripts/integrate-nss-wifi.sh 搬过来
+              →  有线加速也是同一套 EDMA/PPE，一起换
 ```
 
-以前有过第三种「immortalwrt + NSS 补丁」，现在不成立了，因为情况变了：
+第四样最容易漏：驱动直接调内核的 `qca_edma_cpu_queues_to_ring`、
+`qca_ppe_fw_booted`、`qca_ppe_fw_carrier_set`（让固件和 host 共用接收 ring、
+把 flow 交给固件）。上游 main 的 `qca_edma` 走的是另一套 DSA switch ops，
+同名头文件的路径和内容都不同 —— 所以内核侧是整块换 7 个文件，不是打补丁。
+设备树也要加一行 `#include "ipq8074-nss.dtsi"`（NSS 固件区的 reserved-memory）。
 
-- PR #22381（`qca_edma` 重构）2026-07-11 合入 openwrt main
-- PR #24806（`qca_ppe` host-driven offload）2026-10-26 合入 openwrt main
-- immortalwrt master 已同步，且 `ipq807x/config-default` 里
-  `CONFIG_QCOM_EDMA=y`、`CONFIG_QCOM_80211AX_PPE=y` 默认就开
+移植线只在三个前提下成立，缺一个就当场失败（不会静默编出无 NSS 的固件）：
 
-也就是说**「有线加速」imm 自带，不需要任何补丁**；而「Wi-Fi offload」的
-`nss-wifi-drv` 是 ppe-nss 树内的包，还改了 mac80211 的 ath11k 源码
-（给 QCN9074 加 wifili 实例、多实例卸载），那不是补丁能补出来的量级。
-
-两头一夹，中间态就没了。
+- mac80211 backports 版本是 **7.2** —— 补丁按它生成，跳版就没法应用
+- 挂钩锚点在 `Makefile` / `ath.mk` / 设备树里找得到 —— 找不到说明上游改结构了
+- 内核里 `qca_edma.c` 还是上游那套 —— 上游要是自己吃进了 NSS 接口，就别覆盖
 
 > 顺带一句：跑透明代理时，被代理的流量本来就在 CPU 上（dae 是 eBPF、
 > sing-box 是 userspace），PPE/NSS 加速对它们**无效**——它只加速 fw4
@@ -198,9 +189,12 @@ CONFIG_PACKAGE_ppe-help
 ```
 
 树不对时 `make defconfig` 会**静默丢弃**它们 —— 固件照样编出来、名字一样、
-刷进去也能开机，只是 Wi-Fi 还在 CPU 上。所以 `scripts/prepare.sh` 不看变量，
-直接查树里有没有 `package/kernel/nss-wifi-drv` 和
-`seeds/qualcommax-nss-wifi.seed`，对不上立刻失败。
+刷进去也能开机，只是 Wi-Fi 还在 CPU 上。所以判据不是「传没传 NSS=1」：
+
+- **整树**：`scripts/prepare.sh` 用 `seeds/qualcommax-nss-wifi.seed` 认树，
+  没有就当场失败（移植过的 imm 树里也有 `nss-wifi-drv`，光看它分不清）；
+- **移植**：`scripts/integrate-nss-wifi.sh` 按锚点插挂钩，锚点找不到就失败，
+  半搬状态过不去；backports 版本对不上也在这里拦。
 
 ## 恒定的东西（不占选择层）
 
@@ -248,18 +242,22 @@ fork，它的 luci / packages feed 是**官方 openwrt** 的，没有 `dae` / `d
 
 ```
 .github/workflows/
-  build.yml               唯一的构建入口
+  _build.yml              两条线的共用实现（workflow_call，不手动触发）
+  build-immortalwrt.yml   入口 1：immortalwrt 基座（NSS 走移植）
+  build-openwrt-nss.yml   入口 2：openwrt 基座 + ppe-nss 整树
   debug-singbox-pkg.yml   单包调试线（只编 sing-box，验配方）
 configs/
   common.config           所有变体共用
   qhora_301w.config       机型
-  imm.config              immortalwrt 差异层（仅 distro=imm 时挂）
-  nss.config              NSS 线的减法层（仅 openwrt + nss=是 时挂，在 seed 之后）
+  imm.config              immortalwrt 差异层（distro=imm 时挂，含 NSS 线）
+  nss.config              整树线的减法层（在 ppe-nss 的 seed 之后挂）
+  nss-wifi-imm.config     移植线的符号层（imm + NSS 时挂）
   passwall.config         passwall v1 的符号层（把 v2 那组按掉、换 v1 的）
   none.config             不集成代理（把 passwall2 全家 + Rust 工具链按掉）
   daed.config 等          各代理栈的覆盖层
 scripts/
-  prepare.sh              唯一入口：三层参数 → 树选择 + config 拼装
+  prepare.sh              唯一入口：参数 → 树选择 + NSS 落法 + config 拼装
+  integrate-nss-wifi.sh   移植线：把 ppe-nss 的驱动与补丁搬进上游树
   prepare-build.sh        feeds / .config / 符号校验 / 覆盖文件 / 内核补丁
   resolve-deps.sh         展开插件依赖闭包（small feed 内部递归）
   wanted-packages.sh      当前变体「必须进固件」的包清单 → 产物校验用
@@ -279,17 +277,18 @@ docs/build-lines-archive.md  旧结构文档（各代理栈的配置字段仍可
 ## 本地构建
 
 ```sh
-git clone --depth 1 https://github.com/immortalwrt/immortalwrt openwrt   # 或 ppe-nss
+git clone --depth 1 https://github.com/immortalwrt/immortalwrt openwrt
 OPENWRT_DIR=$PWD/openwrt BUILDER_DIR=$PWD \
-  DISTRO=immortalwrt NSS=0 PROXY_STACK=daed bash scripts/prepare.sh
+  DISTRO=immortalwrt NSS=1 PROXY_STACK=daed bash scripts/prepare.sh
 cd openwrt && make -j"$(nproc)"
 ```
 
-`NSS=1` 时 **DISTRO 必须是 `openwrt`**，且把第一行换成 ppe-nss：
+`NSS=1` 在 imm 树上会给 `prepare.sh` 加一道移植（搬驱动 + 补丁进树）；
+想走整树就把第一行换成 ppe-nss、`DISTRO=openwrt`：
 
 ```sh
 git clone --depth 1 -b ppe-nss https://github.com/JuliusBairaktaris/openwrt-ppe-nss openwrt
-# 然后 DISTRO=openwrt NSS=1 ...（DISTRO=immortalwrt NSS=1 会直接失败）
+# 然后 DISTRO=openwrt NSS=1 ...
 ```
 
 ## 改完脚本先本地回归
@@ -301,6 +300,7 @@ admin 权限才下载得到。
 ```sh
 scripts/test-local.sh ~/work/imm                  # 默认 none + daed
 scripts/test-local.sh ~/work/imm none daed honk err   # 指定组合
+scripts/test-local.sh ~/work/imm nss-imm          # imm + NSS 移植（树是上游树）
 scripts/test-local.sh ~/work/ppe nss              # NSS 线，树必须是 ppe-nss
 ```
 

@@ -1,0 +1,78 @@
+name: Build ImmortalWrt
+
+# 线 1：ImmortalWrt 基座。
+#
+# NSS 在这条线上是**移植**进来的，不是整树：imm 的树里没有 nss-wifi-drv，
+# 构建时由 scripts/integrate-nss-wifi.sh 从 ppe-nss 搬来四样东西 —— 驱动包、
+# 18 个 mac80211 补丁、mac80211 里的挂钩、以及内核侧的 EDMA/PPE 驱动与
+# 设备树 reserved-memory（驱动直接调那几个导出符号，上游那套接口不一样）。
+#
+# 另有一条：openwrt 基座直接编 ppe-nss 整树 → Build OpenWrt (NSS)。
+
+on:
+  workflow_dispatch:
+    inputs:
+      nss:
+        description: '集成 NSS（移植 ppe-nss 的 Wi-Fi 卸载）'
+        type: boolean
+        default: true
+
+      proxy:
+        description: '代理栈'
+        type: choice
+        options: [daed, dae, honk, homeproxy, singbox, passwall, passwall2, none]
+        default: daed
+
+      singbox_mode:
+        description: 'sing-box 来源（仅 homeproxy / singbox 有意义）'
+        type: choice
+        options: [builtin, source]
+        default: builtin
+
+      extra_packages:
+        description: '额外插件（逗号分隔，从 kenzok8/small 取最新源码；可留空）'
+        type: string
+        default: ''
+
+      imm_ref:
+        description: 'immortalwrt 基座 ref'
+        type: string
+        default: 'master'
+
+      nss_wifi_ref:
+        description: 'NSS 组件来源 ref（ppe-nss 仓库）'
+        type: string
+        default: 'ppe-nss'
+
+      release:
+        description: '构建成功后发 Release'
+        type: boolean
+        default: false
+
+      clean_build:
+        description: '不复用 dl / ccache 缓存'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-immortalwrt-${{ inputs.proxy }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    uses: ./.github/workflows/_build.yml
+    with:
+      flavor: imm
+      distro: immortalwrt
+      nss: ${{ inputs.nss && '1' || '0' }}
+      source_repo: immortalwrt/immortalwrt
+      source_ref: ${{ inputs.imm_ref }}
+      nss_wifi_ref: ${{ inputs.nss_wifi_ref }}
+      proxy: ${{ inputs.proxy }}
+      singbox_mode: ${{ inputs.singbox_mode }}
+      extra_packages: ${{ inputs.extra_packages }}
+      release: ${{ inputs.release }}
+      clean_build: ${{ inputs.clean_build }}

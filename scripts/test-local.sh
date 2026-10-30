@@ -13,6 +13,7 @@
 # 用法：
 #   scripts/test-local.sh ~/work/imm                     # 默认跑 none + daed
 #   scripts/test-local.sh ~/work/imm none daed err       # 指定组合
+#   scripts/test-local.sh ~/work/imm nss-imm             # imm + NSS 移植
 #   scripts/test-local.sh ~/work/ppe nss                 # NSS 线（树必须是 ppe-nss）
 #
 # 组合：
@@ -22,9 +23,10 @@
 #   honk      immortalwrt + honk（含 doona 面板；会查 GitHub API 补构建元数据）
 #   passwall  immortalwrt + passwall v1（Lua 界面 + luci-compat + Xray）
 #   passwall2 immortalwrt + passwall v2（默认栈，ucode 界面；v1/v2 共用组件仓库）
+#   nss-imm   immortalwrt + NSS 移植（树是上游树，组件由构建时搬进来）
 #   nss       openwrt + ppe-nss 整树 + daed（树必须是 ppe-nss）
 #   err       点一个不存在的包，**期望失败**（验证报错清晰）
-#   conflict  immortalwrt + NSS=1，**期望失败**（① 优先：imm 没有 NSS）
+#   conflict  参数与树不一致（immortalwrt + ppe-nss 树），**期望失败**
 #
 # 退出码 0 = 全通过。任何一步不符合预期即失败并打印该步日志尾部。
 #
@@ -45,9 +47,10 @@ ok()   { printf '\033[1;32m  ✓\033[0m %s\n' "$*"; }
 bad()  { printf '\033[1;31m  ✗\033[0m %s\n' "$*"; }
 hr()   { printf '\033[1m%s\033[0m\n' "────────────────────────────────────────────────────"; }
 
-# 树指纹：先确认节点树的类型，NSS 组合与非 NSS 组合不能串树
-HAS_NSS_DRV=0
-[[ -d "$TREE/package/kernel/nss-wifi-drv" ]] && HAS_NSS_DRV=1
+# 树指纹：判据用 seeds/ 而不是 nss-wifi-drv 目录 —— 移植线跑完以后上游树里
+# 也会有那个目录，拿目录当判据会把「移植过的 imm」误判成 ppe-nss 整树。
+HAS_PPE_SEED=0
+[[ -f "$TREE/seeds/qualcommax-nss-wifi.seed" ]] && HAS_PPE_SEED=1
 
 pass=0 fail=0
 declare -a FAILED=()
@@ -62,11 +65,14 @@ run_case() {
     passwall)  distro=immortalwrt nss=0 stack=passwall  extra="" ;;
     passwall2) distro=immortalwrt nss=0 stack=passwall2 extra="" ;;
     nss)       distro=openwrt     nss=1 stack=daed      extra="luci-app-mosdns" ;;
+    # imm 基座 + NSS 移植：组件由构建时从 ppe-nss 搬进来，产物同上
+    nss-imm)   distro=immortalwrt nss=1 stack=none      extra="" ;;
     err)       distro=immortalwrt nss=0 stack=none      extra="luci-app-mosdns,luci-app-no-such-pkg"
                expect_fail=1 expect_msg="既不在 kenzok8/small" ;;
-    # ① 优先：imm 没有 NSS 可集成，这个组合必须当场失败，不能静默降级
+    # 参数与树不一致：树是 ppe-nss 整树，却按 immortalwrt 要符号层 ——
+    # 必须当场失败，否则编出来的 DISTRIB_ID 是 OpenWrt，和参数说的不是一件事
     conflict)  distro=immortalwrt nss=1 stack=none      extra=""
-               expect_fail=1 expect_msg="① = immortalwrt 时不支持 NSS" ;;
+               expect_fail=1 expect_msg="树与参数不一致" ;;
     *) bad "不认识的组合：$case"; fail=$((fail+1)); FAILED+=("$case"); return 0 ;;
   esac
 
@@ -125,6 +131,21 @@ run_case() {
       ok "$case：kmod-nss-wifi-drv 确实进了 .config"
     else
       bad "$case：kmod-nss-wifi-drv 不在 .config 里 —— NSS 等于没开"; bads=1
+    fi
+    # 移植线还多一道：ath11k 那只开关。它在 =n 的时候补丁不会被应用，
+    # 而 kmod-nss-wifi-drv 照样能编出来 —— 「装了驱动但 Wi-Fi 没卸载」。
+    if [[ "$case" == "nss-imm" ]]; then
+      if grep -qx "CONFIG_ATH11K_NSS_WIFI=y" "$TREE/.config" 2>/dev/null; then
+        ok "$case：ATH11K_NSS_WIFI 已开（补丁会被应用）"
+      else
+        bad "$case：ATH11K_NSS_WIFI 没开 —— 驱动在，Wi-Fi 还在 CPU 上"; bads=1
+      fi
+      if [[ -d "$TREE/package/kernel/mac80211/patches/nss-wifi" ]] &&
+         [[ "$(find "$TREE/package/kernel/mac80211/patches/nss-wifi" -name '*.patch' | wc -l)" -ge 18 ]]; then
+        ok "$case：18 个 NSS 补丁已落位"
+      else
+        bad "$case：NSS 补丁没落位或数量不足"; bads=1
+      fi
     fi
   fi
 
@@ -220,18 +241,19 @@ run_case() {
 }
 
 hr
-log "基座树：$TREE（NSS 指纹：$([[ $HAS_NSS_DRV == 1 ]] && echo ppe-nss || echo 上游)）"
+log "基座树：$TREE（NSS 指纹：$([[ $HAS_PPE_SEED == 1 ]] && echo ppe-nss 整树 || echo 上游树)）"
 log "仓库：$BUILDER_DIR"
 hr
 
 for c in "${CASES[@]}"; do
   # 树与组合的一致性先做一次快速检查，省得白跑 2 分钟
-  if [[ "$c" == "nss" && $HAS_NSS_DRV -eq 0 ]]; then
-    bad "组合 nss 需要 ppe-nss 树，但 $TREE 不是（缺少 package/kernel/nss-wifi-drv）"
+  if [[ "$c" == "nss" && $HAS_PPE_SEED -eq 0 ]]; then
+    bad "组合 nss 需要 ppe-nss 整树，但 $TREE 不是（缺少 seeds/qualcommax-nss-wifi.seed）"
     fail=$((fail+1)); FAILED+=("$c"); continue
   fi
-  if [[ "$c" != "nss" && $HAS_NSS_DRV -eq 1 ]]; then
-    bad "组合 $c 需要上游树，但 $TREE 是 ppe-nss"
+  # nss-imm 要求上游树：ppe-nss 整树跑这条没有意义（组件本来就在树里）
+  if [[ "$c" == "nss-imm" && $HAS_PPE_SEED -eq 1 ]]; then
+    bad "组合 nss-imm 需要上游树（imm / openwrt main），但 $TREE 是 ppe-nss 整树"
     fail=$((fail+1)); FAILED+=("$c"); continue
   fi
   run_case "$c"

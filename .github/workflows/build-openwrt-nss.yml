@@ -1,0 +1,64 @@
+name: Build OpenWrt (NSS)
+
+# 线 2：直接编 ppe-nss 整树 —— NSS 的 Wi-Fi 卸载 + 有线加速全在树里，
+# 不打补丁、不搬组件。基座是 JuliusBairaktaris/openwrt-ppe-nss，
+# 它是 openwrt main 的 fork（DISTRIB_ID 仍为 OpenWrt）。
+#
+# 另一种做法（immortalwrt 基座 + 移植同一套组件）在 Build ImmortalWrt 里。
+
+on:
+  workflow_dispatch:
+    inputs:
+      proxy:
+        description: '代理栈'
+        type: choice
+        options: [daed, dae, honk, homeproxy, singbox, passwall, passwall2, none]
+        default: daed
+
+      singbox_mode:
+        description: 'sing-box 来源（仅 homeproxy / singbox 有意义）'
+        type: choice
+        options: [builtin, source]
+        default: builtin
+
+      extra_packages:
+        description: '额外插件（逗号分隔，从 kenzok8/small 取最新源码；可留空）'
+        type: string
+        default: ''
+
+      ppe_ref:
+        description: 'ppe-nss 分支 / 提交'
+        type: string
+        default: 'ppe-nss'
+
+      release:
+        description: '构建成功后发 Release'
+        type: boolean
+        default: false
+
+      clean_build:
+        description: '不复用 dl / ccache 缓存'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-openwrt-nss-${{ inputs.proxy }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    uses: ./.github/workflows/_build.yml
+    with:
+      flavor: nss
+      distro: openwrt
+      nss: '1'
+      source_repo: JuliusBairaktaris/openwrt-ppe-nss
+      source_ref: ${{ inputs.ppe_ref }}
+      proxy: ${{ inputs.proxy }}
+      singbox_mode: ${{ inputs.singbox_mode }}
+      extra_packages: ${{ inputs.extra_packages }}
+      release: ${{ inputs.release }}
+      clean_build: ${{ inputs.clean_build }}

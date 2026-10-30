@@ -12,9 +12,12 @@
 #
 #   DISTRO        immortalwrt（默认）| openwrt
 #                 决定发行版本身（固件 DISTRIB_ID），优先级最高。
-#   NSS           0（默认）| 1   —— 仅 DISTRO=openwrt 可用
-#                 1 = 整棵树换成 JuliusBairaktaris/openwrt-ppe-nss@ppe-nss
-#                     有线 PPE 加速 + NSS Wi-Fi offload 全都在，不打补丁。
+#   NSS           0（默认）| 1
+#                 1 有两种落法，按**检出的树**自动选，调用方不指定：
+#                   整树  树里已有 package/kernel/nss-wifi-drv
+#                          （= JuliusBairaktaris/openwrt-ppe-nss@ppe-nss 直接编）
+#                   移植  树里没有（immortalwrt / openwrt main）
+#                          = scripts/integrate-nss-wifi.sh 把 Wi-Fi 卸载搬进来
 #                 0 = 该基座的原始树：不引 feed、不打补丁、不开任何 NSS 符号。
 #   PROXY_STACK   daed（默认）| dae | honk | homeproxy | singbox | passwall |
 #                 passwall2 | none
@@ -27,19 +30,19 @@
 #   其余变量（GH_TOKEN / DDNS_GO_VERSION / MSD_LITE_SHA …）原样透传给
 #   scripts/prepare-build.sh，本脚本不干预。
 #
-# ── 为什么 NSS 只有两态 ───────────────────────────────────────
-# 曾经有过第三种「immortalwrt + NSS 移植补丁」。它现在不成立了：
-#   · PR #22381（qca_edma 重构）2026-07-11 合入 openwrt main
-#   · PR #24806（qca_ppe host-driven offload）2026-10-26 合入 openwrt main
-#   · immortalwrt master 已同步，且 ipq807x/config-default 里
-#     CONFIG_QCOM_EDMA=y / CONFIG_QCOM_80211AX_PPE=y 默认就开
-# 所以「有线加速」imm 自带，不需要补丁；而「Wi-Fi offload」的 nss-wifi-drv
-# 是 ppe-nss 树内的包，还改了 mac80211 的 ath11k 源码 —— 那是补丁补不出来的
-# 量级，只能整树用。两头一夹，中间态就没了。
+# ── NSS 的两种落法 ───────────────────────────────────────────
+# 「NSS 的 Wi-Fi 卸载」在 OpenWrt 里不是一套 feed 包，而是三样东西：
+#   nss-wifi-drv 包 + 18 个 mac80211/ath11k 补丁 + mac80211 里的三处挂钩。
+# 以前只有 ppe-nss 整树一条路（直接编那棵树）。现在多一条：把这三样搬到
+# 任意一棵同基线的树上（immortalwrt 走这条）。两条路的产物一样，差别只在
+# 「谁维护那三样」—— 整树是上游维护，移植是我们构建时搬。
 #
-# 换句话说：NSS 是 openwrt 基座上的一个开关，**不能反过来决定发行版**。
-# DISTRO=immortalwrt 时没有 NSS 可用（imm 树里根本没有 nss-wifi-drv），
-# 传 NSS=1 直接失败，不静默降级 —— 「以为开了 NSS」比没有 NSS 更糟。
+# 怎么选不看参数、看树：树里有 nss-wifi-drv 就是整树，没有就是移植。这样
+# workflow 里就不会出现「参数说移植、实际检出整树」这种静默错配 —— 那种
+# 不一致编出来也是好固件，只是做法和你以为的不一样。
+#
+# 有线加速两边都有，但来源不同：整树靠树内的 PPE 改动，imm 靠它自己
+# 已经合并的 qca_ppe（ipq807x 的 config-default 默认开）。
 #
 set -Eeuo pipefail
 
@@ -108,56 +111,79 @@ if [[ -f "$OPENWRT_DIR/include/version.mk" ]]; then
   TREE_DIST="$(printf '%s' "$TREE_DIST" | tr '[:upper:]' '[:lower:]')"
 fi
 
-# ── ① = immortalwrt：不许有 NSS ────────────────────────────────
-# NSS 的 Wi-Fi offload 由 ppe-nss 树内的 nss-wifi-drv 提供，还改了 mac80211
-# 的 ath11k 源码 —— 补丁补不出来，只能整树用。所以 imm + NSS 这个组合物理上
-# 不存在：要么静默编出一个"imm 但不带 NSS"的固件（用户以为拿到了 NSS），
-# 要么当场失败。选后者。
-if [[ "$DISTRO" == "immortalwrt" ]]; then
-  [[ "$NSS" == "0" ]] || die \
-    "① = immortalwrt 时不支持 NSS：nss-wifi-drv 只存在于 JuliusBairaktaris/openwrt-ppe-nss 整树（openwrt main 的 fork），补丁补不出来。" \
-    "二选一：要 ImmortalWrt 就把 NSS 设为 0；要 NSS 就把 DISTRO 改成 openwrt。"
-  if (( HAS_NSS_WIFI_DRV )) || (( HAS_PPE_SEED )); then
-    die "① = immortalwrt 但检出的是 ppe-nss 树（package/kernel/nss-wifi-drv 存在）—— 编出来会是 OpenWrt，不是 ImmortalWrt"
-  fi
-fi
-
-# ── NSS=1：必须是 ppe-nss 树，且两样东西都得在 ─────────────────
-# 这两条断言是本脚本最值钱的部分。ppe-nss 的 .config 里有一堆 imm/openwrt
-# 不认识的符号（CONFIG_PACKAGE_kmod-nss-wifi-drv / CONFIG_ATH11K_NSS_WIFI /
-# CONFIG_NSS_FIRMWARE_VERSION_12_5 …）。树不对时 `make defconfig` 会**静默
-# 丢掉**它们，固件照样编出来、名字一样、刷进去也能开机 —— 只是 Wi-Fi 走的
-# 还是 CPU。宁可在第一步就炸。
+# ── NSS=1：先看树里有没有 ppe-nss 的 seed，决定「整树」还是「移植」──
+# 判据用 seed 而不是 nss-wifi-drv 目录：移植线跑完以后树里也会有那个目录，
+# 拿目录当判据的话，第二次跑就会把「移植过的 imm」认成「ppe-nss 整树」，
+# 然后因为缺少 seeds/ 而失败 —— 明明什么都没错。
 if [[ "$NSS" == "1" ]]; then
-  (( HAS_NSS_WIFI_DRV )) || die \
-    "NSS=1 但 $OPENWRT_DIR 里没有 package/kernel/nss-wifi-drv —— 这不是 ppe-nss 树，编出来会静默降级成无 NSS 的固件"
-  (( HAS_PPE_SEED )) || die \
-    "NSS=1 但 $OPENWRT_DIR 里没有 seeds/qualcommax-nss-wifi.seed —— ppe-nss 分支选错了？"
-  [[ -d "$OPENWRT_DIR/target/linux/qualcommax" ]] || die \
-    "NSS=1 但树里没有 target/linux/qualcommax —— 检出的不是这个 target 的源码"
-
-  # ppe-nss 的 nss-packages 分支只提供 nss-firmware，驱动在树里。
-  export NSS_FEED="src-git nss https://github.com/JuliusBairaktaris/nss-packages.git;ppe-nss"
-  # 顺序要紧：树的 seed 先上（提供全部 NSS 符号），本仓库的 nss.config 后上
-  # （只做减法 —— 关掉 seed 里在原版 feed 上取不到的可选包，否则符号校验会红）。
-  [[ -f "$BUILDER_DIR/configs/nss.config" ]] || die "缺少 configs/nss.config"
-  [[ -f "$OPENWRT_DIR/seeds/qualcommax-nss-wifi.seed" ]] \
-    || die "ppe-nss 树里没有 seeds/qualcommax-nss-wifi.seed"
-  EXTRA_LAYERS=(
-    "$OPENWRT_DIR/seeds/qualcommax-nss-wifi.seed"
-    "$BUILDER_DIR/configs/nss.config"
-  )
-
-else
-  # ── NSS=0：树里不能有 NSS 的东西，否则说明检出了 ppe-nss ──────
-  if (( HAS_NSS_WIFI_DRV )) || (( HAS_PPE_SEED )); then
-    die "NSS=0 但检出的是 ppe-nss 树（package/kernel/nss-wifi-drv 存在）—— 参数与树不一致"
+  if (( HAS_PPE_SEED )); then
+    NSS_MODE=tree
+  else
+    NSS_MODE=port
   fi
-  # 显式置空：prepare-build.sh 用 ${NSS_FEED-…} 区分「未设置」和「空」，
-  # 空串才会真正跳过 feed 追加与 feeds/nss 守卫。
-  export NSS_FEED=""
-  EXTRA_LAYERS=()
+else
+  NSS_MODE=none
 fi
+
+case "$NSS_MODE" in
+  tree)
+    # 整树：两样东西都得在。ppe-nss 的 .config 里有一堆别处不认识的符号
+    # （CONFIG_PACKAGE_kmod-nss-wifi-drv / CONFIG_ATH11K_NSS_WIFI /
+    # CONFIG_NSS_FIRMWARE_VERSION_12_5 …）。树不对时 `make defconfig` 会
+    # **静默丢掉**它们，固件照样编出来、名字一样、刷进去也能开机 —— 只是
+    # Wi-Fi 走的还是 CPU。宁可在第一步就炸。
+    (( HAS_NSS_WIFI_DRV )) || die \
+      "树里有 seeds/qualcommax-nss-wifi.seed 却没有 package/kernel/nss-wifi-drv —— 半棵树，分支选错了？"
+    [[ -d "$OPENWRT_DIR/target/linux/qualcommax" ]] || die \
+      "NSS=1 但树里没有 target/linux/qualcommax —— 检出的不是这个 target 的源码"
+
+    # ppe-nss 的 nss-packages 分支只提供 nss-firmware，驱动在树里。
+    export NSS_FEED="src-git nss https://github.com/JuliusBairaktaris/nss-packages.git;ppe-nss"
+    # 顺序要紧：树的 seed 先上（提供全部 NSS 符号），本仓库的 nss.config 后上
+    # （只做减法 —— 关掉 seed 里在原版 feed 上取不到的可选包，否则符号校验会红）。
+    [[ -f "$BUILDER_DIR/configs/nss.config" ]] || die "缺少 configs/nss.config"
+    EXTRA_LAYERS=(
+      "$OPENWRT_DIR/seeds/qualcommax-nss-wifi.seed"
+      "$BUILDER_DIR/configs/nss.config"
+    )
+    ;;
+
+  port)
+    # 移植：树里没有 nss-wifi-drv，就把 ppe-nss 那三样搬过来。
+    # 下面这个脚本是唯一动树的地方 —— 它按锚点插挂钩、插不上就失败，
+    # 所以「搬了一半」不可能静默通过。
+    [[ -f "$BUILDER_DIR/scripts/integrate-nss-wifi.sh" ]] ||
+      die "缺少 scripts/integrate-nss-wifi.sh —— 移植线没法成立"
+    [[ -f "$BUILDER_DIR/configs/nss-wifi-imm.config" ]] ||
+      die "缺少 configs/nss-wifi-imm.config"
+    [[ -d "$OPENWRT_DIR/target/linux/qualcommax" ]] || die \
+      "NSS=1 但树里没有 target/linux/qualcommax —— 检出的不是这个 target 的源码"
+
+    log "NSS 走移植线：从 ppe-nss 搬驱动与补丁进 $OPENWRT_DIR"
+    OPENWRT_DIR="$OPENWRT_DIR" \
+    NSS_WIFI_REF="${NSS_WIFI_REF:-ppe-nss}" \
+      bash "$BUILDER_DIR/scripts/integrate-nss-wifi.sh"
+
+    # 移植线的 feed 只要 nss-firmware 那一个包（驱动由我们搬进来的包提供）。
+    export NSS_FEED="src-git nss https://github.com/JuliusBairaktaris/nss-packages.git;ppe-nss"
+    EXTRA_LAYERS=( "$BUILDER_DIR/configs/nss-wifi-imm.config" )
+    ;;
+
+  none)
+    # ── NSS=0：树里不能是 ppe-nss 整树，否则说明检出了 ppe-nss ──────
+    if (( HAS_PPE_SEED )); then
+      die "NSS=0 但检出的是 ppe-nss 整树（seeds/qualcommax-nss-wifi.seed 存在）—— 参数与树不一致"
+    fi
+    # 移植线跑过的树会留下 nss-wifi-drv，但没有符号层它不会被编进去。
+    # 只提示，不失败 —— 复用同一棵树时这不是错。
+    (( HAS_NSS_WIFI_DRV )) && \
+      warn "树里有上次移植留下的 package/kernel/nss-wifi-drv；NSS=0 不会编它"
+    # 显式置空：prepare-build.sh 用 ${NSS_FEED-…} 区分「未设置」和「空」，
+    # 空串才会真正跳过 feed 追加与 feeds/nss 守卫。
+    export NSS_FEED=""
+    EXTRA_LAYERS=()
+    ;;
+esac
 
 # ── 树指纹核对：DISTRO 与树的自我声明必须一致 ──────────────────
 # imm 线上这一条最要紧：固件的 DISTRIB_ID 就取自这里。树检错了，
@@ -167,7 +193,7 @@ if [[ -n "$TREE_DIST" ]]; then
   if [[ "$DISTRO" == "immortalwrt" ]]; then expect_dist=immortalwrt; fi
   [[ "$TREE_DIST" == "$expect_dist" ]] || die \
     "树与参数不一致：DISTRO=$DISTRO 期望 ${expect_dist} 树，但 include/version.mk 的 VERSION_DIST 兜底值是 ${TREE_DIST}"
-  log "树指纹核对通过：${TREE_DIST}$([[ "$NSS" == "1" ]] && echo '（ppe-nss 整树）' || echo '')"
+  log "树指纹核对通过：${TREE_DIST}（$([[ "$NSS_MODE" == tree ]] && echo 'ppe-nss 整树' || echo '上游树')）"
 fi
 
 # ── 基座的 config 差异层 ────────────────────────────────────────
@@ -180,7 +206,11 @@ if [[ "$DISTRO" == "immortalwrt" ]]; then
   EXTRA_LAYERS=("$base_layer" "${EXTRA_LAYERS[@]}")
 fi
 
-if [[ "$NSS" == "1" ]]; then tree_label="ppe-nss 整树"; else tree_label="${DISTRO} 原始树"; fi
+case "$NSS_MODE" in
+  tree) tree_label="ppe-nss 整树" ;;
+  port) tree_label="${DISTRO} 原始树 + NSS 移植" ;;
+  *)    tree_label="${DISTRO} 原始树" ;;
+esac
 log "基座=$DISTRO  NSS=$NSS（树=$tree_label）  代理栈=$PROXY_STACK  sing-box=$SINGBOX_MODE"
 [[ -n "$EXTRA_PACKAGES" ]] && log "额外插件（kenzok8/small）：$EXTRA_PACKAGES"
 

@@ -1,80 +1,59 @@
-name: Build QHora-301W
+name: _build
 
-# 唯一的一条构建流水线。以前的 11 个 workflow 是「源 × 代理栈 × sing-box
-# 模式」的手工展开（每个 600~900 行，90% 逐字重复），已全部移入
-# archive/workflows/ 留档。现在所有差异都收敛成下面这几组输入，实际拼装
-# 由 scripts/prepare.sh 完成。
+# 两条线的共用实现。由 build-immortalwrt.yml / build-openwrt-nss.yml 通过
+# `uses:` 调用，不手动触发（workflow_dispatch 故意不开）。
 #
-# 三层选择，① 决定发行版（优先级最高）：
-#   ① 基座      immortalwrt / openwrt      固件 DISTRIB_ID 就是它
-#   ② NSS       仅 ①=openwrt 可用。是 → 整树切到 ppe-nss（有线 PPE +
-#               Wi-Fi offload）；否 → 纯上游 openwrt，不开任何 NSS 符号
-#   ③ 代理栈    daed / dae / honk / homeproxy / singbox / passwall / passwall2 / 不集成
-#               passwall  = v1（Lua 界面，luci-app-passwall）
-#               passwall2 = v2（ucode 界面，luci-app-passwall2）
-#
-# ⚠️ ① = immortalwrt 时 ② 必须为「否」，勾了「是」会当场失败（不静默降级）：
-#    NSS 的 Wi-Fi offload 由 ppe-nss 树内的 nss-wifi-drv 提供（openwrt main
-#    的 fork，不是 imm 的分支），还改了 mac80211 的 ath11k 源码 —— 补丁补不
-#    出来，只能整树用。所以「imm 想要 NSS」这件事物理上不存在，二选一。
+# 为什么合成一个 workflow_call 而不是两份复制的 yml：
+# 编译、缓存、产物校验、发 Release 这些步骤和「哪条线」无关，
+# 拆成两份以后任何一处修正都要改两遍，而漏改的那个不会报错 ——
+# 它只是继续用旧逻辑，安静地出固件。差异只有三个：源码树、distro 标签、
+# NSS 的落法，全部由调用方通过 inputs 传进来。
 
 on:
-  workflow_dispatch:
+  workflow_call:
     inputs:
+      flavor:
+        description: '产物名里的线标识（imm / nss）'
+        type: string
+        required: true
       distro:
-        description: '① 基座（决定发行版，优先级最高）'
-        type: choice
-        options: [immortalwrt, openwrt]
-        default: immortalwrt
-
+        description: '发行版：immortalwrt / openwrt（决定 prepare.sh 的符号层）'
+        type: string
+        required: true
       nss:
-        description: '② 集成 NSS（仅 ①=openwrt 可用；整树切到 ppe-nss）'
-        type: boolean
-        default: false
-
-      proxy:
-        description: '③ 代理栈'
-        type: choice
-        options: [daed, dae, honk, homeproxy, singbox, passwall, passwall2, none]
-        default: daed
-
-      singbox_mode:
-        description: 'sing-box 来源（仅 homeproxy / singbox 有意义）'
-        type: choice
-        options: [builtin, source]
-        default: builtin
-
-      extra_packages:
-        description: '额外插件（逗号分隔，从 kenzok8/small 取最新源码；可留空）'
+        description: 'NSS：1=开（按树自动选整树/移植），0=关'
         type: string
-        default: ''
-
-      imm_ref:
-        description: 'immortalwrt 基座 ref（仅 ①=immortalwrt 时生效）'
+        required: true
+      source_repo:
+        description: '基座源码仓库'
         type: string
-        default: 'master'
-
-      ppe_ref:
-        description: 'ppe-nss 分支（仅 ①=openwrt 且 ②=是 时生效）'
+        required: true
+      source_ref:
+        description: '基座 ref（分支 / tag / sha）'
+        type: string
+        required: true
+      nss_wifi_ref:
+        description: '移植 NSS 组件时从 ppe-nss 的哪个 ref 取'
         type: string
         default: 'ppe-nss'
-
+      proxy:
+        type: string
+        required: true
+      singbox_mode:
+        type: string
+        default: 'builtin'
+      extra_packages:
+        type: string
+        default: ''
       release:
-        description: '构建成功后发 Release'
         type: boolean
         default: false
-
       clean_build:
-        description: '不复用 dl / ccache 缓存'
         type: boolean
         default: false
 
 permissions:
   contents: write
-
-concurrency:
-  group: build-${{ github.ref }}-${{ inputs.distro }}-${{ inputs.nss }}-${{ inputs.proxy }}
-  cancel-in-progress: false
 
 env:
   TARGET: qualcommax
@@ -86,39 +65,23 @@ env:
 
 jobs:
   build:
-    # 标题同时写「基座」和「NSS」，因为 NSS 现在是 ① 的下属开关而不是
-    # 覆盖 ① 的东西：imm 线永远没有 NSS，openwrt 线才有加不加的选择。
-    # 以前 ② 覆盖 ① 时标题只能写树名，看起来就像"选了 imm 编成 openwrt"。
-    name: ${{ inputs.distro }}${{ inputs.nss && ' + NSS' || '' }} · ${{ inputs.proxy }}
+    name: ${{ inputs.flavor }} · ${{ inputs.proxy }}
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
     env:
-      # 两个名字是同一件事：prepare.sh 读 NSS，workflow 里的 shell 判断读
-      # NSS_FLAG。以前只有 NSS_FLAG，脚本一直拿不到这个参数，全靠它自己的
-      # 默认值 —— ② 一改成「否」就会因为「NSS=1 但树里没有 nss-wifi-drv」炸掉。
-      NSS: ${{ inputs.nss && '1' || '0' }}
-      NSS_FLAG: ${{ inputs.nss && '1' || '0' }}
+      # prepare.sh 读 NSS / DISTRO，它自己再决定「整树」还是「移植」。
+      NSS: ${{ inputs.nss }}
       DISTRO: ${{ inputs.distro }}
       PROXY_STACK: ${{ inputs.proxy }}
       SINGBOX_MODE: ${{ inputs.singbox_mode }}
       EXTRA_PACKAGES: ${{ inputs.extra_packages }}
+      NSS_WIFI_REF: ${{ inputs.nss_wifi_ref }}
       # prepare 阶段的几个脚本都要查 GitHub API（版本解析 / honk 的构建元数据）。
       # 不传 token 走的是匿名限额（60 次/小时/IP，runner 是共享 IP）。
       GH_TOKEN: ${{ github.token }}
 
     steps:
-      # 参数组合先校验，别等 20 分钟才在 prepare 里炸。imm + NSS 不存在，
-      # 与其静默降级成「imm 但不带 NSS」（用户以为拿到了 NSS），不如当场拒绝。
-      - name: 校验参数组合
-        run: |
-          set -euo pipefail
-          echo "① 基座 = ${DISTRO}    ② NSS = $([[ "$NSS_FLAG" == "1" ]] && echo 是 || echo 否)"
-          if [[ "$DISTRO" == "immortalwrt" && "$NSS_FLAG" == "1" ]]; then
-            echo "::error title=参数冲突::① = immortalwrt 没有 NSS 可集成 —— nss-wifi-drv 只存在于 ppe-nss 整树（openwrt main 的 fork），补丁补不出来。二选一：要 ImmortalWrt 就把 ② 改成「否」；要 NSS 就把 ① 改成 openwrt。" >&2
-            exit 1
-          fi
-
       - name: 释放磁盘空间
         # 全量编译约需 25-35GB，runner 根分区默认不够。
         run: |
@@ -139,16 +102,13 @@ jobs:
           # OpenWrt 自建 flex/bison 等 host 工具，宿主机只需最小集合。
           sudo apt-get update || true
           sudo apt-get install -y \
-            bzip2 g++ gawk gcc git glibc-source libncurses-dev make patch python3
+            bzip2 g++ gawk gcc git glibc-source libncurses-dev make patch python3 rsync
 
-      # ── 源码树：① 决定发行版，② 只在 ①=openwrt 时换树 ──────────
-      # 顺序就是优先级：先看 ①=imm → imm 树（NSS 无意义，上面已挡住）；
-      # 否则 ①=openwrt → 看 ②：是则 ppe-nss 整树，否则 openwrt main。
       - name: 检出基座源码
         uses: actions/checkout@v7
         with:
-          repository: ${{ inputs.distro == 'immortalwrt' && 'immortalwrt/immortalwrt' || (inputs.nss && 'JuliusBairaktaris/openwrt-ppe-nss' || 'openwrt/openwrt') }}
-          ref: ${{ inputs.distro == 'immortalwrt' && inputs.imm_ref || (inputs.nss && inputs.ppe_ref || 'main') }}
+          repository: ${{ inputs.source_repo }}
+          ref: ${{ inputs.source_ref }}
           fetch-depth: 1
           path: openwrt
 
@@ -157,11 +117,10 @@ jobs:
         with:
           path: builder
 
-      # ── 组装构建环境 ──────────────────────────────────────────
       - name: 环境预检
         run: |
           set -euo pipefail
-          for c in perl make git gcc g++ gawk bzip2 curl tar sha256sum patch python3; do
+          for c in perl make git gcc g++ gawk bzip2 curl tar sha256sum patch python3 rsync; do
             command -v "$c" >/dev/null 2>&1 ||
               { echo "::error::runner 上缺少必需工具：$c"; exit 1; }
           done
@@ -170,9 +129,8 @@ jobs:
           echo "树：$(git -C openwrt log -1 --format='%h %s')"
 
       - name: 准备构建环境（feeds + .config + 覆盖文件）
-        # 所有分支判断都在脚本里，这里只是把三层参数传下去。
-        # prepare.sh 会先用「树指纹」核对传入的 NSS 与检出的树是否一致，
-        # 不一致直接失败 —— 这是防「静默编出无 NSS 固件」的唯一防线。
+        # 三种 NSS 落法（关 / 整树 / 移植）全在脚本里判断，这里只传参数。
+        # 移植线会在这一步把 ppe-nss 的驱动与补丁搬进树，并核对 backports 基线。
         id: prepare
         run: |
           set -o pipefail
@@ -201,16 +159,16 @@ jobs:
           } >>"$GITHUB_ENV"
 
       # ── 源码包缓存 ────────────────────────────────────────────
-      # key 里带 NSS 和代理栈：各线的包集合不同，混用只会互相顶掉。
+      # key 里带线标识和代理栈：各线的包集合不同，混用只会互相顶掉。
       - name: 恢复源码包缓存
         if: inputs.clean_build == false
         uses: actions/cache/restore@v6
         with:
           path: openwrt/dl
-          key: dl-${{ env.NSS_FLAG }}-${{ inputs.proxy }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: dl-${{ inputs.flavor }}-${{ inputs.proxy }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            dl-${{ env.NSS_FLAG }}-${{ inputs.proxy }}-
-            dl-${{ env.NSS_FLAG }}-
+            dl-${{ inputs.flavor }}-${{ inputs.proxy }}-
+            dl-${{ inputs.flavor }}-
 
       - name: 下载源码包
         id: download
@@ -237,7 +195,7 @@ jobs:
         uses: actions/cache/save@v6
         with:
           path: openwrt/dl
-          key: dl-${{ env.NSS_FLAG }}-${{ inputs.proxy }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: dl-${{ inputs.flavor }}-${{ inputs.proxy }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       # ── ccache ────────────────────────────────────────────────
       # key 带上工具链目录树哈希 + 工具链配置：任一项变了就从空缓存开始。
@@ -251,7 +209,7 @@ jobs:
             grep -E '^CONFIG_(BINUTILS|GCC|LIBC|MUSL|GLIBC)_' openwrt/.config
             gcc --version; as --version
           } | sha256sum | cut -c1-16)
-          echo "prefix=ccache-qhora301w-${NSS_FLAG}-${{ inputs.proxy }}-$sum-" >>"$GITHUB_OUTPUT"
+          echo "prefix=ccache-qhora301w-${{ inputs.flavor }}-${{ inputs.proxy }}-$sum-" >>"$GITHUB_OUTPUT"
 
       - name: 恢复 ccache
         if: inputs.clean_build == false
@@ -324,11 +282,11 @@ jobs:
           {
             echo "## ${DEVICE_LABEL} 构建产物"
             echo
-            echo "- 实际源码：\`$(git -C openwrt remote get-url origin)\` @ \`$(git -C openwrt rev-parse --short HEAD)\`"
-            if [[ "$NSS_FLAG" == "1" ]]; then
-              echo "- NSS：集成（ppe-nss 整树 = openwrt main + Wi-Fi offload，① 仍为 openwrt）"
+            echo "- 线：\`${{ inputs.flavor }}\` · 源码：\`$(git -C openwrt remote get-url origin)\` @ \`$(git -C openwrt rev-parse --short HEAD)\`"
+            if [[ "$NSS" == "1" ]]; then
+              echo "- NSS：集成（Wi-Fi 卸载 + 有线加速）"
             else
-              echo "- NSS：不集成（① = \`$DISTRO\` 的原始树）"
+              echo "- NSS：不集成"
             fi
             echo "- 代理栈：\`${PROXY_STACK}\` / sing-box：\`${SINGBOX_MODE}\`"
             echo
@@ -341,12 +299,12 @@ jobs:
       # .config 里写 =y 只证明"被选中"，不证明"编出来了"。三个角度互相独立：
       #   ① 包文件（apk 后端 .apk / opkg 后端 .ipk）
       #   ② rootfs 的 .manifest —— 最终固件里实际装了什么
-      #   ③ 内核 BTF —— daed/dae 的 CO-RE 前提（只有这两条线要查）
+      #   ③ 内核 BTF —— daed/dae/honk 的 CO-RE 前提（只有这三条线要查）
       - name: 校验功能包是否真的编进固件
         run: |
           set -euo pipefail
           out="openwrt/bin/targets/${TARGET}/${SUBTARGET}"
-          WANT="$(DISTRO="$DISTRO" NSS="$NSS_FLAG" PROXY_STACK="$PROXY_STACK" \
+          WANT="$(DISTRO="$DISTRO" NSS="$NSS" PROXY_STACK="$PROXY_STACK" \
                   EXTRA_PACKAGES="$EXTRA_PACKAGES" bash "$BUILDER_DIR/scripts/wanted-packages.sh")"
           echo "本变体要求 $(wc -w <<<"$WANT") 个功能包"
 
@@ -394,16 +352,11 @@ jobs:
           echo "功能包与内核前提全部通过"
 
       # ── 出厂预置是否真的进了镜像 ──────────────────────────────
-      # 覆盖层是**静默合并**的：prepare-build.sh 的 `cp -a files-<栈>/. files/`
-      # 对不存在的目录直接跳过，目录名拼错、被 .gitignore 吃掉都不报错。
-      # 编出来的固件照样能刷能开机，只是打开配置页面是空的 —— 只有刷完机
-      # 才发现，代价一个固件周期。
-      #
-      # 已有的守卫只覆盖一半：check-no-credentials.sh 管"里面有没有凭据"，
-      # prepare-build.sh 的断言只管 dae / daed / honk / passwall 那几个点名文件。
-      # 这一步是**按覆盖层逐个文件**核对拼镜像之前的 root-*：
-      # 存在性、逐字节内容、以及那几条「权限即功能」的期望值
-      # （uci-defaults 不可执行 = 首启不跑；dae/honk 配置不是 0600 = 服务拒绝启动）。
+      # 覆盖层是**静默合并**的：`cp -a files-<栈>/. files/` 对不存在的目录
+      # 直接跳过，目录名拼错、被 .gitignore 吃掉都不报错。编出来的固件照样
+      # 能刷能开机，只是打开配置页面是空的 —— 只有刷完机才发现。
+      # 这一步按覆盖层逐个文件核对拼镜像之前的 root-*：存在性、逐字节内容、
+      # 以及那几条「权限即功能」的期望值。
       - name: 校验出厂预置是否进了镜像
         run: bash "$BUILDER_DIR/scripts/verify-presets.sh" --tree openwrt
 
@@ -412,7 +365,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: qhora-301w-${{ inputs.nss && 'nss' || (inputs.distro == 'immortalwrt' && 'imm' || 'openwrt') }}-${{ inputs.proxy }}-${{ github.run_number }}
+          name: qhora-301w-${{ inputs.flavor }}-${{ inputs.proxy }}-${{ github.run_number }}
           path: |
             openwrt/bin/targets/qualcommax/ipq807x/*qnap_301w*
             openwrt/bin/targets/qualcommax/ipq807x/*.manifest
@@ -429,10 +382,7 @@ jobs:
         if: inputs.release
         id: tag
         run: |
-          if [[ "$NSS_FLAG" == "1" ]]; then flavor=nss
-          elif [[ "$DISTRO" == "immortalwrt" ]]; then flavor=imm
-          else flavor=openwrt; fi
-          echo "tag=qhora-301w-${flavor}-${PROXY_STACK}-$(date -u +%Y%m%d)-${GITHUB_RUN_NUMBER}" >>"$GITHUB_OUTPUT"
+          echo "tag=qhora-301w-${{ inputs.flavor }}-${PROXY_STACK}-$(date -u +%Y%m%d)-${GITHUB_RUN_NUMBER}" >>"$GITHUB_OUTPUT"
 
       - name: 生成 Release 说明
         if: inputs.release
@@ -450,18 +400,23 @@ jobs:
           DATE_CN="$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M')"
           UP_COMMIT="$(git -C openwrt log -1 --format='%h · %cs' 2>/dev/null || echo '?')"
           OW_VER="$(sed -n 's/^RELEASE:=//p' openwrt/include/version.mk 2>/dev/null | head -n1)"
+          if [[ "$NSS" == "1" ]]; then
+            NSS_ROW='集成（Wi-Fi 卸载 + 有线加速）'
+          else
+            NSS_ROW='不集成'
+          fi
 
           {
-            printf '# QHora-301W · %s 固件\n\n' "$([[ "$NSS_FLAG" == "1" ]] && echo 'openwrt + NSS' || echo "$DISTRO")"
+            printf '# QHora-301W · %s 固件\n\n' "$DISTRO"
             printf '| | |\n|---|---|\n'
             printf '| **编译时间** | %s（北京时间） |\n' "$DATE_CN"
-            printf '| **发行版** | `%s`%s |\n' "$DISTRO" "$([[ "$NSS_FLAG" == "1" ]] && echo '（② = 是）' || echo '')"
-            printf '| **NSS** | %s |\n' "$([[ "$NSS_FLAG" == "1" ]] && echo '集成（PPE 有线 + Wi-Fi offload，整树 ppe-nss）' || echo '不集成')"
+            printf '| **发行版** | `%s` |\n' "$DISTRO"
+            printf '| **NSS** | %s |\n' "$NSS_ROW"
             printf '| **代理栈** | `%s` |\n' "$PROXY_STACK"
             printf '| **源码** | `%s` @ `%s` |\n' "$(git -C openwrt remote get-url origin)" "$UP_COMMIT"
             printf '| **OpenWrt** | %s |\n\n' "${OW_VER:-未知}"
             printf '## 组件版本（取自固件 rootfs 清单）\n\n| 组件 | 版本 |\n|---|---|\n'
-            for p in $(DISTRO="$DISTRO" NSS="$NSS_FLAG" PROXY_STACK="$PROXY_STACK" \
+            for p in $(DISTRO="$DISTRO" NSS="$NSS" PROXY_STACK="$PROXY_STACK" \
                        bash "$BUILDER_DIR/scripts/wanted-packages.sh"); do
               printf '| `%s` | %s |\n' "$p" "$(ver_of "$p")"
             done
@@ -477,7 +432,7 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
-          name: QHora-301W ${{ inputs.nss && 'NSS' || '上游' }} ${{ inputs.proxy }} #${{ github.run_number }}
+          name: QHora-301W ${{ inputs.flavor }} ${{ inputs.proxy }} #${{ github.run_number }}
           draft: false
           prerelease: false
           body_path: release-notes.md

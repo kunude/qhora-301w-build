@@ -16,9 +16,10 @@
 #
 # ⚠️ NSS 相关的包名分两代，不要混：
 #   老 edma-nss 栈：kmod-qca-nss-drv / kmod-qca-nss-ecm / nssqos / nss-tools
-#   新 ppe-nss 栈：kmod-nss-wifi-drv / nss-firmware-ipq807x / qca-ppe-qos
-#   本脚本只跟新栈。NSS=1 只可能出现在 openwrt 基座（ppe-nss 整树）上，
-#   老栈的包名在那棵树里根本不存在。
+#   新栈（整树与 imm 移植都是它）：kmod-nss-wifi-drv / nss-firmware-ipq807x
+#   本脚本只跟新栈。NSS=1 现在有两条实现（openwrt 整树 / imm 移植），
+#   但两者产出的包名完全一样：驱动包都叫 kmod-nss-wifi-drv，固件都来自
+#   nss-packages feed。所以这里不需要按基座分支。
 #
 set -Eeuo pipefail
 
