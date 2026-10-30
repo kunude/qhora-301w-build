@@ -105,8 +105,16 @@ jobs:
             /opt/az \
             /usr/share/miniconda \
             /usr/local/share/boost \
-            /usr/local/share/powershell || true
+            /usr/local/share/powershell \
+            /usr/local/share/chromium \
+            /usr/local/share/chrome \
+            /opt/google \
+            /opt/microsoft \
+            /usr/local/go \
+            /usr/lib/jvm || true
           sudo apt-get clean
+          # 预装镜像可能还占着几 G，能删就删（不需要 docker 构建）
+          sudo docker image prune -af >/dev/null 2>&1 || true
           df -h / | tail -1
           free -g | head -2
 
@@ -225,9 +233,14 @@ jobs:
           } | sha256sum | cut -c1-16)
           echo "prefix=ccache-qhora301w-${{ inputs.flavor }}-${{ inputs.proxy }}-$sum-" >>"$GITHUB_OUTPUT"
 
+      # 用 restore/save 两步而不是 actions/cache 一步：后者的存盘是
+      # post-if: success()，也就是**只有整个 job 成功才存**。
+      # 于是失败的那几次永远存不下 ccache，下一次又从零编工具链，
+      # 每次白扔 70 分钟（2026-10-30 那两次就是这样，恢复只用了 0 秒）。
       - name: 恢复 ccache
+        id: ccache-restore
         if: inputs.clean_build == false
-        uses: actions/cache@v6
+        uses: actions/cache/restore@v6
         with:
           path: openwrt/.ccache
           key: ${{ steps.ccache.outputs.prefix }}${{ github.run_id }}
@@ -241,46 +254,73 @@ jobs:
           CCACHE_MAXSIZE: 5G
           BUILD_LOG: ${{ runner.temp }}/build.log
         run: |
-          # 故意不加 -e：make 失败要自己接住，好决定是否单线程重跑。
+          # ⚠️ run 块默认是 `bash -e {0}`，-e 一开始就是开的。
+          # 以前这里只写 `set -uo pipefail`，结果一开 pipefail，
+          # `make | tee` 就返回 make 的非零码，-e 立刻把脚本杀掉 ——
+          # 「单线程重跑拿完整报错」和「失败现场」两段根本没机会执行，
+          # 日志正好停在 make 最后一行（2026-10-30 那次 CI 就是这样）。
+          # 所以要接住 make 的失败，必须先把 -e 关掉。
+          set +e
           set -uo pipefail
           : >"$BUILD_LOG"
+          # 全部构建动作放进子 shell，整体输出 pipe 给 tee：
+          # OpenWrt 默认把每个包的编译输出藏在 logs/package/... 里，
+          # 只有 -j1 V=s 重跑才会打到控制台 —— 以前那段只在控制台，
+          # artifact 里看不到。用子 shell 而不是 exec 重定向，是为了让
+          # 子 shell 退出时管道立刻关闭，tee 一定把尾巴写完再上传。
+          (
           # 起编前先看一眼余量：宁可在这里明确红掉，也不要编一小时以后
           # 以"某个包 failed to build"的形式失败 —— 那种报错会把人带偏。
-          # 阈值取 8 GiB：另一条线在 ~14 GiB 上编成功过，卡太严会把好构建也拦掉。
+          # 实测整树占用：build_dir 22G + staging 2G + dl 1.6G + ccache 3G
+          # ≈ 30G。低于 8G 直接红（必然写满），低于 30G 先警告 ——
+          # 真实剩余空间会记进日志，好判断是不是又被满盘坑了。
           avail_mb=$(df -Pm / | awk 'NR==2{print $4}')
           echo "可用空间：${avail_mb} MiB"
           if (( avail_mb < 8192 )); then
-            echo "::error::根分区只剩 ${avail_mb} MiB，全量编译必然中途写满；先清理磁盘再跑"
+            echo "::error::根分区只剩 ${avail_mb} MiB，全量编译要 ~30 GiB，中途必然写满；先清理磁盘再跑"
             exit 1
-          elif (( avail_mb < 15360 )); then
-            echo "::warning::根分区只剩 ${avail_mb} MiB，可能不够全量编译（历史成功值 ~14 GiB+）"
+          elif (( avail_mb < 30720 )); then
+            echo "::warning::根分区只剩 ${avail_mb} MiB，低于实测的 ~30 GiB，可能撑不到最后"
           fi
-          make -j"$(nproc)" 2>&1 | tee -a "$BUILD_LOG"
-          rc=${PIPESTATUS[0]}
+          make -j"$(nproc)"
+          rc=$?
           if (( rc != 0 )); then
             echo "::warning::并行编译失败（make 退出码 $rc），改用单线程 -j1 V=s 重跑以拿到完整报错"
-            make -j1 V=s 2>&1 | tee -a "$BUILD_LOG"
-            rc=${PIPESTATUS[0]}
+            make -j1 V=s
+            rc=$?
           fi
-          staging_dir/host/bin/ccache -s 2>&1 | tee -a "$BUILD_LOG" || true
+          staging_dir/host/bin/ccache -s || true
           if (( rc != 0 )); then
-            # 失败现场的三样东西，缺一样就得靠猜：
+            # 失败现场的四样东西，缺一样就得靠猜：
             #   ① 资源 —— 满盘的典型症状是"包级报错但没有编译错误"，很容易
             #      被误判成配方问题（本仓库真实踩过：C 盘满导致解包截断）。
-            #   ② 失败包自己的日志 —— config.log 里有 configure 的真实原因。
-            #   ③ build.log 尾部 —— 由下一步回放。
-            {
-              echo "===== 失败现场 ====="
-              df -h / "$RUNNER_TEMP" 2>/dev/null || df -h /
-              free -g 2>/dev/null || true
-              echo "--- 最近改动的包构建目录（含 configure 日志尾部）---"
-              for d in $(find build_dir/target-* build_dir/hostpkg -maxdepth 1 -mindepth 1 -type d \
-                           -newermt '-40 minutes' 2>/dev/null | head -6); do
-                echo "### $d"
-                [ -f "$d/config.log" ] && tail -12 "$d/config.log"
-              done
-            } 2>&1 | tee -a "$BUILD_LOG"
+            #   ② 失败包自己的日志 —— logs/package 里的 compile.txt 才是
+            #      真正的报错；回退到 config.log（configure 阶段失败时只有它）。
+            #   ③ 源码包 —— 包下载/校验出问题时 dl 里那个文件大小会不对。
+            #   ④ build.log 尾部 —— 由下一步回放。
+            echo "===== 失败现场 ====="
+            df -h / "$RUNNER_TEMP" 2>/dev/null || df -h /
+            free -g 2>/dev/null || true
+            echo "--- 最近改动的包日志（logs/package，真正的报错在这里）---"
+            for f in $(find logs/package -name '*.txt' -newermt '-40 minutes' 2>/dev/null | head -8); do
+              echo "### $f"
+              tail -40 "$f"
+            done
+            echo "--- 最近改动的包构建目录（含 configure 日志尾部）---"
+            for d in $(find build_dir/target-* build_dir/hostpkg -maxdepth 1 -mindepth 1 -type d \
+                         -newermt '-40 minutes' 2>/dev/null | head -6); do
+              echo "### $d"
+              [ -f "$d/config.log" ] && tail -12 "$d/config.log"
+            done
+            echo "--- dl 里最近的源码包 ---"
+            ls -lt dl 2>/dev/null | head -8
             echo "编译失败：make 最终退出码 $rc。完整日志见下一步「回放编译日志」，并作为 artifact 上传。"
+          fi
+          exit "$rc"
+          ) 2>&1 | tee -a "$BUILD_LOG"
+          rc=${PIPESTATUS[0]}
+          if (( rc != 0 )); then
+            echo "编译失败（退出码 $rc），日志已写入 $BUILD_LOG"
             exit "$rc"
           fi
           echo "编译通过"
@@ -297,7 +337,7 @@ jobs:
           # 作业日志要 admin 权限才能从 API 取，注解是公开可读的。
           # 模式要宽：只有 4 条的老写法漏掉了"满盘 / 被 kill / 缺工具"这三类
           # ——它们不打印 "error:"，恰恰是最难猜的。顺序有意义：越靠后越具体。
-          grep -nE '(No space left on device|Killed|Out of memory|Cannot allocate memory|command not found|: not found|Permission denied|No rule to make target|undefined reference to|cannot find -l|fatal error:|\*\*\* \[.*\] Error [0-9]+|ERROR: )' "$BUILD_LOG" |
+          grep -nE '(No space left on device|Killed|Out of memory|Cannot allocate memory|command not found|: not found|Permission denied|No rule to make target|undefined reference to|cannot find -l|fatal error:|configure: error|Error [0-9]+$|\*\*\* \[.*\] Error [0-9]+|ERROR: )' "$BUILD_LOG" |
             tail -25 | while IFS= read -r line; do
               echo "::error title=编译报错::$line"
             done || true
@@ -306,14 +346,27 @@ jobs:
       # 注解只装得下几十行，且失败原因往往在更早的位置。build.log 落成
       # artifact 之后，没有仓库 admin 权限也能拿到（actions/jobs/{id}/logs
       # 对公开仓库同样返回 403，实测过）。
+      # openwrt/logs 一起带上：每个包的 compile.txt 才是原始报错。
       - name: 上传编译日志
         if: failure()
         uses: actions/upload-artifact@v7
         with:
           name: build-log-${{ inputs.flavor }}-${{ inputs.proxy }}-${{ github.run_number }}
-          path: ${{ runner.temp }}/build.log
+          path: |
+            ${{ runner.temp }}/build.log
+            openwrt/logs
           if-no-files-found: warn
           retention-days: 7
+
+      # 提前存 ccache，且失败也存（见「恢复 ccache」上面的说明）。
+      # 放在编译之后、校验产物之前：无论成败，编过的东西都留下来。
+      - name: 保存 ccache
+        if: always() && inputs.clean_build == false && steps.ccache-restore.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v6
+        with:
+          path: openwrt/.ccache
+          key: ${{ steps.ccache.outputs.prefix }}${{ github.run_id }}
 
       - name: 收集并校验产物
         run: |
