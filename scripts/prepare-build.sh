@@ -932,6 +932,15 @@ if [[ "$PROXY_STACK" == "honk" && -f files/etc/honk/config.dae ]]; then
   log "honk 恢复出厂模板已对齐：/usr/share/honk/default-config.dae = 出厂 config.dae（默认出口 proxy）"
 fi
 
+# ── 6a-0. dns.routing.request 的规则行号 ───────────────────────
+# 出厂配置往 DNS 层塞了几条拦截规则，而它们的**顺序**是硬要求：广告分类与
+# 国内域名的 HTTPS RR 必须排在 `qname(geosite:cn) -> <上游>` 之前。放到后面
+# 不会报错、不会崩、不会警告，只是永远命中不到 —— 构建、刷机、开机全绿，
+# 只有用户觉得"广告还是没拦干净"。所以顺序在构建期就用行号比出来。
+_dns_rule_line() { # $1=配置文件 $2=ERE  →  输出首个匹配行号（无匹配则空）
+  grep -nE "$2" "$1" 2>/dev/null | head -n1 | cut -d: -f1
+}
+
 # ── 6a. dae 覆盖层的两道断言 ───────────────────────────────────
 # files-<PROXY_STACK>/ 是"目录不存在就静默跳过"的，写错目录名不会报错，
 # 只会编出一份**没有骨架配置**的固件 —— 刷进去 dae 一启动就因为找不到
@@ -958,6 +967,25 @@ if [[ "$PROXY_STACK" == "dae" ]]; then
     die "dae 出厂配置里出现了**有效**的订阅链接或分享链接（固件是公开产物）" \
         "把值删掉、只保留注释掉的示例；真正的节点在设备上填"
   fi
+  # DNS 层拦截：存在性 + 顺序（顺序为什么是硬要求见 6a-0）
+  _ln_ads=$(_dns_rule_line "$dae_conf" '^[[:space:]]*qname\(geosite:[[:space:]]*category-ads-all\)[[:space:]]*->[[:space:]]*reject')
+  _ln_https=$(_dns_rule_line "$dae_conf" '^[[:space:]]*qtype\(HTTPS\).*->[[:space:]]*reject')
+  _ln_cn=$(_dns_rule_line "$dae_conf" '^[[:space:]]*qname\(geosite:[[:space:]]*cn\)[[:space:]]*->')
+  [[ -n "$_ln_ads" ]] || die \
+    "$dae_conf 的 dns.routing.request 里没有广告拦截（qname(geosite:category-ads-all) -> reject）" \
+    "（DNS 层拒答比 routing 段的 block 更快：连接都不会发起）"
+  [[ -n "$_ln_https" ]] || die \
+    "$dae_conf 里没有 HTTPS RR 拦截（qtype(HTTPS) && qname(geosite:cn) -> reject）" \
+    "（国内站点回 ECHConfig 后客户端会尝试加密 ClientHello，直连被 reset）"
+  [[ -n "$_ln_cn" ]] || die \
+    "$dae_conf 里找不到 qname(geosite:cn) -> <上游> 这条国内域名规则"
+  ((_ln_ads < _ln_cn)) || die \
+    "$dae_conf 里广告拦截排在国内域名规则之后（第 $_ln_ads 行 vs 第 $_ln_cn 行）" \
+    "（cnzz / umeng 这类统计域名同时属于 cn 分类，排在后面就永远命中不到）"
+  ((_ln_https < _ln_cn)) || die \
+    "$dae_conf 里 HTTPS RR 拦截排在国内域名规则之后（第 $_ln_https 行 vs 第 $_ln_cn 行）"
+  unset _ln_ads _ln_https _ln_cn
+
   log "dae 出厂配置就位：无有效订阅/节点链接（订阅留空，实测该配置能通过 dae validate）"
 fi
 
@@ -990,6 +1018,25 @@ if [[ "$PROXY_STACK" == "honk" ]]; then
     die "$hk_conf 里还有 fallback: direct —— 命中它的流量永不出国" \
         "（routing 块最后一行应该是 proxy；direct 只保留在上面那几条明确规则里）"
   fi
+  # DNS 层拦截：存在性 + 顺序（顺序为什么是硬要求见 6a-0）
+  _ln_ads=$(_dns_rule_line "$hk_conf" '^[[:space:]]*qname\(geosite:[[:space:]]*category-ads-all\)[[:space:]]*->[[:space:]]*reject')
+  _ln_https=$(_dns_rule_line "$hk_conf" '^[[:space:]]*qtype\(HTTPS\).*->[[:space:]]*reject')
+  _ln_cn=$(_dns_rule_line "$hk_conf" '^[[:space:]]*qname\(geosite:[[:space:]]*cn\)[[:space:]]*->')
+  [[ -n "$_ln_ads" ]] || die \
+    "$hk_conf 的 dns.routing.request 里没有广告拦截（qname(geosite: category-ads-all) -> reject）" \
+    "（DNS 层拒答比 routing 段的 block 更快：连接都不会发起）"
+  [[ -n "$_ln_https" ]] || die \
+    "$hk_conf 里没有 HTTPS RR 拦截（qtype(HTTPS) && qname(geosite: cn) -> reject）" \
+    "（国内站点回 ECHConfig 后客户端会尝试加密 ClientHello，直连被 reset）"
+  [[ -n "$_ln_cn" ]] || die \
+    "$hk_conf 里找不到 qname(geosite: cn) -> <上游> 这条国内域名规则"
+  ((_ln_ads < _ln_cn)) || die \
+    "$hk_conf 里广告拦截排在国内域名规则之后（第 $_ln_ads 行 vs 第 $_ln_cn 行）" \
+    "（cnzz / umeng 这类统计域名同时属于 cn 分类，排在后面就永远命中不到）"
+  ((_ln_https < _ln_cn)) || die \
+    "$hk_conf 里 HTTPS RR 拦截排在国内域名规则之后（第 $_ln_https 行 vs 第 $_ln_cn 行）"
+  unset _ln_ads _ln_https _ln_cn
+
   log "honk 出厂配置就位：config.dae 含 include system.dae（native_api + doona），默认出口 proxy"
 fi
 

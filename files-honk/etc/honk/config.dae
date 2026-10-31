@@ -4,12 +4,20 @@
 #  来源：本仓库 files-honk/etc/honk/config.dae，由 prepare-build.sh 在叠加
 #        files/ 之后按变体叠加进固件（只有 honk 版固件带它）。
 #
-#  这份文件与 kenzok8/small 里 honk 包自带的 config.dae **功能段完全一致**
-#  （逐行对照过），只多了两类东西：
+#  这份文件以 kenzok8/small 里 honk 包自带的 config.dae 为底（逐行对照过），
+#  在上面做了四类改动：
 #    ① 注释：订阅要填在哪、面板在哪、哪些值不要动；
-#    ② 一行被注释掉的 ipversion_prefer（原因见下）。
-#  这么做是有意的：honk 处于 alpha，未知语法会让它**拒绝启动**，
-#  所以出厂配置不做任何"我觉得更好"的改动，只把该写清楚的地方写清楚。
+#    ② routing 的 `fallback: direct` → `proxy`（不改就是"装了代理也永不出国"）；
+#    ③ DNS 层三条规则：广告/追踪域名拒答、.lan/home.arpa 不送上游、国内域名
+#       不回 HTTPS RR（见 dns 段的注释）；
+#    ④ 一行被注释掉的 ipversion_prefer（原因见下）。
+#  除这四类之外不再动任何功能段。改得少是有意的：honk 处于 alpha，未知语法
+#  会让它**拒绝启动**，而"拒绝启动"在设备上只表现为"面板打不开、流量全直连"。
+#
+#  ⚠️ 因此改这几条规则时有两条纪律：
+#    · 只用 dae 语法里最基础的写法，不玩多值 / 不写正则；
+#    · 顺序不能动（广告与 HTTPS 两条必须排在 cn 规则之前，prepare-build.sh 会用
+#      行号比出来）。真在设备上遇到 honk 起不来，先按 dns 段里的"排障"逐条注释。
 #
 #  ⚠️ 本文件权限必须是 0600（prepare-build.sh 会强制收紧）。
 #     honk 与 dae 同源，配置里天生要放订阅链接，因此不接受 group/other 可读。
@@ -45,7 +53,36 @@ dns {
     }
     routing {
         request {
+            # ── 广告 / 追踪域名：DNS 层直接拒答 ──────────────────────────
+            # dae 那一族里"拦截"有两个落点，效果差很多：
+            #   · routing 段 `domain(...) -> block`：**先解析成功、再丢流量**，
+            #     客户端要等到连接超时；页面表现为"卡一会儿才跳过"。
+            #   · dns.routing.request `-> reject`：查询根本不落地，客户端立刻
+            #     拿到否定应答，连接都不发起。
+            # 后者更快也更省转发，所以放在这里。数据来自 v2ray-geosite 的
+            # category-ads-all 聚合分类（与 dae / daed 线用的同一份 .dat）。
+            #
+            # ⚠️ 顺序硬要求：必须在下面 `qname(geosite: cn) -> default` **之前**。
+            #    很多广告/统计域名（cnzz、umeng 这类）同时落在 cn 分类里，
+            #    放到 cn 规则之后就等于永远命中不到。
+            qname(geosite: category-ads-all) -> reject
+
+            # 内网域名不参与 DNS 路由（上游自带的那条，保序不动）
             qname(geosite: private) -> asis
+            # .lan / home.arpa 是家用惯例域名（RFC 8375），该由 dnsmasq 本地应答。
+            # 拆分两行而不是 `suffix: lan, home.arpa`：多值写法在本仓库没有先例，
+            # honk 是 alpha，语法不被接受时会**整个配置拒载**，宁可多写一行。
+            qname(suffix: lan) -> asis
+            qname(suffix: home.arpa) -> asis
+
+            # ── 国内域名一律不给 HTTPS RR ───────────────────────────────
+            # HTTPS 记录（type 65）是给 ECH / HTTP3 用的。对国内站点，返回它
+            # 反而有害：客户端拿到 ECHConfig 后会尝试加密 ClientHello，而
+            # 直连路径上往往直接被 reset，表现为"国内站偶发打不开、刷新就好"。
+            # 拒答后客户端回落到普通 A/AAAA，与分流判断也一致。
+            # 必须在 cn 规则之前 —— 否则 CN 域名已经由 `-> default` 应答了。
+            qtype(HTTPS) && qname(geosite: cn) -> reject
+
             qname(geosite: cn) -> default
             fallback: remote
         }
@@ -56,6 +93,16 @@ dns {
     # 修法，honk 沿用同一套配置语义；但本仓库没有在设备上验证过 honk 的
     # 行为，所以默认保持注释状态 —— 需要时再开。
     # ipversion_prefer: 4
+
+    # ── 真起不来时的排障顺序 ────────────────────────────────────────────
+    # honk 对不认识的语法是**整份拒载**：症状是 `honk-core` 起一下就退、日志里
+    # 只有一行 parse error + 行号、LuCI 面板打不开、局域网**全直连**。
+    # 按下面顺序逐条注释掉、每条改完重启一次，就能定位到是哪条不被接受：
+    #   1. qtype(HTTPS) && ... -> reject   ← 最可能，type 65 的写法依赖解析库版本
+    #   2. qname(suffix: lan) / home.arpa  ← `suffix:` 前缀在 qname() 里是否被接受
+    #   3. qname(geosite: category-ads-all) ← geosite 数据里缺这个分类
+    # 三条全部删掉也不影响出国：它们只是"拦截广告"和"少绕一圈"，都不是分流前提。
+    # 删掉之后记得同步改 prepare-build.sh 的断言（否则下次构建会判红）。
 }
 
 # 分流：私有网段 / 国内 IP / 国内域名走直连，**其余全部交给 proxy 组**。

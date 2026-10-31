@@ -229,6 +229,27 @@ dns {
     }
     routing {
         request {
+            # ── 广告 / 追踪：DNS 层拒答 ──────────────────────────────────
+            # routing 段里已有一条 `domain(geosite:category-ads-all) -> block`，
+            # 那是"解析成功后再丢流量"的兜底；这里再加 DNS 层拒答，让请求
+            # 根本不落地（客户端连连接都不会发起），页面跳过更快。
+            # 必须排在 `qname(geosite:cn) -> alidns` 之前：cnzz / umeng 这类
+            # 统计域名同时属于 cn 分类，放在后面就永远命中不到。
+            qname(geosite:category-ads-all) -> reject
+
+            # ── 家用惯例域名不进上游 ────────────────────────────────────
+            # .lan / home.arpa 该由 dnsmasq 本地应答。一旦被转发出去，
+            # 上游（尤其是 Google）只会回 NXDOMAIN，表现为内网设备名解析失败。
+            qname(suffix: lan) -> asis
+            qname(suffix: home.arpa) -> asis
+
+            # ── 国内域名不给 HTTPS RR ───────────────────────────────────
+            # HTTPS 记录（type 65）携带 ECHConfig。国内站点回这种记录，
+            # 客户端会尝试加密 ClientHello 走直连，结果被 reset —— 典型症状是
+            # "国内站偶发打不开、刷新一次就好"。拒答后回落普通 A/AAAA。
+            # 同样必须在 cn 规则之前。
+            qtype(HTTPS) && qname(geosite:cn) -> reject
+
             # 国内域名用国内 DNS
             qname(geosite:cn) -> alidns
             # 拉订阅本身也走国内 DNS，避免"订阅域名被污染 → 拉不到节点"

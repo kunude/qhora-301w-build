@@ -145,6 +145,23 @@ OpenWrt 在拼 rootfs 时原样铺上去。`etc/uci-defaults/*` 里的脚本在*
 | `files-passwall/` | `zz-passwall-preset` —— 在厂商默认配置之上打的薄补丁（见下） |
 | `files-honk/` | `/etc/honk/config.dae` —— 分组 / DNS / 分流 / 订阅占位，`include system.dae`（native_api + doona） |
 
+### 出厂 DNS 层的三条规则
+
+dae 与 honk 两条线的 `dns.routing.request` 里都预置了同样三条，顺序固定：
+
+| 规则 | 作用 | 为什么放在 DNS 层 |
+|---|---|---|
+| `qname(geosite: category-ads-all) -> reject` | 广告 / 追踪域名拒答 | 流量层的 `domain(...) -> block` 要**先解析成功再丢流量**，客户端得等到连接超时；DNS 层拒答请求根本不落地，页面直接跳过 |
+| `qname(suffix: lan) -> asis`<br>`qname(suffix: home.arpa) -> asis` | 家用惯例域名不送上游 | dnsmasq 该本地应答的域名一旦被转发出去，上游（尤其 Google）只会回 NXDOMAIN |
+| `qtype(HTTPS) && qname(geosite: cn) -> reject` | 国内域名不回 HTTPS RR | HTTPS 记录（type 65）带 ECHConfig；客户端拿到后会尝试加密 ClientHello 走直连，被 reset —— 典型症状是"国内站偶发打不开、刷新就好" |
+
+**顺序是硬要求**：前两条必须排在 `qname(geosite: cn) -> <上游>` **之前**。cnzz、
+umeng 这类统计域名同时属于 cn 分类，放后面就永远命中不到 —— 不报错、不崩、
+构建刷机全绿。所以 `prepare-build.sh` 用行号把这条顺序比出来（见 `6a-0`）。
+
+拆成 `suffix: lan` / `suffix: home.arpa` 两行而不是写成多值：多值写法在本仓库
+没有先例，honk 是 alpha，语法不被接受时**整个配置拒载** —— 宁可多写一行。
+
 ### 两个非显而易见的取舍
 
 **honk 的配置是"两份拼起来"的。** 我们的 `config.dae` 只管出站分组、DNS、分流和
