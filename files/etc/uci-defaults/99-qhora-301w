@@ -59,6 +59,26 @@ EOF
 	/etc/init.d/msd_lite enable
 fi
 
+# ── dnsmasq：放行 Windows 联网检测的私有地址应答 ─────────────
+# dns.msftncsi.com 的 AAAA 记录是 fd3e:4f5a:5b81::1 —— 微软**故意**用一段
+# ULA 地址（fc00::/7）让 Windows 校验 IPv6 通路是否可用。而 dnsmasq 默认开着
+# stop-dns-rebind：应答里只要出现私有段/环回地址，一律丢弃并在 syslog 记
+# "possible DNS-rebind attack detected"。
+#
+# 两者撞上的结果：
+#   - 每台 Windows 每 30 秒探测一次 → syslog 被这条 warning 刷屏（实测一晚 198 条）
+#   - IPv6 侧探测永远拿不到结果，Windows 可能误判"无法访问 Internet"
+#   - 而 A 记录 131.107.255.255 是公网，正常通过，所以"能上网但报无网络"
+#
+# 只对这一个域名放行（--rebind-domain-ok），rebind 保护本身保持开启 ——
+# 这是安全特性，不该为了消一条日志把它整个关掉。
+if uci -q show dhcp.@dnsmasq[0] >/dev/null 2>&1; then
+	if ! uci -q get dhcp.@dnsmasq[0].rebind_domain 2>/dev/null | grep -qx 'dns.msftncsi.com'; then
+		uci -q add_list dhcp.@dnsmasq[0].rebind_domain='dns.msftncsi.com'
+		uci -q commit dhcp
+	fi
+fi
+
 # ── WireGuard ───────────────────────────────────────────────
 # 协议本身没有常驻服务，kmod 由 AutoProbe 在建立 wg 接口时自动加载，
 # 这里没有需要启用的东西。隧道请到「网络 -> 接口」新建 wg 接口。
