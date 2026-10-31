@@ -314,6 +314,14 @@ jobs:
             done
             echo "--- dl 里最近的源码包 ---"
             ls -lt dl 2>/dev/null | head -8
+            # 本仓库的配置没开 BUILD_LOG，所以 logs/package 通常是空的。
+            # 退而求其次：从日志里认出失败的那个包，单独用 V=s 重编一次 ——
+            # 这是人工排查的标准动作，几秒钟就有结果，比再等一小时强。
+            echo "--- 单独重编失败的包（V=s，完整报错）---"
+            for p in $(grep -oE 'ERROR: [^ ]+ failed to build' "$BUILD_LOG" | awk '{print $2}' | sort -u | head -2); do
+              echo "### $p"
+              make "$p/compile" V=s 2>&1 | tail -60
+            done
             echo "编译失败：make 最终退出码 $rc。完整日志见下一步「回放编译日志」，并作为 artifact 上传。"
           fi
           exit "$rc"
