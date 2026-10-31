@@ -285,10 +285,16 @@ place() {
   #   PKG_BUILD_DEPENDS:=rust/host 置空交给新版决定。
   # immortalwrt 树里没有 include/rust-package.mk、feed 版 mk 也不带那个条件
   # ⇒ 两个门都过不去，整体跳过，行为不变。
+  #
+  # 第三个门（$$(RUST_ARCH_DEPENDS)）把范围收窄到**需要**迁移的配方：只有
+  # 用 define 模板写的包（passwall 的 shadowsocks-rust / shadow-tls）才带这个
+  # 双美元写法。smartdns 那份是顶层 $(RUST_ARCH_DEPENDS)（它的 smartdns-ui
+  # 才用 rust，本仓库不选），保持原样不动。
   local mk="$feed_dir/$dst_rel/Makefile"
   if [[ -f "$OPENWRT_DIR/include/rust-package.mk" ]] &&
      grep -q 'USE_RUST_TOOLCHAIN' "$OPENWRT_DIR/feeds/packages/lang/rust/rust-values.mk" 2>/dev/null &&
-     grep -q 'feeds/packages/lang/rust/rust-package.mk' "$mk"; then
+     grep -q 'feeds/packages/lang/rust/rust-package.mk' "$mk" &&
+     grep -q '\$\$(RUST_ARCH_DEPENDS)' "$mk"; then
     sed -i \
       -e 's#include $(TOPDIR)/feeds/packages/lang/rust/rust-package.mk#include $(INCLUDE_DIR)/rust-package.mk#' \
       -e 's#^PKG_BUILD_DEPENDS:=rust/host$#PKG_BUILD_DEPENDS:=#' \
