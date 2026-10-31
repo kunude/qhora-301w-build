@@ -55,11 +55,18 @@ on:
 permissions:
   contents: write
 
+# 变量名一律加 QH_ 前缀：env 块里的变量会进**每个**步骤的环境，而
+# autotools 的 configure 会按变量名读环境。真实踩过的坑：原先这里叫
+# `TARGET`，libffi 的 configure 用 autoconf-archive 的 AX_ENABLE_BUILDDIR，
+# 它把 `$TARGET` 当成外置构建目录名 —— 于是构建目录变成 build_dir/.../qualcommax/，
+# 而配方期望的是 aarch64-openwrt-linux*/fficonfig.h，编译到最后装头文件时才报
+# `cp: cannot stat .../fficonfig.h`，报错和真正的起因隔了 80 分钟。
+# 本地编永远不复现（本地没有这个变量），只有 CI 红。
 env:
-  TARGET: qualcommax
-  SUBTARGET: ipq807x
-  DEVICE: qnap_301w
-  DEVICE_LABEL: QHora-301W
+  QH_TARGET: qualcommax
+  QH_SUBTARGET: ipq807x
+  QH_DEVICE: qnap_301w
+  QH_DEVICE_LABEL: QHora-301W
   OPENWRT_DIR: ${{ github.workspace }}/openwrt
   BUILDER_DIR: ${{ github.workspace }}/builder
 
@@ -262,6 +269,11 @@ jobs:
           # 所以要接住 make 的失败，必须先把 -e 关掉。
           set +e
           set -uo pipefail
+          # 兜底：job 级 env 里的 NSS / DISTRO 只给 prepare.sh 用，编译用不到，
+          # 但它们会进 configure 的环境。autotools 按变量名读环境，历史上
+          # TARGET 就让 libffi 把构建目录建成了 build_dir/.../qualcommax/，
+          # 一路编到最后装头文件才报错（详见文件头 env 块的注释）。
+          unset TARGET SUBTARGET DEVICE DEVICE_LABEL NSS DISTRO 2>/dev/null || true
           : >"$BUILD_LOG"
           # 全部构建动作放进子 shell，整体输出 pipe 给 tee：
           # OpenWrt 默认把每个包的编译输出藏在 logs/package/... 里，
@@ -379,24 +391,24 @@ jobs:
       - name: 收集并校验产物
         run: |
           set -euo pipefail
-          out="openwrt/bin/targets/${TARGET}/${SUBTARGET}"
+          out="openwrt/bin/targets/${QH_TARGET}/${QH_SUBTARGET}"
           [[ -d "$out" ]] || { echo "::error::输出目录不存在：$out"; exit 1; }
           ls -lh "$out"
 
-          compgen -G "$out/*${DEVICE}*squashfs-sysupgrade.bin" >/dev/null ||
-            { echo "::error::$out 下没有 ${DEVICE} 的 sysupgrade 镜像"; exit 1; }
+          compgen -G "$out/*${QH_DEVICE}*squashfs-sysupgrade.bin" >/dev/null ||
+            { echo "::error::$out 下没有 ${QH_DEVICE} 的 sysupgrade 镜像"; exit 1; }
 
           if listing=$(cd "$out" && ls -lh . 2>/dev/null |
-                         grep -E "${DEVICE}|sha256sums|config\.buildinfo|profiles\.json|\.manifest|\.bom\.cdx\.json" |
+                         grep -E "${QH_DEVICE}|sha256sums|config\.buildinfo|profiles\.json|\.manifest|\.bom\.cdx\.json" |
                          awk '{print $5"  "$9}'); then
             while IFS= read -r line; do
               [ -n "$line" ] || continue
-              echo "::notice title=${DEVICE_LABEL} 产物::$line"
+              echo "::notice title=${QH_DEVICE_LABEL} 产物::$line"
             done <<<"$listing"
           fi
 
           {
-            echo "## ${DEVICE_LABEL} 构建产物"
+            echo "## ${QH_DEVICE_LABEL} 构建产物"
             echo
             echo "- 线：\`${{ inputs.flavor }}\` · 源码：\`$(git -C openwrt remote get-url origin)\` @ \`$(git -C openwrt rev-parse --short HEAD)\`"
             if [[ "$NSS" == "1" ]]; then
@@ -407,7 +419,7 @@ jobs:
             echo "- 代理栈：\`${PROXY_STACK}\` / sing-box：\`${SINGBOX_MODE}\`"
             echo
             echo '```'
-            (cd "$out" && ls -lh . | grep -E "${DEVICE}|sha256sums|config\.buildinfo|profiles\.json|\.manifest" || true)
+            (cd "$out" && ls -lh . | grep -E "${QH_DEVICE}|sha256sums|config\.buildinfo|profiles\.json|\.manifest" || true)
             echo '```'
           } >>"$GITHUB_STEP_SUMMARY"
 
@@ -419,7 +431,7 @@ jobs:
       - name: 校验功能包是否真的编进固件
         run: |
           set -euo pipefail
-          out="openwrt/bin/targets/${TARGET}/${SUBTARGET}"
+          out="openwrt/bin/targets/${QH_TARGET}/${QH_SUBTARGET}"
           WANT="$(DISTRO="$DISTRO" NSS="$NSS" PROXY_STACK="$PROXY_STACK" \
                   EXTRA_PACKAGES="$EXTRA_PACKAGES" bash "$BUILDER_DIR/scripts/wanted-packages.sh")"
           echo "本变体要求 $(wc -w <<<"$WANT") 个功能包"
@@ -504,7 +516,7 @@ jobs:
         if: inputs.release
         run: |
           set -uo pipefail
-          out="openwrt/bin/targets/${TARGET}/${SUBTARGET}"
+          out="openwrt/bin/targets/${QH_TARGET}/${QH_SUBTARGET}"
           manifest=$(find "$out" -maxdepth 1 -name '*.manifest' -print -quit 2>/dev/null || true)
           ver_of() {
             local v=""
