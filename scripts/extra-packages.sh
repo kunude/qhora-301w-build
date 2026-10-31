@@ -264,6 +264,38 @@ place() {
   mkdir -p "$feed_dir/$(dirname "$dst_rel")"
   cp -a "$src_root/$src_rel" "$feed_dir/$dst_rel"
   log "  落位（$label）$feed_dir/$dst_rel"
+
+  # ── Rust 集成层兼容改写（只对带 include/rust-package.mk 的树生效）──────
+  # openwrt main 从 2026 年起把 Rust 支持搬进了主树：include/rust-package.mk
+  # 加预置工具链模式（CONFIG_EXPERIMENTAL=y → USE_RUST_PREBUILT=y
+  # → USE_RUST_TOOLCHAIN=y）。而 feed 里那份 lang/rust/rust-package.mk 是旧版，
+  # 它的 RUST_ARCH_DEPENDS 多带一个条件：
+  #
+  #     @(aarch64||arm||…) @!USE_RUST_TOOLCHAIN
+  #
+  # 于是开了预置工具链的树里，**任何** include 旧版 mk 的包都整包失效。
+  # 症状极隐蔽：`make defconfig` 只是安静地不写 CONFIG_PACKAGE_xxx，
+  # 固件照样编出来，只是缺这个组件。本仓库的符号校验会红，原因就写在那行的
+  # depends 上（实测：openwrt-ppe-nss + EXPERIMENTAL=y + passwall2 线，
+  # `shadowsocks-rust sslocal … depends on (aarch64||…)` 被丢弃）。
+  #
+  # 接法：主树有新版 mk 时接到它上面 ——
+  #   include → $(INCLUDE_DIR)/rust-package.mk，DEPENDS → $(RUST_PKG_DEPENDS)
+  #   （新版按模式自动补 libstd-rust / rust/host），硬写的
+  #   PKG_BUILD_DEPENDS:=rust/host 置空交给新版决定。
+  # immortalwrt 树里没有 include/rust-package.mk、feed 版 mk 也不带那个条件
+  # ⇒ 两个门都过不去，整体跳过，行为不变。
+  local mk="$feed_dir/$dst_rel/Makefile"
+  if [[ -f "$OPENWRT_DIR/include/rust-package.mk" ]] &&
+     grep -q 'USE_RUST_TOOLCHAIN' "$OPENWRT_DIR/feeds/packages/lang/rust/rust-values.mk" 2>/dev/null &&
+     grep -q 'feeds/packages/lang/rust/rust-package.mk' "$mk"; then
+    sed -i \
+      -e 's#include $(TOPDIR)/feeds/packages/lang/rust/rust-package.mk#include $(INCLUDE_DIR)/rust-package.mk#' \
+      -e 's#^PKG_BUILD_DEPENDS:=rust/host$#PKG_BUILD_DEPENDS:=#' \
+      -e 's#\$\$(RUST_ARCH_DEPENDS)#$$(RUST_PKG_DEPENDS)#g' \
+      "$mk"
+    log "    ↳ 改用主树的 Rust 集成层 include/rust-package.mk：$dst_rel"
+  fi
 }
 
 # ══════════════════════════════════════════════════════════════
