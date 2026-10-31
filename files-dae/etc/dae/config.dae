@@ -35,9 +35,29 @@ global {
     # 名字要和 `ip link` 里的一模一样，逗号分隔：
     #   lan_interface: br-lan, br-guest, wg0
     #
-    # 注意：写进来的接口必须一直存在。删掉/改名之后 dae 会因为绑不上而启动失败，
-    # 那时不是"少代理一个网段"，而是**整个代理都不工作**。
+    # ⚠️ 这行是**最容易把人坑死**的一行，两条硬约束：
+    #
+    #   ① 接口必须**真实存在**。写进来的接口一旦不存在（改名 / 拼错 / 接口还没
+    #      建起来），dae 绑 LAN 直接失败 —— 不是"少代理一个网段"，而是**整个
+    #      代理都不工作**：进程起一下就退，日志里只在启动瞬间有一行错误，
+    #      之后完全安静，用户只会说"又不通了"。
+    #
+    #   ② 名字**大小写敏感、逐字符匹配**，不接受任何近似写法。实测踩过一次：
+    #      写成 `WireGuasard`（Guard 打成 Guasard，多一个 a、一个 s），
+    #      接口明明在，dae 却绑不上 —— 肉眼扫十遍也看不出问题。
+    #
+    # 加接口之前先让机器告诉你原名，别凭记忆敲：
+    #   ip -br link | awk '{print $1}' | grep -i wire
+    #   ip -br link | awk '{print $1}' | grep -iE 'br-|wg|zt|tailscale'
+    # 输出是什么就贴什么。写完用下面这条确认 dae 真的绑上了：
+    #   logread | grep -i 'bind to lan'
+    # 每个接口应该各有一行 Bind to LAN: <name>；少一个就说明名字不对。
+    #
+    # 保守做法：这里**只留必然存在的接口**，WireGuard / 访客网络等按需再加。
+    # 一个写错的接口会让整套代理失效，收益（多代理一个网段）远小于风险。
     lan_interface: br-lan
+    # 需要时照下面的样子加（名字换成 `ip -br link` 里的真实输出）：
+    # lan_interface: br-lan, br-guest, wg0
 
     # auto = 自动认 WAN（本机型是 wan / pppoe-wan，auto 都能认）
     wan_interface: auto
