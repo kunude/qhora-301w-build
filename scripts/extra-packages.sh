@@ -290,6 +290,22 @@ place() {
   # 用 define 模板写的包（passwall 的 shadowsocks-rust / shadow-tls）才带这个
   # 双美元写法。smartdns 那份是顶层 $(RUST_ARCH_DEPENDS)（它的 smartdns-ui
   # 才用 rust，本仓库不选），保持原样不动。
+  #
+  # 接过去之后还要处理第二个坑：新版 mk 默认给 cargo 加 --offline，
+  # 它假设「包自带 vendor tarball + .cargo/config.toml」（见文件头注释，
+  # 配套 scripts/gen-cargo-vendor-tarball.sh）。而 passwall 这些配方用的是
+  # 上游 tar.gz，没有 vendor 目录，--offline 下 cargo 在空 registry 里解析
+  # 依赖，直接失败：
+  #     error: no matching package named `aes` found
+  #     location searched: crates.io index
+  #     note: offline mode (via `--offline`) can sometimes cause surprising
+  #           resolution failures
+  # 旧版 feed mk 正好没有 --offline（CARGO_PKG_ARGS 为空，cargo 自己联网
+  # 拉 crates，CARGO_HOME 在 dl/cargo 里跨构建复用），这也是 OpenWrt 一直
+  # 以来的做法。所以把 --offline 摘掉、保留 --locked（版本仍被 Cargo.lock
+  # 钉死），行为回到旧版，代价是编这个包时要能连 crates.io。
+  # 实测：同一份 1.25.0 源码 + 预置 cargo 1.99.1，`cargo fetch --locked`
+  # 20 秒拉完全部 400+ 依赖，aes 正常解析。
   local mk="$feed_dir/$dst_rel/Makefile"
   if [[ -f "$OPENWRT_DIR/include/rust-package.mk" ]] &&
      grep -q 'USE_RUST_TOOLCHAIN' "$OPENWRT_DIR/feeds/packages/lang/rust/rust-values.mk" 2>/dev/null &&
@@ -300,6 +316,9 @@ place() {
       -e 's#^PKG_BUILD_DEPENDS:=rust/host$#PKG_BUILD_DEPENDS:=#' \
       -e 's#\$\$(RUST_ARCH_DEPENDS)#$$(RUST_PKG_DEPENDS)#g' \
       "$mk"
+    # 摘掉新版默认塞进来的 --offline（配方没有 vendor tarball）。
+    # 用 GNU sed 的 `a text` 单行插入，紧跟 include 之后即可生效。
+    sed -i '/^include \$(INCLUDE_DIR)\/rust-package\.mk$/a CARGO_PKG_ARGS:=$(filter-out --offline,$(CARGO_PKG_ARGS))' "$mk"
     log "    ↳ 改用主树的 Rust 集成层 include/rust-package.mk：$dst_rel"
   fi
 }
