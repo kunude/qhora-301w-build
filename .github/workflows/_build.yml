@@ -304,7 +304,12 @@ jobs:
           case "$PROXY_STACK" in
             daed|dae|honk)
               echo "--- 预编 dwarves（pahole） ---"
-              make tools/dwarves/compile V=s || echo "::warning::dwarves 预编失败，内核 BTF 可能被静默关掉"
+              # </dev/null + timeout：万一 .config 被判失效，toplevel 的 .config
+              # 规则会去起交互式 menuconfig，CI 里就会一直挂着直到 6 小时超时。
+              timeout 900 make tools/dwarves/compile V=s </dev/null \
+                || echo "::warning::dwarves 预编失败（rc=$?），内核 BTF 可能被静默关掉"
+              staging_dir/host/bin/pahole --version 2>/dev/null \
+                || echo "::warning::staging_dir/host/bin/pahole 不存在，内核 olddefconfig 会关掉 BTF"
               ;;
           esac
 
@@ -491,6 +496,8 @@ jobs:
                 echo "::error::BTF 在 Kconfig 里 depends on PAHOLE_VERSION >= 116 —— 多半是 pahole 没编出来"
                 echo "--- 内核 .config 相关项 ---"
                 grep -E '^(CONFIG_DEBUG_INFO|CONFIG_BPF_SYSCALL|CONFIG_GCC_PLUGIN_RANDSTRUCT)' "$kcfg" || true
+                echo "--- 全局 .config 里的 DWARVES（决定 dwarves 是否进 tools-y）---"
+                grep -E '^(# )?CONFIG_DWARVES' openwrt/.config || echo "openwrt/.config 里没有 CONFIG_DWARVES 行"
                 echo "--- pahole ---"
                 ls -l openwrt/staging_dir/host/bin/pahole 2>/dev/null || echo "staging_dir/host/bin/pahole 不存在"
                 bad=$((bad + 1))
