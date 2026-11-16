@@ -19,11 +19,12 @@ name: Build · 固件（仓库 / 默认IP / 内置包 / 代理栈）
 # 同时装通常编得出来，但跑起来会互相抢流量。一次只装一个，省得排查。
 #
 # 各仓库的兼容性（2026-11 实测）：
-#   immortalwrt/immortalwrt  8 个内置包全在官方 feed 里（ddns-go / msd_lite 在
-#                            packages feed，两个 luci-app 在 luci feed）
+#   immortalwrt/immortalwrt  8 个内置包全在（ddns-go / msd_lite 在 packages feed，
+#                            两个 luci-app 在 luci feed，wireguard-tools 与
+#                            kmod-wireguard 在源码树 package/ 里，不在 feed）
 #   coolsnowwolf/lede        有 ddns-go / msd_lite / luci-app-ddns-go，缺 luci-app-msd_lite
 #   openwrt/openwrt          官方 feed 里这 4 个都没有
-# 所以默认 immortalwrt；换别的仓库会在「feeds 自检」这一步直接报缺哪个，
+# 所以默认 immortalwrt；换别的仓库会在「内置包自检」这一步直接报缺哪个，
 # 不会白编一小时才失败。
 # ─────────────────────────────────────────────────────────────
 
@@ -285,25 +286,64 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      # 早失败：仓库的 feed 缺内置包时不要等到编一小时后再发现。
-      - name: feeds 自检（内置包是否存在于 feed 中）
+      # 早失败：仓库里缺内置包时不要等到编一小时后再发现。
+      #
+      # 只搜 feeds/ 会误报 —— 内置包有三种放法，都要认：
+      #   ① 独立包目录      package/…/foo、feeds/…/foo        （ddns-go、qrencode…）
+      #   ② KernelPackage   kmod-* 没有自己的目录，定义在
+      #                     package/kernel/linux/modules/*.mk 里的 `define KernelPackage/x`
+      #                     （kmod-wireguard 就是 netsupport.mk 里的一段，源码树里根本没有
+      #                       叫 kmod-wireguard 的目录，只查目录必然 MISS）
+      #   ③ PKG_NAME 兜底   少数配方把包定义写在上层目录，目录名与包名不一致
+      - name: 内置包自检（是否存在于源码树 / feed 中）
         working-directory: openwrt
         run: |
           set -euo pipefail
+
+          find_pkg() {
+            local p="$1" m hit
+            # ① 目录名 == 包名。用 -print -quit 取第一个就停；不要接 `| grep -q .`，
+            #    管道里 grep 提前退出会让 find 收到 SIGPIPE，pipefail 下整条判断翻脸。
+            hit="$(find package feeds -maxdepth 4 -type d -name "$p" -print -quit 2>/dev/null || true)"
+            if [[ -n "$hit" ]]; then
+              echo "  → 目录 $hit"
+              return 0
+            fi
+            # ② kmod-xxx → KernelPackage/xxx
+            if [[ "$p" == kmod-* ]]; then
+              m="${p#kmod-}"
+              if grep -rqsE "^define KernelPackage/${m}\$" \
+                   --include='*.mk' --include='Makefile' package feeds; then
+                echo "  → KernelPackage/$m"
+                return 0
+              fi
+            fi
+            # ③ Makefile 里直接写 PKG_NAME:=<包名>
+            if grep -rqsE "^PKG_NAME:=[[:space:]]*${p}\$" \
+                 --include='Makefile' package feeds; then
+              echo "  → PKG_NAME=$p"
+              return 0
+            fi
+            return 1
+          }
+
           missing=()
           for p in $PKGS_BUILTIN; do
-            if find feeds -maxdepth 4 -type d -name "$p" -print -quit | grep -q .; then
+            if find_pkg "$p"; then
               echo "OK   $p"
             else
               echo "MISS $p"
               missing+=("$p")
             fi
           done
+
           if (( ${#missing[@]} > 0 )); then
-            echo "::error::$REPO@$REF 的 feed 里没有：${missing[*]}"
-            echo "::error::这 8 个内置包是固定的。当前仓库缺包，请把 repo 换成 immortalwrt/immortalwrt（8 个全在），或改 PKGS_BUILTIN 去掉缺的那个"
+            total=$(wc -w <<<"$PKGS_BUILTIN")
+            echo "::error::$REPO@$REF 里找不到：${missing[*]}"
+            echo "::error::内置包共 $total 个（PKGS_BUILTIN）。缺包时把 repo 换成 immortalwrt/immortalwrt，或改 PKGS_BUILTIN 去掉缺的那个"
             exit 1
           fi
+          echo "内置包自检通过"
 
       # ── 生成 .config ─────────────────────────────────────────
       # 只写 target/device + 包名，其余交给 kconfig 自己解依赖。
