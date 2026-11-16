@@ -8,18 +8,18 @@ name: Build · 固件（仓库 / 默认IP / 内置包 / 代理栈）
 # 四个输入项：
 #   ① repo + ref      从哪个仓库、哪个分支取源码（tag / commit 也行）
 #   ② lan_ip          刷机后默认 LAN 地址，出厂即生效
-#   ③ 内置包           固定 8 个，不需要选，见 PKGS_BUILTIN
+#   ③ 内置包           固定 9 个（8 个常备件 + luci），不需要选，见 PKGS_BUILTIN
 #   ④ proxy_stack     代理栈单选，配方来自 kenzok8/small
 #
-# 为什么内置包不用选：这 8 个是这台机器的常备件（DDNS / 组播转单播 / WG / 二维码），
-# 每次构建都要，放进选项只会让人多点几下。要加东西改 PKGS_BUILTIN 即可。
+# 为什么内置包不用选：这 9 个是这台机器的常备件（DDNS / 组播转单播 / WG / 二维码 /
+# luci 本体），每次构建都要，放进选项只会让人多点几下。要加东西改 PKGS_BUILTIN 即可。
 #
 # 代理栈为什么单选：openclash / passwall / ssr-plus / homeproxy / daed / dae /
 # honk / nikki 全都要接管 53 和透明代理端口（daed / dae / honk 直接挂内核 eBPF），
 # 同时装通常编得出来，但跑起来会互相抢流量。一次只装一个，省得排查。
 #
 # 各仓库的兼容性（2026-11 实测）：
-#   immortalwrt/immortalwrt  8 个内置包全在（ddns-go / msd_lite 在 packages feed，
+#   immortalwrt/immortalwrt  9 个内置包全在（ddns-go / msd_lite 在 packages feed，
 #                            两个 luci-app 在 luci feed，wireguard-tools 与
 #                            kmod-wireguard 在源码树 package/ 里，不在 feed）
 #   coolsnowwolf/lede        有 ddns-go / msd_lite / luci-app-ddns-go，缺 luci-app-msd_lite
