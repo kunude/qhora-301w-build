@@ -7,23 +7,25 @@ name: Build · 固件（仓库 / 默认IP / 内置包 / 代理栈）
 #
 # 四个输入项：
 #   ① repo + ref      从哪个仓库、哪个分支取源码（tag / commit 也行）
-#   ② lan_ip          刷机后默认 LAN 地址，出厂即生效
-#   ③ 内置包           固定 9 个（8 个常备件 + luci），不需要选，见 PKGS_BUILTIN
+#   ①② lan_ip          刷机后默认 LAN 地址，出厂即生效；界面语言固定简体中文
+#   ③ 内置包           固定 11 个（immortalwrt 再加一个 autocore），不需要选，见 PKGS_BUILTIN
 #   ④ proxy_stack     代理栈单选，配方来自 kenzok8/small
 #
-# 为什么内置包不用选：这 9 个是这台机器的常备件（DDNS / 组播转单播 / WG / 二维码 /
-# luci 本体），每次构建都要，放进选项只会让人多点几下。要加东西改 PKGS_BUILTIN 即可。
+# 为什么内置包不用选：这些是这台机器的常备件（DDNS / 组播转单播 / WG / 二维码 /
+# 流量图 / luci 本体），每次构建都要，放进选项只会让人多点几下。要加东西改
+# PKGS_BUILTIN 即可。
 #
 # 代理栈为什么单选：openclash / passwall / ssr-plus / homeproxy / daed / dae /
 # honk / nikki 全都要接管 53 和透明代理端口（daed / dae / honk 直接挂内核 eBPF），
 # 同时装通常编得出来，但跑起来会互相抢流量。一次只装一个，省得排查。
 #
 # 各仓库的兼容性（2026-11 实测）：
-#   immortalwrt/immortalwrt  9 个内置包全在（ddns-go / msd_lite 在 packages feed，
-#                            两个 luci-app 在 luci feed，wireguard-tools 与
-#                            kmod-wireguard 在源码树 package/ 里，不在 feed）
+#   immortalwrt/immortalwrt  内置包全在（ddns-go / msd_lite 在 packages feed，
+#                            两个 luci-app 与 statistics 在 luci feed，wireguard-tools
+#                            与 kmod-wireguard 在源码树 package/ 里，collectd-mod-thermal
+#                            是 collectd 的子包、autocore 在 package/emortal）
 #   coolsnowwolf/lede        有 ddns-go / msd_lite / luci-app-ddns-go，缺 luci-app-msd_lite
-#   openwrt/openwrt          官方 feed 里这 4 个都没有
+#   openwrt/openwrt          官方 feed 里这 4 个都没有，也没有 autocore
 # 所以默认 immortalwrt；换别的仓库会在「内置包自检」这一步直接报缺哪个，
 # 不会白编一小时才失败。
 # ─────────────────────────────────────────────────────────────
@@ -87,6 +89,12 @@ env:
   PKGS_BUILTIN: >-
     luci ddns-go msd_lite luci-app-ddns-go luci-app-msd_lite
     wireguard-tools kmod-wireguard luci-proto-wireguard qrencode
+    luci-app-statistics collectd-mod-thermal
+
+  # 只有 immortalwrt 有的包（package/emortal/autocore）：CPU 负载 / 温度那套状态页。
+  # 别的仓库没这个目录，硬塞进 PKGS_BUILTIN 会让自检直接报缺包，所以单独一列，
+  # 按 REPO 决定加不加。
+  PKGS_IMMORTAL: autocore
 
 jobs:
   build:
@@ -133,11 +141,19 @@ jobs:
             *) fail "未知 proxy_stack：$PROXY_STACK" ;;
           esac
 
+          # 内置包 = 固定列 + （immortalwrt 才有）autocore。
+          # 结果写进 PKGS_ON，后面几步统一用它，免得两处各算一遍再走偏。
+          pkgs_on="$PKGS_BUILTIN"
+          if [[ "$REPO" == "immortalwrt/immortalwrt" ]]; then
+            pkgs_on="$pkgs_on $PKGS_IMMORTAL"
+          fi
+
           # 只往下传这两个：LAN_IP 是归一化后的地址，PROXY_PKGS 是查表结果。
           # REPO / REF / PROXY_STACK 已经是 job 级 env，不用再写。
           {
             echo "LAN_IP=$ip"
             echo "PROXY_PKGS=$pkgs"
+            echo "PKGS_ON=$pkgs_on"
           } >> "$GITHUB_ENV"
 
           {
@@ -147,6 +163,8 @@ jobs:
             echo "|---|---|"
             echo "| 源码 | \`$REPO\` @ \`$REF\` |"
             echo "| 默认 LAN | \`$ip/24\` |"
+            echo "| 界面语言 | 简体中文（\`luci-i18n-*-zh-cn\`，默认 zh_cn） |"
+            echo "| 内置包 | \`$pkgs_on\` |"
             echo "| 代理栈 | \`$PROXY_STACK\`${pkgs:+ → \`$pkgs\`} |"
             echo "| 目标 | \`$QH_TARGET/$QH_SUBTARGET\` → \`$QH_DEVICE\` |"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -213,14 +231,14 @@ jobs:
             || { echo "::error::$dev_mk 里没有 Device/$QH_DEVICE，$REPO@$REF 不支持这台机器"; exit 1; }
           echo "设备定义 OK：$dev_mk 含 Device/$QH_DEVICE"
 
-      # ── ② 默认 LAN 地址 ──────────────────────────────────────
+      # ── ② 默认 LAN 地址 / 界面语言 ───────────────────────────
       # 用 uci-defaults 而不是改 target 的 /etc/config/network：
       #   · 不绑死具体设备，换仓库也对
       #   · uci-defaults 由 /etc/init.d/boot（START=10）跑，network 是 START=20，
       #     所以首次开机网络起来时地址已经是新的，不用再重启一次
       #   · 脚本执行后自动删除，不会在系统里留垃圾
       # DHCP 范围不用动：dhcp.lan 的 start=100/limit=150 是相对网段算的。
-      - name: 写入默认 LAN 地址
+      - name: 写入默认 LAN 地址与界面语言
         run: |
           set -euo pipefail
           mkdir -p openwrt/files/etc/uci-defaults
@@ -240,6 +258,24 @@ jobs:
           chmod +x "$f"
           echo "--- 生成的 $f ---"
           cat "$f"
+
+          # 默认语言钉成简体中文。语言包本身由 CONFIG_LUCI_LANG_zh_Hans 带进来，
+          # 但 /etc/config/luci 出厂是 lang='auto'（跟浏览器走）——浏览器是英文环境的
+          # 时候还是英文界面。这里只在没被人改过（auto / 空）时写 zh_cn。
+          g=openwrt/files/etc/uci-defaults/98-set-luci-lang
+          cat > "$g" <<'EOF'
+          #!/bin/sh
+          # 构建时生成（build-firmware.yml）：默认界面语言改为简体中文。
+          cur="$(uci -q get luci.main.lang)"
+          if [ -z "$cur" ] || [ "$cur" = "auto" ]; then
+          	uci -q set luci.main.lang='zh_cn'
+          	uci -q commit luci
+          fi
+          exit 0
+          EOF
+          chmod +x "$g"
+          echo "--- 生成的 $g ---"
+          cat "$g"
 
       # ── ④ 代理栈：接入 kenzok8 的两个 feed ────────────────────
       # 放在 feeds 更新之后、install 之前 —— 要先把官方 feed 拉下来，
@@ -288,20 +324,21 @@ jobs:
 
       # 早失败：仓库里缺内置包时不要等到编一小时后再发现。
       #
-      # 只搜 feeds/ 会误报 —— 内置包有三种放法，都要认：
-      #   ① 独立包目录      package/…/foo、feeds/…/foo        （ddns-go、qrencode…）
-      #   ② KernelPackage   kmod-* 没有自己的目录，定义在
-      #                     package/kernel/linux/modules/*.mk 里的 `define KernelPackage/x`
-      #                     （kmod-wireguard 就是 netsupport.mk 里的一段，源码树里根本没有
-      #                       叫 kmod-wireguard 的目录，只查目录必然 MISS）
-      #   ③ PKG_NAME 兜底   少数配方把包定义写在上层目录，目录名与包名不一致
+      # 判"包在不在"有三个来源，缺一不可：
+      #   ① 独立目录        package/…/foo、feeds/…/foo（ddns-go、autocore…）
+      #   ② define 宏       kmod-* 只有 package/kernel/linux/modules/*.mk 里的
+      #                     `define KernelPackage/x`，没有以包名命名的目录
+      #   ③ feed 索引       feeds/<feed>.index 是 scripts/feeds update 生成的元数据，
+      #                     最可靠 —— collectd-mod-thermal 这种是
+      #                     `$(eval $(call BuildPlugin,thermal,…))` 拼出来的，
+      #                     Makefile 里连这个字符串都没有，翻文件必然 MISS
       - name: 内置包自检（是否存在于源码树 / feed 中）
         working-directory: openwrt
         run: |
           set -euo pipefail
 
           find_pkg() {
-            local p="$1" m hit
+            local p="$1" hit
             # ① 目录名 == 包名。用 -print -quit 取第一个就停；不要接 `| grep -q .`，
             #    管道里 grep 提前退出会让 find 收到 SIGPIPE，pipefail 下整条判断翻脸。
             hit="$(find package feeds -maxdepth 4 -type d -name "$p" -print -quit 2>/dev/null || true)"
@@ -309,26 +346,28 @@ jobs:
               echo "  → 目录 $hit"
               return 0
             fi
-            # ② kmod-xxx → KernelPackage/xxx
-            if [[ "$p" == kmod-* ]]; then
-              m="${p#kmod-}"
-              if grep -rqsE "^define KernelPackage/${m}\$" \
-                   --include='*.mk' --include='Makefile' package feeds; then
-                echo "  → KernelPackage/$m"
-                return 0
-              fi
+            # ② 源码树里 define Package/<包名>
+            if grep -rqsE "^define Package/${p}\$" \
+                 --include='*.mk' --include='Makefile' package; then
+              echo "  → define Package/$p"
+              return 0
             fi
-            # ③ Makefile 里直接写 PKG_NAME:=<包名>
-            if grep -rqsE "^PKG_NAME:=[[:space:]]*${p}\$" \
-                 --include='Makefile' package feeds; then
-              echo "  → PKG_NAME=$p"
+            # ② kmod-xxx → define KernelPackage/xxx
+            if [[ "$p" == kmod-* ]] && grep -rqsE "^define KernelPackage/${p#kmod-}\$" \
+                 --include='*.mk' --include='Makefile' package; then
+              echo "  → KernelPackage/${p#kmod-}"
+              return 0
+            fi
+            # ③ feed 索引里登记过
+            if grep -qsE "^Package: ${p}\$" feeds/*.index; then
+              echo "  → feed 索引"
               return 0
             fi
             return 1
           }
 
           missing=()
-          for p in $PKGS_BUILTIN; do
+          for p in $PKGS_ON; do
             if find_pkg "$p"; then
               echo "OK   $p"
             else
@@ -338,9 +377,9 @@ jobs:
           done
 
           if (( ${#missing[@]} > 0 )); then
-            total=$(wc -w <<<"$PKGS_BUILTIN")
+            total=$(wc -w <<<"$PKGS_ON")
             echo "::error::$REPO@$REF 里找不到：${missing[*]}"
-            echo "::error::内置包共 $total 个（PKGS_BUILTIN）。缺包时把 repo 换成 immortalwrt/immortalwrt，或改 PKGS_BUILTIN 去掉缺的那个"
+            echo "::error::内置包共 $total 个（PKGS_BUILTIN + autocore）。缺包时把 repo 换成 immortalwrt/immortalwrt，或改 PKGS_BUILTIN 去掉缺的那个"
             exit 1
           fi
           echo "内置包自检通过"
@@ -361,11 +400,19 @@ jobs:
             echo "CONFIG_TARGET_ROOTFS_SQUASHFS=y"
           } > .config
 
-          for p in $PKGS_BUILTIN $PROXY_PKGS; do
+          for p in $PKGS_ON $PROXY_PKGS; do
             [[ -n "$p" ]] || continue
             [[ "$p" =~ ^[A-Za-z0-9_.+-]+$ ]] || { echo "::error::非法包名：$p"; exit 1; }
             echo "CONFIG_PACKAGE_${p}=y" >> .config
           done
+
+          # 简体中文界面。不能直接写 CONFIG_PACKAGE_luci-i18n-base-zh-cn=y —— 那些
+          # 语言包在 luci.mk 里是 HIDDEN:=1，hidden 符号的 .config 值会被 kconfig 丢掉，
+          # 只认 default。它们的 default 恰好是 `LUCI_LANG_<tag>||(ALL&&m)`，所以打开
+          # 这个可见的 tristate，所有 luci-i18n-*-zh-cn 就一起默认 =y 了（实测 6 个核心
+          # 语言包 + 各 app 的一二十个，别的语言不受影响）。
+          # 不打开这个开关时，整棵树一个 zh-cn 语言包都不会编出来，界面就是英文。
+          echo "CONFIG_LUCI_LANG_zh_Hans=y" >> .config
 
           # daed / dae / honk 的 eBPF 程序靠 CO-RE 读内核结构，没有 BTF 一启动就崩。
           # 注意这只是"请求"：内核 Kconfig 里 BTF 还 depends on PAHOLE_VERSION >= 116，
@@ -439,7 +486,7 @@ jobs:
         run: |
           set -euo pipefail
           make defconfig
-          want="$PKGS_BUILTIN $PROXY_PKGS"
+          want="$PKGS_ON $PROXY_PKGS"
           bad=0
           for p in $want; do
             [[ -n "$p" ]] || continue
@@ -450,6 +497,16 @@ jobs:
               bad=$((bad + 1))
             fi
           done
+
+          # 中文语言包是 hidden 符号，只在 LUCI_LANG_zh_Hans 打开时按 default 生效。
+          # 它要是没落地，固件起来就是英文界面 —— 这里直接卡住。
+          i18n=$(grep -cE "^CONFIG_PACKAGE_luci-i18n-.*-zh-cn=y" .config)
+          if [[ "$i18n" -lt 3 ]]; then
+            echo "::error::中文语言包只落了 $i18n 个，CONFIG_LUCI_LANG_zh_Hans 没生效，界面会是英文"
+            bad=$((bad + 1))
+          else
+            echo "OK  中文语言包 $i18n 个（luci-i18n-*-zh-cn）"
+          fi
 
           # daed 与 dae 共用一个前端，后端是 choice。选错会连另一个一起装进来，
           # 或者两个都没选（dae 还要求内核真的带 BTF 才会给出 DAE_USE_KERNEL_BTF）。

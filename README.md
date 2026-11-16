@@ -11,7 +11,7 @@ Actions 里三个入口：
 |---|---|---|
 | **Build ImmortalWrt** | `immortalwrt/immortalwrt` | 正式线。**移植** NSS：构建时把 ppe-nss 的 `nss-wifi-drv` + 18 个 mac80211 补丁搬进来（`nss` 可选，默认开） |
 | **Build OpenWrt (NSS)** | `JuliusBairaktaris/openwrt-ppe-nss@ppe-nss` | 正式线。**整树** NSS：直接编那棵树，组件本来就在里面 |
-| **Build · 固件** | 任选（`immortalwrt` / `openwrt` / `lede`） | 简化线：选仓库和分支、设默认 LAN 地址、固定 9 个内置包、代理栈单选（配方取自 `kenzok8/small`）。**不带 NSS** |
+| **Build · 固件** | 任选（`immortalwrt` / `openwrt` / `lede`） | 简化线：选仓库和分支、设默认 LAN 地址、固定 11 个内置包（ddns-go / msd_lite / WG / qrencode / 流量图，immortalwrt 另加 autocore）、界面默认简体中文、代理栈单选（配方取自 `kenzok8/small`）。**不带 NSS** |
 
 前两个的 `proxy` 取值一样：`daed` `dae` `honk` `homeproxy` `singbox` `passwall`
 `passwall2` `none`。另有 `extra_packages`（额外插件，逗号分隔）和 `release`。
