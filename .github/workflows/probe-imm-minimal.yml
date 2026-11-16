@@ -20,8 +20,14 @@ name: Probe · ImmortalWrt 最小构建
 # 判据：
 #   · imm_ref=master 且红在 firewall4 的 .prepared → 主树自带问题，与我们无关
 #   · 同一个 ref 但红在别的包 → 我们的包 / 集成方式有问题
-#   · 想绕开 2026-11-14 之后 master 上已知的 firewall4 fullcone 补丁冲突、
-#     单独验证包，把 imm_ref 填 d42cc475c（合并前快照）
+#   · d42cc475c 是 2026-11-14「Merge Official Source」之前最后一个好快照，
+#     仍可作为干净对照：当时 firewall4 源码是旧版，fullcone 补丁的 hunk 对得上
+#
+# 2026-11-16 更新：上游已用 2fe3065ade "firewall4: refresh fullcone patches"
+# 修掉这次冲突 —— 官方把 firewall4 升到 2026-11-08 后，root/etc/config/firewall
+# 在 config defaults 下多了 option syn_flood，并删掉了两行 disable_ipv6 注释，
+# 旧补丁的 hunk 上下文因此失效（1 out of 1 hunk FAILED）。现在 master 应能编过；
+# 若又红在同一处，先跑这个 probe 判断是哪一侧发生了版本漂移。
 #
 # 触发（先 push 到默认分支）：
 #   gh workflow run probe-imm-minimal.yml -f imm_ref=master

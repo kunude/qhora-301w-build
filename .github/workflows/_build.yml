@@ -294,6 +294,14 @@ jobs:
           elif (( avail_mb < 30720 )); then
             echo "::warning::根分区只剩 ${avail_mb} MiB，低于实测的 ~30 GiB，可能撑不到最后"
           fi
+          # 先把 pahole 编出来：内核 BTF 的 Kconfig 依赖 PAHOLE_VERSION >= 116，
+          # pahole 缺失时 olddefconfig 会把 CONFIG_DEBUG_INFO_BTF 静默关掉 ——
+          # 构建全绿、包也编得出来，只有 vmlinux 里没有 .BTF，最后卡在产物校验。
+          # 完整 make 本会编 tools/dwarves，显式跑一次只是几秒（已编则 no-op），
+          # 换掉那条最费时间的失败路径。
+          echo "--- 预编 dwarves（pahole）---"
+          make tools/dwarves/compile V=s || echo "::warning::dwarves 预编失败，内核 BTF 可能被静默关掉"
+
           make -j"$(nproc)"
           rc=$?
           if (( rc != 0 )); then
@@ -357,8 +365,10 @@ jobs:
           # 作业日志要 admin 权限才能从 API 取，注解是公开可读的。
           # 模式要宽：只有 4 条的老写法漏掉了"满盘 / 被 kill / 缺工具"这三类
           # ——它们不打印 "error:"，恰恰是最难猜的。顺序有意义：越靠后越具体。
-          grep -nE '(No space left on device|Killed|Out of memory|Cannot allocate memory|command not found|: not found|Permission denied|No rule to make target|undefined reference to|cannot find -l|fatal error:|configure: error|Error [0-9]+$|\*\*\* \[.*\] Error [0-9]+|ERROR: )' "$BUILD_LOG" |
-            tail -25 | while IFS= read -r line; do
+          # 2026-11-14 那轮 firewall4 补丁打不上，日志里只剩 "failed to build"，
+          # 真正的 "Patch failed! / hunk FAILED" 被这个模式漏掉，排查绕了一大圈。
+          grep -nE '(No space left on device|Killed|Out of memory|Cannot allocate memory|command not found|: not found|Permission denied|No rule to make target|undefined reference to|cannot find -l|fatal error:|configure: error|Error [0-9]+$|\*\*\* \[.*\] Error [0-9]+|ERROR: |Patch failed!|hunk .*FAILED|patch does not apply|can.t find file to patch|saving rejects to file)' "$BUILD_LOG" |
+            tail -30 | while IFS= read -r line; do
               echo "::error title=编译报错::$line"
             done || true
           tail -40 "$BUILD_LOG"
@@ -462,16 +472,32 @@ jobs:
           done
 
           # BTF：daed / dae / honk 的 eBPF 程序靠 CO-RE 读内核结构，没有 .BTF 段
-          # 一启动就失败。.config 里开了 DEBUG_INFO 也可能被
-          # KERNEL_DEBUG_INFO_REDUCED 挡掉，所以必须查编出来的内核本体。
+          # 一启动就失败。这里分两步查，因为「全局 .config 写了 y」不等于「内核真的有」：
+          #   ① 内核 .config 里 CONFIG_DEBUG_INFO_BTF 是否真的 =y —— Kconfig 里它
+          #      depends on PAHOLE_VERSION >= 116，pahole 不可用时会被 olddefconfig
+          #      **静默关掉**：构建全绿、包也编得出来，只有 vmlinux 里没有 .BTF。
+          #   ② vmlinux 里是否真有 .BTF 段（pahole 可用但生成失败时也会缺）。
           case "$PROXY_STACK" in
             daed|dae|honk)
-              vmlinux=$(find openwrt/build_dir -maxdepth 4 -name vmlinux -print -quit 2>/dev/null || true)
-              if [[ -n "$vmlinux" ]] && readelf -S "$vmlinux" 2>/dev/null | grep -q '\.BTF'; then
-                echo "::notice title=BTF::内核含 .BTF 段，$PROXY_STACK 的 CO-RE 前提满足"
-              else
-                echo "::error::$PROXY_STACK 需要内核 BTF，但 vmlinux 里没有 .BTF 段"
+              kcfg=$(find openwrt/build_dir -maxdepth 6 -path '*linux-*/linux-*/.config' -print -quit 2>/dev/null || true)
+              if [[ -n "$kcfg" ]] && ! grep -q '^CONFIG_DEBUG_INFO_BTF=y' "$kcfg"; then
+                echo "::error::$PROXY_STACK 需要 BTF，但内核 .config 里 CONFIG_DEBUG_INFO_BTF 没生效（$kcfg）"
+                echo "::error::BTF 在 Kconfig 里 depends on PAHOLE_VERSION >= 116 —— 多半是 pahole 没编出来"
+                echo "--- 内核 .config 相关项 ---"
+                grep -E '^(CONFIG_DEBUG_INFO|CONFIG_BPF_SYSCALL|CONFIG_GCC_PLUGIN_RANDSTRUCT)' "$kcfg" || true
+                echo "--- pahole ---"
+                ls -l openwrt/staging_dir/host/bin/pahole 2>/dev/null || echo "staging_dir/host/bin/pahole 不存在"
                 bad=$((bad + 1))
+              else
+                vmlinux=$(find openwrt/build_dir -maxdepth 6 -name vmlinux -print -quit 2>/dev/null || true)
+                if [[ -n "$vmlinux" ]] && readelf -S "$vmlinux" 2>/dev/null | grep -q '\.BTF'; then
+                  echo "::notice title=BTF::内核含 .BTF 段，$PROXY_STACK 的 CO-RE 前提满足"
+                else
+                  echo "::error::$PROXY_STACK 需要内核 BTF，但 vmlinux 里没有 .BTF 段（vmlinux=${vmlinux:-未找到}）"
+                  echo "--- build_dir 下的 vmlinux 候选 ---"
+                  find openwrt/build_dir -maxdepth 6 -name vmlinux -print 2>/dev/null || true
+                  bad=$((bad + 1))
+                fi
               fi
               ;;
           esac
