@@ -8,7 +8,7 @@ name: Build · 固件（仓库 / 默认IP / 内置包 / 代理栈）
 # 四个输入项：
 #   ① repo + ref      从哪个仓库、哪个分支取源码（tag / commit 也行）
 #   ①② lan_ip          刷机后默认 LAN 地址，出厂即生效；界面语言固定简体中文
-#   ③ 内置包           固定 11 个（immortalwrt 再加一个 autocore），不需要选，见 PKGS_BUILTIN
+#   ③ 内置包           固定 12 个（immortalwrt 再加一个 autocore），不需要选，见 PKGS_BUILTIN
 #   ④ proxy_stack     代理栈单选，配方来自 kenzok8/small
 #
 # 为什么内置包不用选：这些是这台机器的常备件（DDNS / 组播转单播 / WG / 二维码 /
@@ -86,8 +86,14 @@ env:
   LAN_IP: ${{ inputs.lan_ip }}
 
   # ③ 内置包：与选项无关，恒定编入。
+  # curl 必带：kenzok8/small 的 honk 包 DEPENDS 里漏了它，但 rpcd 的
+  # honk_lifecycle_api_owned 和 install 自检都用 `curl --noproxy '*'` 探活
+  # /api；设备没 curl 时 API 明明通着，LuCI 仍判 api_ready=0，报
+  # "Honk is running, but its management interface is not ready."
+  # honk 自带的 diagnose 也会直接报"缺少 curl 命令"。加进公共列，各仓库都有
+  # packages/net/curl，自检能过。
   PKGS_BUILTIN: >-
-    luci ddns-go msd_lite luci-app-ddns-go luci-app-msd_lite
+    luci curl ddns-go msd_lite luci-app-ddns-go luci-app-msd_lite
     wireguard-tools kmod-wireguard luci-proto-wireguard qrencode
     luci-app-statistics collectd-mod-thermal
 
