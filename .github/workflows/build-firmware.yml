@@ -539,6 +539,13 @@ jobs:
               || { echo "::error::dae 没有选到 DAE_USE_KERNEL_BTF，CO-RE 会缺 BTF 来源"; bad=$((bad + 1)); }
           fi
 
+          # honk-core 同理：它是预编译的 eBPF 程序，靠 CO-RE 读内核结构，
+          # 内核没有 .BTF 段时能装能起、但一加载规则就崩，所以也要卡住。
+          if [[ "$PROXY_STACK" == "honk" ]]; then
+            grep -q "^CONFIG_KERNEL_DEBUG_INFO_BTF=y" .config \
+              || { echo "::error::honk 需要内核 BTF，但 CONFIG_KERNEL_DEBUG_INFO_BTF 不是 y"; bad=$((bad + 1)); }
+          fi
+
           # host LLVM 必须活到 defconfig 之后，否则 bpf-headers 会在 bpf.mk 里
           # 直接 Stop，报错只有一句 "LLVM/clang version too old ... found: ."。
           case "$PROXY_STACK" in
