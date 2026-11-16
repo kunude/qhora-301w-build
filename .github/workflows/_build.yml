@@ -299,8 +299,14 @@ jobs:
           # 构建全绿、包也编得出来，只有 vmlinux 里没有 .BTF，最后卡在产物校验。
           # 完整 make 本会编 tools/dwarves，显式跑一次只是几秒（已编则 no-op），
           # 换掉那条最费时间的失败路径。
-          echo "--- 预编 dwarves（pahole）---"
-          make tools/dwarves/compile V=s || echo "::warning::dwarves 预编失败，内核 BTF 可能被静默关掉"
+          # 只有 daed/dae/honk 的配置层会开 KERNEL_DEBUG_INFO_BTF（进而 select
+          # DWARVES），其余变体跑这个目标是 "No rule to make target"，纯噪音。
+          case "$PROXY_STACK" in
+            daed|dae|honk)
+              echo "--- 预编 dwarves（pahole） ---"
+              make tools/dwarves/compile V=s || echo "::warning::dwarves 预编失败，内核 BTF 可能被静默关掉"
+              ;;
+          esac
 
           make -j"$(nproc)"
           rc=$?
