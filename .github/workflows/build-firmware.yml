@@ -283,6 +283,30 @@ jobs:
           echo "--- 生成的 $g ---"
           cat "$g"
 
+          # ddns-go 统一用官方版（读 /etc/ddns-go/config.yaml）。
+          # 从 kenzo 版固件保留设置刷过来时，账号/密钥/域名留在旧文件
+          # ddns-go-config.yaml 里，官方程序读的是 config.yaml → 配置像"没启动/空的"。
+          # 首次开机把旧 YAML 改名过来（UCI 那侧 section 名字两边都叫 config，
+          # 官方 init 按名字取值，能读通，不用动）。只做一次，之后自动删除。
+          h=openwrt/files/etc/uci-defaults/97-migrate-ddns-go
+          cat > "$h" <<'EOF'
+          #!/bin/sh
+          # 构建时生成：kenzo 版 ddns-go 的 YAML 改名成官方版路径。
+          OLD=/etc/ddns-go/ddns-go-config.yaml
+          NEW=/etc/ddns-go/config.yaml
+          if [ -s "$OLD" ] && [ ! -s "$NEW" ]; then
+          	mkdir -p /etc/ddns-go
+          	mv "$OLD" "$NEW" 2>/dev/null || cp "$OLD" "$NEW"
+          	chown ddns-go:ddns-go /etc/ddns-go "$NEW" 2>/dev/null
+          	chmod 644 "$NEW" 2>/dev/null
+          	logger -t ddns-go-migrate "已把 $OLD 迁移为 $NEW"
+          fi
+          exit 0
+          EOF
+          chmod +x "$h"
+          echo "--- 生成的 $h ---"
+          cat "$h"
+
       # ── ④ 代理栈：接入 kenzok8 的两个 feed ────────────────────
       # 放在 feeds 更新之后、install 之前 —— 要先把官方 feed 拉下来，
       # 才能删掉和 small 重名的那些目录。
@@ -311,6 +335,12 @@ jobs:
                  feeds/packages/net/v2ray* feeds/packages/net/sing* \
                  feeds/packages/net/smartdns feeds/packages/utils/v2dat
           rm -rf feeds/luci/applications/luci-app-mosdns
+
+          # ddns-go 固定用官方 immortalwrt 版本，不让 kenzo 的同名包顶掉。
+          # 两版不兼容：kenzo 的 UCI section 叫 `basic`、配置文件叫 ddns-go-config.yaml；
+          # 官方版 section 叫 `ddns-go`、配置文件叫 config.yaml。混用（尤其保留配置刷机）
+          # 会让 LuCI 读不到 section、程序读不到旧配置，表现为"ddns-go 没启动"。
+          rm -rf feeds/kenzo/ddns-go feeds/kenzo/luci-app-ddns-go
 
           # golang 不换：immortalwrt / lede 当前 feed 里的 Go 都够新（lede 已到 1.27），
           # README 里那步 `git clone kenzok8/golang -b 1.26` 是给老树的补丁，照抄反而降级。
