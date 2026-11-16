@@ -1,36 +1,37 @@
-name: Build · 固件（基座 / 默认IP / 内置包 / 代理栈）
+name: Build · 固件（仓库 / 默认IP / 内置包 / 代理栈）
 
 # ─────────────────────────────────────────────────────────────
-# 一条尽量简单的固件构建线：只依赖上游主树 + kenzok8/small，不调用本仓库的
+# 一条尽量简单的固件构建线：只依赖上游源码树 + kenzok8/small，不调用本仓库的
 # prepare.sh / prepare-build.sh，也不做 NSS 移植（无线走 ath11k 原生驱动）。
-# 需要 NSS / honk / daed 预置配置 / 出厂 uci 覆盖那一套，用 build-immortalwrt.yml。
+# 需要 NSS / 出厂 uci 覆盖那一套，用 build-immortalwrt.yml。
 #
 # 四个输入项：
-#   ① base_repo + base_ref  选基座仓库与分支（tag / commit 也行）
-#   ② lan_ip                刷机后默认 LAN 地址，出厂即生效
-#   ③ 内置包                 固定 8 个，不需要选，见 PKGS_BUILTIN
-#   ④ proxy_stack           代理栈单选，配方来自 kenzok8/small
+#   ① repo + ref      从哪个仓库、哪个分支取源码（tag / commit 也行）
+#   ② lan_ip          刷机后默认 LAN 地址，出厂即生效
+#   ③ 内置包           固定 8 个，不需要选，见 PKGS_BUILTIN
+#   ④ proxy_stack     代理栈单选，配方来自 kenzok8/small
 #
 # 为什么内置包不用选：这 8 个是这台机器的常备件（DDNS / 组播转单播 / WG / 二维码），
 # 每次构建都要，放进选项只会让人多点几下。要加东西改 PKGS_BUILTIN 即可。
 #
-# 代理栈为什么单选：openclash / passwall / ssr-plus / homeproxy 都要接管 53 与
-# 透明代理端口，同时装通常编得出来但跑起来互相抢流量。一次只装一个，省得排查。
+# 代理栈为什么单选：openclash / passwall / ssr-plus / homeproxy / daed / dae /
+# honk / nikki 全都要接管 53 和透明代理端口（daed / dae / honk 直接挂内核 eBPF），
+# 同时装通常编得出来，但跑起来会互相抢流量。一次只装一个，省得排查。
 #
-# 基座兼容性（2026-11 实测）：
+# 各仓库的兼容性（2026-11 实测）：
 #   immortalwrt/immortalwrt  8 个内置包全在官方 feed 里（ddns-go / msd_lite 在
 #                            packages feed，两个 luci-app 在 luci feed）
 #   coolsnowwolf/lede        有 ddns-go / msd_lite / luci-app-ddns-go，缺 luci-app-msd_lite
 #   openwrt/openwrt          官方 feed 里这 4 个都没有
-# 所以默认 immortalwrt；选别的基座会在「feeds 自检」这一步直接报缺哪个，
+# 所以默认 immortalwrt；换别的仓库会在「feeds 自检」这一步直接报缺哪个，
 # 不会白编一小时才失败。
 # ─────────────────────────────────────────────────────────────
 
 on:
   workflow_dispatch:
     inputs:
-      base_repo:
-        description: '① 基座仓库'
+      repo:
+        description: '① 源码仓库'
         type: choice
         default: 'immortalwrt/immortalwrt'
         options:
@@ -38,8 +39,8 @@ on:
           - 'openwrt/openwrt'
           - 'coolsnowwolf/lede'
 
-      base_ref:
-        description: '① 基座分支 / tag / commit（跟着上面那个仓库走）'
+      ref:
+        description: '① 分支 / tag / commit（属于上面选中的仓库）'
         type: string
         default: 'master'
 
@@ -60,6 +61,8 @@ on:
           - 'ssr-plus'
           - 'homeproxy'
           - 'daed'
+          - 'dae'
+          - 'honk'
           - 'nikki'
 
 permissions:
@@ -74,8 +77,8 @@ env:
 
   # 这四个来自 inputs，在 job 级声明，下面 `if:` 才能引用（env 上下文在
   # 求值 if 时只看静态定义，$GITHUB_ENV 里写进去的值是拿不到的）。
-  BASE_REPO: ${{ inputs.base_repo }}
-  BASE_REF: ${{ inputs.base_ref }}
+  REPO: ${{ inputs.repo }}
+  REF: ${{ inputs.ref }}
   PROXY_STACK: ${{ inputs.proxy_stack }}
   LAN_IP: ${{ inputs.lan_ip }}
 
@@ -97,9 +100,9 @@ jobs:
           set -euo pipefail
           fail() { echo "::error::$*"; exit 1; }
 
-          [[ -n "${BASE_REF// }" ]] || fail "base_ref 不能为空"
-          [[ "$BASE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail "base_repo 形态不对：$BASE_REPO"
-          [[ "$BASE_REF" =~ ^[A-Za-z0-9_./-]+$ ]] || fail "base_ref 里出现了非法字符：$BASE_REF"
+          [[ -n "${REF// }" ]] || fail "ref（分支 / tag / commit）不能为空"
+          [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail "repo 要写成 owner/name：$REPO"
+          [[ "$REF" =~ ^[A-Za-z0-9_./-]+$ ]] || fail "ref 里出现了非法字符：$REF"
 
           # lan_ip：允许带 "/24"，统一去掉；逐段查范围；挡掉明显不能当 LAN 的地址。
           ip="${LAN_IP%%/*}"
@@ -113,6 +116,8 @@ jobs:
           esac
 
           # 代理栈 → 实际包名。配方都在 kenzok8/small，别名见 README。
+          # daed 与 dae 共用 luci-app-daede 这个前端，后端靠 choice 区分，
+          # 具体选哪个在「生成 .config」那步写死（默认是 daed）。
           case "$PROXY_STACK" in
             none)      pkgs="" ;;
             openclash) pkgs="luci-app-openclash" ;;
@@ -121,12 +126,14 @@ jobs:
             ssr-plus)  pkgs="luci-app-ssr-plus" ;;
             homeproxy) pkgs="luci-app-homeproxy" ;;
             daed)      pkgs="luci-app-daede daed" ;;
+            dae)       pkgs="luci-app-daede dae" ;;
+            honk)      pkgs="luci-app-honk honk" ;;
             nikki)     pkgs="luci-app-nikki" ;;
             *) fail "未知 proxy_stack：$PROXY_STACK" ;;
           esac
 
           # 只往下传这两个：LAN_IP 是归一化后的地址，PROXY_PKGS 是查表结果。
-          # BASE_REPO / BASE_REF / PROXY_STACK 已经是 job 级 env，不用再写。
+          # REPO / REF / PROXY_STACK 已经是 job 级 env，不用再写。
           {
             echo "LAN_IP=$ip"
             echo "PROXY_PKGS=$pkgs"
@@ -137,12 +144,12 @@ jobs:
             echo
             echo "| 项 | 值 |"
             echo "|---|---|"
-            echo "| 基座 | \`$BASE_REPO\` @ \`$BASE_REF\` |"
+            echo "| 源码 | \`$REPO\` @ \`$REF\` |"
             echo "| 默认 LAN | \`$ip/24\` |"
             echo "| 代理栈 | \`$PROXY_STACK\`${pkgs:+ → \`$pkgs\`} |"
             echo "| 目标 | \`$QH_TARGET/$QH_SUBTARGET\` → \`$QH_DEVICE\` |"
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "参数 OK：$BASE_REPO@$BASE_REF | LAN=$ip | proxy=$PROXY_STACK($pkgs)"
+          echo "参数 OK：$REPO@$REF | LAN=$ip | proxy=$PROXY_STACK($pkgs)"
 
       # runner 只有 ~14G 可用，整树编译要 ~30G。不清理会满盘，
       # 症状是「包级 failed to build 但没有编译错误」，非常误导。
@@ -167,11 +174,24 @@ jobs:
             libssl-dev make patch perl python3 python3-setuptools rsync unzip wget \
             zlib1g-dev zstd
 
-      - name: 检出基座源码
+          # dae / daed 要编 eBPF，bpf-headers 硬性要求 host 有 clang 和 llvm 那套
+          # 工具（llc / opt / llvm-dis / llvm-strip），版本 ≥ 12。runner 一般自带，
+          # 缺哪个补哪个；不装的话会在 bpf.mk 里直接 Stop，报错信息还看不到原因。
+          case "$PROXY_STACK" in
+            daed|dae)
+              for t in clang llc opt llvm-dis llvm-strip; do
+                command -v "$t" >/dev/null 2>&1 || { echo "缺 $t，安装 clang + llvm"; sudo apt-get install -y clang llvm; break; }
+              done
+              clang --version | head -1
+              llc --version 2>/dev/null | head -3 | tail -1 || true
+              ;;
+          esac
+
+      - name: 检出源码
         uses: actions/checkout@v7
         with:
-          repository: ${{ inputs.base_repo }}
-          ref: ${{ inputs.base_ref }}
+          repository: ${{ inputs.repo }}
+          ref: ${{ inputs.ref }}
           fetch-depth: 1
           path: openwrt
 
@@ -184,17 +204,17 @@ jobs:
             echo "- 实际 commit：\`$(git log -1 --format='%H %ci %s')\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          # 三个基座都有 ipq807x.mk，但万一将来某个分支把 qnap_301w 挪走/删掉，
+          # 三个仓库都有 ipq807x.mk，但万一将来某个分支把 qnap_301w 挪走/删掉，
           # 这里立刻红，比编到 image 阶段才发现强。
           dev_mk="target/linux/$QH_TARGET/image/$QH_SUBTARGET.mk"
-          [[ -f "$dev_mk" ]] || { echo "::error::$dev_mk 不存在，这个基座不支持 $QH_TARGET/$QH_SUBTARGET"; exit 1; }
+          [[ -f "$dev_mk" ]] || { echo "::error::$dev_mk 不存在，$REPO@$REF 里没有 $QH_TARGET/$QH_SUBTARGET"; exit 1; }
           grep -q "Device/$QH_DEVICE" "$dev_mk" \
-            || { echo "::error::$dev_mk 里没有 Device/$QH_DEVICE，该基座不支持这台机器"; exit 1; }
+            || { echo "::error::$dev_mk 里没有 Device/$QH_DEVICE，$REPO@$REF 不支持这台机器"; exit 1; }
           echo "设备定义 OK：$dev_mk 含 Device/$QH_DEVICE"
 
       # ── ② 默认 LAN 地址 ──────────────────────────────────────
       # 用 uci-defaults 而不是改 target 的 /etc/config/network：
-      #   · 不绑死具体设备，换基座也对
+      #   · 不绑死具体设备，换仓库也对
       #   · uci-defaults 由 /etc/init.d/boot（START=10）跑，network 是 START=20，
       #     所以首次开机网络起来时地址已经是新的，不用再重启一次
       #   · 脚本执行后自动删除，不会在系统里留垃圾
@@ -265,7 +285,7 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      # 早失败：基座缺内置包时不要等到编一小时后再发现。
+      # 早失败：仓库的 feed 缺内置包时不要等到编一小时后再发现。
       - name: feeds 自检（内置包是否存在于 feed 中）
         working-directory: openwrt
         run: |
@@ -280,8 +300,8 @@ jobs:
             fi
           done
           if (( ${#missing[@]} > 0 )); then
-            echo "::error::$BASE_REPO@$BASE_REF 的 feed 里没有：${missing[*]}"
-            echo "::error::这 8 个内置包是固定的。当前基座缺包，请改用 immortalwrt/immortalwrt（8 个全在），或改 PKGS_BUILTIN 去掉缺的那个"
+            echo "::error::$REPO@$REF 的 feed 里没有：${missing[*]}"
+            echo "::error::这 8 个内置包是固定的。当前仓库缺包，请把 repo 换成 immortalwrt/immortalwrt（8 个全在），或改 PKGS_BUILTIN 去掉缺的那个"
             exit 1
           fi
 
@@ -307,18 +327,11 @@ jobs:
             echo "CONFIG_PACKAGE_${p}=y" >> .config
           done
 
+          # daed / dae / honk 的 eBPF 程序靠 CO-RE 读内核结构，没有 BTF 一启动就崩。
+          # 注意这只是"请求"：内核 Kconfig 里 BTF 还 depends on PAHOLE_VERSION >= 116，
+          # pahole 不在 PATH 时会被静默关掉，所以下面编译前会显式把 dwarves 编出来。
           case "$PROXY_STACK" in
-            openclash)
-              # openclash 的 DEPENDS 是 dnsmasq-full；不显式关掉会和默认的
-              # dnsmasq 撞成 recursive dependency，defconfig 直接报错。
-              echo "CONFIG_PACKAGE_dnsmasq=n" >> .config
-              echo "CONFIG_PACKAGE_dnsmasq-full=y" >> .config
-              ;;
-            daed)
-              # daed 的 eBPF 程序靠 CO-RE 读内核结构，没有 BTF 一启动就崩。
-              # 注意这只是"请求"，内核 Kconfig 里 BTF 还 depends on
-              # PAHOLE_VERSION >= 116 —— pahole 不在 PATH 时会被静默关掉，
-              # 所以下面编译前会显式把 dwarves 编出来。
+            daed|dae|honk)
               echo "CONFIG_KERNEL_DEBUG_INFO=y" >> .config
               echo "CONFIG_KERNEL_DEBUG_INFO_REDUCED=n" >> .config
               echo "CONFIG_KERNEL_DEBUG_INFO_BTF=y" >> .config
@@ -328,6 +341,46 @@ jobs:
               echo "CONFIG_PACKAGE_kmod-sched-bpf=y" >> .config
               echo "CONFIG_PACKAGE_kmod-veth=y" >> .config
               echo "CONFIG_PACKAGE_kmod-xdp-sockets-diag=y" >> .config
+              ;;
+          esac
+
+          case "$PROXY_STACK" in
+            openclash)
+              # openclash 的 DEPENDS 是 dnsmasq-full；不显式关掉会和默认的
+              # dnsmasq 撞成 recursive dependency，defconfig 直接报错。
+              echo "CONFIG_PACKAGE_dnsmasq=n" >> .config
+              echo "CONFIG_PACKAGE_dnsmasq-full=y" >> .config
+              ;;
+          esac
+
+          # dae / daed 的 eBPF 要 bpf-headers，而 bpf-headers 需要一套 host LLVM。
+          # 「用哪套 LLVM」是 toolchain/Config.in 里的 choice BPF_TOOLCHAIN，它的
+          # prompt 带 `if DEVEL` —— 不开 DEVEL 就不可见，而 kconfig 对不可见符号
+          # 一律取 default、无视 .config 里写的值（和隐藏包是同一个坑）。
+          # 默认值是 BUILD_LLVM：在 git 树上（没有 llvm-bpf/.llvm-version）等于
+          # 现场编一遍 LLVM 22，一小时起步、十几 G 磁盘，CI 里根本跑不完。
+          # 所以开 DEVEL 把这个 choice 露出来，显式选 host LLVM。
+          # DEVEL 在本树里只影响这一个 choice（其余 !DEVEL 条件都在同一处）。
+          case "$PROXY_STACK" in
+            daed|dae)
+              echo "CONFIG_DEVEL=y" >> .config
+              echo "CONFIG_BPF_TOOLCHAIN_HOST=y" >> .config
+              echo "CONFIG_USE_LLVM_HOST=y" >> .config
+              ;;
+          esac
+
+          case "$PROXY_STACK" in
+            daed|dae)
+              # daed 与 dae 共用 luci-app-daede 前端，后端是个 choice，默认选 daed。
+              # 不显式改过去，选 dae 时会连 daed 一起拖进来 —— 两个 eBPF 代理
+              # 抢同一套挂载点，跑不起来。
+              for b in daed dae; do
+                if [[ "$b" == "$PROXY_STACK" ]]; then
+                  echo "CONFIG_PACKAGE_luci-app-daede_${b}=y" >> .config
+                else
+                  echo "CONFIG_PACKAGE_luci-app-daede_${b}=n" >> .config
+                fi
+              done
               ;;
           esac
 
@@ -350,7 +403,40 @@ jobs:
               bad=$((bad + 1))
             fi
           done
-          [[ "$bad" -eq 0 ]] || { echo "::error::共 $bad 个包没被选中"; exit 1; }
+
+          # daed 与 dae 共用一个前端，后端是 choice。选错会连另一个一起装进来，
+          # 或者两个都没选（dae 还要求内核真的带 BTF 才会给出 DAE_USE_KERNEL_BTF）。
+          case "$PROXY_STACK" in
+            daed|dae)
+              other=$([[ "$PROXY_STACK" == "dae" ]] && echo daed || echo dae)
+              grep -q "^CONFIG_PACKAGE_luci-app-daede_${PROXY_STACK}=y" .config \
+                || { echo "::error::luci-app-daede 的后端没选成 $PROXY_STACK"; bad=$((bad + 1)); }
+              if grep -q "^CONFIG_PACKAGE_${other}=y" .config; then
+                echo "::error::luci-app-daede 把 $other 也带进来了，两者必须互斥"
+                bad=$((bad + 1))
+              fi
+              ;;
+          esac
+
+          # dae 的 BTF 来源也是 choice：内核真带 BTF 时才选得中 DAE_USE_KERNEL_BTF，
+          # 否则会掉到 vmlinux-btf 包（我们没有装），运行时起不来。
+          if [[ "$PROXY_STACK" == "dae" ]]; then
+            grep -q "^CONFIG_KERNEL_DEBUG_INFO_BTF=y" .config \
+              || { echo "::error::dae 需要内核 BTF，但 CONFIG_KERNEL_DEBUG_INFO_BTF 不是 y"; bad=$((bad + 1)); }
+            grep -q "^CONFIG_DAE_USE_KERNEL_BTF=y" .config \
+              || { echo "::error::dae 没有选到 DAE_USE_KERNEL_BTF，CO-RE 会缺 BTF 来源"; bad=$((bad + 1)); }
+          fi
+
+          # host LLVM 必须活到 defconfig 之后，否则 bpf-headers 会在 bpf.mk 里
+          # 直接 Stop，报错只有一句 "LLVM/clang version too old ... found: ."。
+          case "$PROXY_STACK" in
+            daed|dae)
+              grep -q "^CONFIG_USE_LLVM_HOST=y" .config \
+                || { echo "::error::CONFIG_USE_LLVM_HOST 没活下来，eBPF 会退化成源码编 LLVM"; bad=$((bad + 1)); }
+              ;;
+          esac
+
+          [[ "$bad" -eq 0 ]] || { echo "::error::共 $bad 项没通过"; exit 1; }
           echo "--- 生效的 target / device ---"
           grep -E "^CONFIG_TARGET_(${QH_TARGET}|DEVICE_|MULTI_PROFILE)" .config
 
@@ -377,12 +463,26 @@ jobs:
           (
             # pahole：内核 BTF 的 Kconfig 依赖 PAHOLE_VERSION >= 116，
             # pahole 缺失时 olddefconfig 会把 CONFIG_DEBUG_INFO_BTF 静默改成 n，
-            # 构建全绿但 daed 一跑就崩。不用 BTF 的变体不编它，省两分钟。
-            if [[ "$PROXY_STACK" == "daed" ]]; then
-              echo "--- 预编 dwarves（pahole）---"
-              timeout 900 make tools/dwarves/compile V=s </dev/null \
-                || echo "::warning::dwarves 预编失败，内核 BTF 可能被静默关掉"
-            fi
+            # 构建全绿但 daed / dae / honk 一跑就崩。不用 BTF 的变体不编它，省两分钟。
+            case "$PROXY_STACK" in
+              daed|dae|honk)
+                echo "--- 预编 dwarves（pahole）---"
+                timeout 900 make tools/dwarves/compile V=s </dev/null \
+                  || echo "::warning::dwarves 预编失败，内核 BTF 可能被静默关掉"
+                ;;
+            esac
+
+            # po2lmo：luci-app-daede（daed / dae 的前端）与 small 版 openclash 的
+            # Makefile 里直接调它，但这两个配方都没写 PKG_BUILD_DEPENDS:=luci-base/host，
+            # 并行编译时就可能先编到它们、po2lmo 还没生成，报 "po2lmo: not found"。
+            # 单独把 host 版编出来只要一两秒，换掉这条最莫名其妙的失败。
+            case "$PROXY_STACK" in
+              daed|dae|openclash)
+                echo "--- 预编 luci-base/host（po2lmo / jsmin）---"
+                timeout 900 make package/luci-base/host/compile V=s </dev/null \
+                  || echo "::warning::luci-base/host 预编失败，luci 的多语言编译可能受影响"
+                ;;
+            esac
 
             # V=s：包级输出直接进日志，避免只剩一句 "failed to build"
             make -j"$(nproc)" V=s

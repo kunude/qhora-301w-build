@@ -7,21 +7,26 @@
 
 Actions 里三个入口：
 
-| 入口 | 基座 | 用途 |
+| 入口 | 源码仓库 | 用途 |
 |---|---|---|
 | **Build ImmortalWrt** | `immortalwrt/immortalwrt` | 正式线。**移植** NSS：构建时把 ppe-nss 的 `nss-wifi-drv` + 18 个 mac80211 补丁搬进来（`nss` 可选，默认开） |
 | **Build OpenWrt (NSS)** | `JuliusBairaktaris/openwrt-ppe-nss@ppe-nss` | 正式线。**整树** NSS：直接编那棵树，组件本来就在里面 |
-| **Build · 固件** | 任选（`immortalwrt` / `openwrt` / `lede`） | 简化线：选基座和分支、设默认 LAN 地址、固定 8 个内置包、代理栈单选（配方取自 `kenzok8/small`）。**不带 NSS** |
+| **Build · 固件** | 任选（`immortalwrt` / `openwrt` / `lede`） | 简化线：选仓库和分支、设默认 LAN 地址、固定 8 个内置包、代理栈单选（配方取自 `kenzok8/small`）。**不带 NSS** |
 
 前两个的 `proxy` 取值一样：`daed` `dae` `honk` `homeproxy` `singbox` `passwall`
 `passwall2` `none`。另有 `extra_packages`（额外插件，逗号分隔）和 `release`。
 
-第三个只有四个选项：`base_repo` + `base_ref`、`lan_ip`（默认 `192.168.35.1`）、
-`proxy_stack`（`none` `openclash` `passwall` `passwall2` `ssr-plus` `homeproxy`
-`daed` `nikki`）。内置包固定为 `ddns-go` `msd_lite` `luci-app-ddns-go`
-`luci-app-msd_lite` `wireguard-tools` `kmod-wireguard` `luci-proto-wireguard`
-`qrencode` + `luci`，不用选。它不调用本仓库的脚本、不叠 `configs/*.config`，
-`.config` 与 LAN 覆盖都是现场生成的 —— 定位「上游的问题还是我们的问题」时也用它。
+第三个只有四个选项：`repo`（源码仓库）、`ref`（分支 / tag / commit）、`lan_ip`
+（默认 `192.168.35.1`）、`proxy_stack`（`none` `openclash` `passwall` `passwall2`
+`ssr-plus` `homeproxy` `daed` `dae` `honk` `nikki`）。内置包固定为 `ddns-go`
+`msd_lite` `luci-app-ddns-go` `luci-app-msd_lite` `wireguard-tools`
+`kmod-wireguard` `luci-proto-wireguard` `qrencode` + `luci`，不用选。它不调用
+本仓库的脚本、不叠 `configs/*.config`，`.config` 与 LAN 覆盖都是现场生成的 ——
+定位「上游的问题还是我们的问题」时也用它。
+
+> `daed` 与 `dae` 共用 `luci-app-daede` 这个 LuCI 前端，后端由 workflow 里的
+> choice 指定（默认 daed）。选 `dae` 时会显式把 daed 后端关掉，两者不会同时装。
+> `dae` / `daed` / `honk` 都要内核 BTF，构建前会自动编 `tools/dwarves` 拿 pahole。
 
 ## NSS：一套东西，两种落法
 
@@ -29,9 +34,9 @@ NSS 的 Wi-Fi 卸载不是一个 feed 包，而是四样：`nss-wifi-drv` 包 + 
 mac80211/ath11k 补丁 + mac80211 里的三处挂钩 + 内核侧的 EDMA/PPE 驱动。
 
 ```
-openwrt 基座  →  ppe-nss 整树直接编  →  四样都在树里，上游维护
-imm 基座      →  scripts/integrate-nss-wifi.sh 搬过来
-              →  有线加速也是同一套 EDMA/PPE，一起换
+openwrt + ppe-nss  →  整树直接编  →  四样都在树里，上游维护
+immortalwrt        →  scripts/integrate-nss-wifi.sh 搬过来
+                   →  有线加速也是同一套 EDMA/PPE，一起换
 ```
 
 第四样最容易漏：驱动直接调内核的 `qca_edma_cpu_queues_to_ring`、
@@ -279,15 +284,15 @@ feed 内跟依赖、跳过 `@条件`、也不处理 `+COND:pkg` 里的条件包�
 fork，它的 luci / packages feed 是**官方 openwrt** 的，没有 `dae` / `daed` /
 `homeproxy` 这些 ImmortalWrt 专属包。
 `extra-packages.sh` 会按「feed 里有没有」判断，缺了才从 immortalwrt 稀疏检出补进来
-（`place_imm_extra`）—— 判据是 feed 而不是树名，ImmortalWrt 基座直接跳过。
+（`place_imm_extra`）—— 判据是 feed 而不是树名，ImmortalWrt 的树直接跳过。
 
 ## 目录
 
 ```
 .github/workflows/
   _build.yml              两条线的共用实现（workflow_call，不手动触发）
-  build-immortalwrt.yml   入口 1：immortalwrt 基座（NSS 走移植）
-  build-openwrt-nss.yml   入口 2：openwrt 基座 + ppe-nss 整树
+  build-immortalwrt.yml   入口 1：immortalwrt 源码（NSS 走移植）
+  build-openwrt-nss.yml   入口 2：openwrt + ppe-nss 整树
   debug-singbox-pkg.yml   单包调试线（只编 sing-box，验配方）
 configs/
   common.config           所有变体共用
@@ -336,7 +341,7 @@ git clone --depth 1 -b ppe-nss https://github.com/JuliusBairaktaris/openwrt-ppe-
 
 ## 改完脚本先本地回归
 
-`scripts/test-local.sh` 在**真实基座树**上跑 `prepare.sh`，覆盖几组关键参数。
+`scripts/test-local.sh` 在**真实源码树**上跑 `prepare.sh`，覆盖几组关键参数。
 prepare 阶段只要 1~3 分钟，而同样的错误丢到 CI 上要等二十几分钟，且日志要
 admin 权限才下载得到。
 
