@@ -414,6 +414,13 @@ jobs:
               # daed 与 dae 共用 luci-app-daede 前端，后端是个 choice，默认选 daed。
               # 不显式改过去，选 dae 时会连 daed 一起拖进来 —— 两个 eBPF 代理
               # 抢同一套挂载点，跑不起来。
+              #
+              # 符号名别猜错：后端选项在 luci-app-daede 自己的 Package/config 里，
+              # 名字带前端前缀 —— CONFIG_PACKAGE_luci-app-daede_dae / …_daed。
+              # 很容易顺手写成 CONFIG_PACKAGE_luci-app-dae=y，那是另一个包：
+              # 官方 luci feed 的独立前端，DEPENDS +dae-geoip +dae-geosite，
+              # 而本构建里 dae 来自 kenzok8/small（用 v2ray-geoip/v2ray-geosite），
+              # dae-geoip / dae-geosite 根本不存在，符号能留下来但一编就报缺依赖。
               for b in daed dae; do
                 if [[ "$b" == "$PROXY_STACK" ]]; then
                   echo "CONFIG_PACKAGE_luci-app-daede_${b}=y" >> .config
@@ -455,6 +462,14 @@ jobs:
                 echo "::error::luci-app-daede 把 $other 也带进来了，两者必须互斥"
                 bad=$((bad + 1))
               fi
+              # 顺手挡住"符号写错成官方 luci-app-dae / daed"这种情况：这两个包的
+              # 依赖 dae-geoip / dae-geosite 在本构建里不存在，符号能留下但编不过。
+              for wrong in luci-app-dae luci-app-daed; do
+                if grep -q "^CONFIG_PACKAGE_${wrong}=y" .config; then
+                  echo "::error::$wrong 被选进来了：前端应该用 luci-app-daede（small），后端靠它的 choice 区分"
+                  bad=$((bad + 1))
+                fi
+              done
               ;;
           esac
 
