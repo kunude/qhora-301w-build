@@ -1,0 +1,449 @@
+name: Build · 固件（基座 / 默认IP / 内置包 / 代理栈）
+
+# ─────────────────────────────────────────────────────────────
+# 一条尽量简单的固件构建线：只依赖上游主树 + kenzok8/small，不调用本仓库的
+# prepare.sh / prepare-build.sh，也不做 NSS 移植（无线走 ath11k 原生驱动）。
+# 需要 NSS / honk / daed 预置配置 / 出厂 uci 覆盖那一套，用 build-immortalwrt.yml。
+#
+# 四个输入项：
+#   ① base_repo + base_ref  选基座仓库与分支（tag / commit 也行）
+#   ② lan_ip                刷机后默认 LAN 地址，出厂即生效
+#   ③ 内置包                 固定 8 个，不需要选，见 PKGS_BUILTIN
+#   ④ proxy_stack           代理栈单选，配方来自 kenzok8/small
+#
+# 为什么内置包不用选：这 8 个是这台机器的常备件（DDNS / 组播转单播 / WG / 二维码），
+# 每次构建都要，放进选项只会让人多点几下。要加东西改 PKGS_BUILTIN 即可。
+#
+# 代理栈为什么单选：openclash / passwall / ssr-plus / homeproxy 都要接管 53 与
+# 透明代理端口，同时装通常编得出来但跑起来互相抢流量。一次只装一个，省得排查。
+#
+# 基座兼容性（2026-11 实测）：
+#   immortalwrt/immortalwrt  8 个内置包全在官方 feed 里（ddns-go / msd_lite 在
+#                            packages feed，两个 luci-app 在 luci feed）
+#   coolsnowwolf/lede        有 ddns-go / msd_lite / luci-app-ddns-go，缺 luci-app-msd_lite
+#   openwrt/openwrt          官方 feed 里这 4 个都没有
+# 所以默认 immortalwrt；选别的基座会在「feeds 自检」这一步直接报缺哪个，
+# 不会白编一小时才失败。
+# ─────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_repo:
+        description: '① 基座仓库'
+        type: choice
+        default: 'immortalwrt/immortalwrt'
+        options:
+          - 'immortalwrt/immortalwrt'
+          - 'openwrt/openwrt'
+          - 'coolsnowwolf/lede'
+
+      base_ref:
+        description: '① 基座分支 / tag / commit（跟着上面那个仓库走）'
+        type: string
+        default: 'master'
+
+      lan_ip:
+        description: '② 默认 LAN 地址（刷机首次启动即生效）'
+        type: string
+        default: '192.168.35.1'
+
+      proxy_stack:
+        description: '④ 代理栈（单选；none = 不装任何代理）'
+        type: choice
+        default: 'none'
+        options:
+          - 'none'
+          - 'openclash'
+          - 'passwall'
+          - 'passwall2'
+          - 'ssr-plus'
+          - 'homeproxy'
+          - 'daed'
+          - 'nikki'
+
+permissions:
+  contents: read
+
+env:
+  # 别叫 TARGET / SUBTARGET：这两个名字会被 autotools 当成自己的变量读走，
+  # 历史上有过 libffi 把构建目录建错、一路编到最后才报错的事故。
+  QH_TARGET: qualcommax
+  QH_SUBTARGET: ipq807x
+  QH_DEVICE: qnap_301w
+
+  # 这四个来自 inputs，在 job 级声明，下面 `if:` 才能引用（env 上下文在
+  # 求值 if 时只看静态定义，$GITHUB_ENV 里写进去的值是拿不到的）。
+  BASE_REPO: ${{ inputs.base_repo }}
+  BASE_REF: ${{ inputs.base_ref }}
+  PROXY_STACK: ${{ inputs.proxy_stack }}
+  LAN_IP: ${{ inputs.lan_ip }}
+
+  # ③ 内置包：与选项无关，恒定编入。
+  PKGS_BUILTIN: >-
+    luci ddns-go msd_lite luci-app-ddns-go luci-app-msd_lite
+    wireguard-tools kmod-wireguard luci-proto-wireguard qrencode
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      # ── 输入校验：把能提前发现的错误挡在这里 ──────────────────
+      - name: 解析并校验输入
+        env:
+          LAN_IP: ${{ inputs.lan_ip }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+
+          [[ -n "${BASE_REF// }" ]] || fail "base_ref 不能为空"
+          [[ "$BASE_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail "base_repo 形态不对：$BASE_REPO"
+          [[ "$BASE_REF" =~ ^[A-Za-z0-9_./-]+$ ]] || fail "base_ref 里出现了非法字符：$BASE_REF"
+
+          # lan_ip：允许带 "/24"，统一去掉；逐段查范围；挡掉明显不能当 LAN 的地址。
+          ip="${LAN_IP%%/*}"
+          [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] \
+            || fail "lan_ip 不是 IPv4 地址：$LAN_IP"
+          for o in "${BASH_REMATCH[@]:1}"; do
+            (( 10#$o <= 255 )) || fail "lan_ip 有超出 255 的段：$LAN_IP"
+          done
+          case "$ip" in
+            0.*|127.*|169.254.*|255.*) fail "lan_ip 不能是 $ip（回环 / 链路本地 / 广播）" ;;
+          esac
+
+          # 代理栈 → 实际包名。配方都在 kenzok8/small，别名见 README。
+          case "$PROXY_STACK" in
+            none)      pkgs="" ;;
+            openclash) pkgs="luci-app-openclash" ;;
+            passwall)  pkgs="luci-app-passwall" ;;
+            passwall2) pkgs="luci-app-passwall2" ;;
+            ssr-plus)  pkgs="luci-app-ssr-plus" ;;
+            homeproxy) pkgs="luci-app-homeproxy" ;;
+            daed)      pkgs="luci-app-daede daed" ;;
+            nikki)     pkgs="luci-app-nikki" ;;
+            *) fail "未知 proxy_stack：$PROXY_STACK" ;;
+          esac
+
+          # 只往下传这两个：LAN_IP 是归一化后的地址，PROXY_PKGS 是查表结果。
+          # BASE_REPO / BASE_REF / PROXY_STACK 已经是 job 级 env，不用再写。
+          {
+            echo "LAN_IP=$ip"
+            echo "PROXY_PKGS=$pkgs"
+          } >> "$GITHUB_ENV"
+
+          {
+            echo "## 构建参数"
+            echo
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 基座 | \`$BASE_REPO\` @ \`$BASE_REF\` |"
+            echo "| 默认 LAN | \`$ip/24\` |"
+            echo "| 代理栈 | \`$PROXY_STACK\`${pkgs:+ → \`$pkgs\`} |"
+            echo "| 目标 | \`$QH_TARGET/$QH_SUBTARGET\` → \`$QH_DEVICE\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "参数 OK：$BASE_REPO@$BASE_REF | LAN=$ip | proxy=$PROXY_STACK($pkgs)"
+
+      # runner 只有 ~14G 可用，整树编译要 ~30G。不清理会满盘，
+      # 症状是「包级 failed to build 但没有编译错误」，非常误导。
+      - name: 释放磁盘空间
+        run: |
+          set -euo pipefail
+          df -h / | tail -1
+          sudo rm -rf /opt/hostedtoolcache /usr/share/dotnet /usr/local/lib/android \
+            /usr/share/swift /opt/ghc /usr/local/.ghcup /opt/az /usr/share/miniconda \
+            /usr/local/share/boost /usr/local/share/powershell /usr/local/share/chromium \
+            /usr/local/go /usr/lib/jvm || true
+          sudo apt-get clean
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          df -h / | tail -1
+
+      - name: 安装构建依赖
+        run: |
+          set -euo pipefail
+          sudo apt-get update || true
+          sudo apt-get install -y \
+            bzip2 file flex bison g++ gawk gcc gettext git libelf-dev libncurses-dev \
+            libssl-dev make patch perl python3 python3-setuptools rsync unzip wget \
+            zlib1g-dev zstd
+
+      - name: 检出基座源码
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.base_repo }}
+          ref: ${{ inputs.base_ref }}
+          fetch-depth: 1
+          path: openwrt
+
+      - name: 记录基线并确认设备存在
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+          git log -1 --format='%H %ci %s'
+          {
+            echo "- 实际 commit：\`$(git log -1 --format='%H %ci %s')\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # 三个基座都有 ipq807x.mk，但万一将来某个分支把 qnap_301w 挪走/删掉，
+          # 这里立刻红，比编到 image 阶段才发现强。
+          dev_mk="target/linux/$QH_TARGET/image/$QH_SUBTARGET.mk"
+          [[ -f "$dev_mk" ]] || { echo "::error::$dev_mk 不存在，这个基座不支持 $QH_TARGET/$QH_SUBTARGET"; exit 1; }
+          grep -q "Device/$QH_DEVICE" "$dev_mk" \
+            || { echo "::error::$dev_mk 里没有 Device/$QH_DEVICE，该基座不支持这台机器"; exit 1; }
+          echo "设备定义 OK：$dev_mk 含 Device/$QH_DEVICE"
+
+      # ── ② 默认 LAN 地址 ──────────────────────────────────────
+      # 用 uci-defaults 而不是改 target 的 /etc/config/network：
+      #   · 不绑死具体设备，换基座也对
+      #   · uci-defaults 由 /etc/init.d/boot（START=10）跑，network 是 START=20，
+      #     所以首次开机网络起来时地址已经是新的，不用再重启一次
+      #   · 脚本执行后自动删除，不会在系统里留垃圾
+      # DHCP 范围不用动：dhcp.lan 的 start=100/limit=150 是相对网段算的。
+      - name: 写入默认 LAN 地址
+        run: |
+          set -euo pipefail
+          mkdir -p openwrt/files/etc/uci-defaults
+          f=openwrt/files/etc/uci-defaults/99-set-lan-ip
+          cat > "$f" <<EOF
+          #!/bin/sh
+          # 构建时生成（build-firmware.yml）：把出厂 LAN 地址改成 ${LAN_IP}/24。
+          # 首次启动执行一次，成功后由 OpenWrt 自动删除。
+          if uci -q get network.lan >/dev/null 2>&1; then
+          	uci -q set network.lan.ipaddr='${LAN_IP}/24'
+          	uci -q commit network
+          else
+          	logger -t build-firmware "network.lan 不存在，跳过 LAN 地址设置"
+          fi
+          exit 0
+          EOF
+          chmod +x "$f"
+          echo "--- 生成的 $f ---"
+          cat "$f"
+
+      # ── ④ 代理栈：接入 kenzok8 的两个 feed ────────────────────
+      # 放在 feeds 更新之后、install 之前 —— 要先把官方 feed 拉下来，
+      # 才能删掉和 small 重名的那些目录。
+      #
+      # 顺序很重要：这两个 feed 写在 feeds.conf 最前面，同名包由它们提供。
+      # 官方 feed 里也有 xray-core / sing-box / mosdns 等，不删掉会出现重复包定义。
+      - name: 接入 kenzok8 feed
+        if: inputs.proxy_stack != 'none'
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+          {
+            echo "src-git kenzo https://github.com/kenzok8/openwrt-packages.git"
+            echo "src-git small https://github.com/kenzok8/small.git"
+            cat feeds.conf.default
+          } > feeds.conf
+          echo "--- feeds.conf ---"
+          cat feeds.conf
+
+          ./scripts/feeds update -a
+
+          # 去重清单照抄 kenzok8/small 的 README：这些包官方 feed 与 small 都有，
+          # 留着会重复定义。small 自己的版本因为 feed 排在最前面而生效。
+          rm -rf feeds/packages/net/alist feeds/packages/net/adguardhome \
+                 feeds/packages/net/mosdns feeds/packages/net/xray* \
+                 feeds/packages/net/v2ray* feeds/packages/net/sing* \
+                 feeds/packages/net/smartdns feeds/packages/utils/v2dat
+          rm -rf feeds/luci/applications/luci-app-mosdns
+
+          # golang 不换：immortalwrt / lede 当前 feed 里的 Go 都够新（lede 已到 1.27），
+          # README 里那步 `git clone kenzok8/golang -b 1.26` 是给老树的补丁，照抄反而降级。
+          # 真遇到 "go: module requires go >= x.y" 再在这里补：
+          #   rm -rf feeds/packages/lang/golang
+          #   git clone --depth 1 -b 1.26 https://github.com/kenzok8/golang.git feeds/packages/lang/golang
+
+          ./scripts/feeds install -a
+
+      - name: 初始化官方 feed
+        if: inputs.proxy_stack == 'none'
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      # 早失败：基座缺内置包时不要等到编一小时后再发现。
+      - name: feeds 自检（内置包是否存在于 feed 中）
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+          missing=()
+          for p in $PKGS_BUILTIN; do
+            if find feeds -maxdepth 4 -type d -name "$p" -print -quit | grep -q .; then
+              echo "OK   $p"
+            else
+              echo "MISS $p"
+              missing+=("$p")
+            fi
+          done
+          if (( ${#missing[@]} > 0 )); then
+            echo "::error::$BASE_REPO@$BASE_REF 的 feed 里没有：${missing[*]}"
+            echo "::error::这 8 个内置包是固定的。当前基座缺包，请改用 immortalwrt/immortalwrt（8 个全在），或改 PKGS_BUILTIN 去掉缺的那个"
+            exit 1
+          fi
+
+      # ── 生成 .config ─────────────────────────────────────────
+      # 只写 target/device + 包名，其余交给 kconfig 自己解依赖。
+      # 放在 feeds install 之后：第三方包名要先存在，符号才不会被丢弃。
+      - name: 生成 .config
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+          {
+            echo "CONFIG_TARGET_${QH_TARGET}=y"
+            echo "CONFIG_TARGET_${QH_TARGET}_${QH_SUBTARGET}=y"
+            echo "CONFIG_TARGET_MULTI_PROFILE=y"
+            echo "CONFIG_TARGET_PER_DEVICE_ROOTFS=y"
+            echo "CONFIG_TARGET_DEVICE_${QH_TARGET}_${QH_SUBTARGET}_DEVICE_${QH_DEVICE}=y"
+            echo "CONFIG_TARGET_ROOTFS_SQUASHFS=y"
+          } > .config
+
+          for p in $PKGS_BUILTIN $PROXY_PKGS; do
+            [[ -n "$p" ]] || continue
+            [[ "$p" =~ ^[A-Za-z0-9_.+-]+$ ]] || { echo "::error::非法包名：$p"; exit 1; }
+            echo "CONFIG_PACKAGE_${p}=y" >> .config
+          done
+
+          case "$PROXY_STACK" in
+            openclash)
+              # openclash 的 DEPENDS 是 dnsmasq-full；不显式关掉会和默认的
+              # dnsmasq 撞成 recursive dependency，defconfig 直接报错。
+              echo "CONFIG_PACKAGE_dnsmasq=n" >> .config
+              echo "CONFIG_PACKAGE_dnsmasq-full=y" >> .config
+              ;;
+            daed)
+              # daed 的 eBPF 程序靠 CO-RE 读内核结构，没有 BTF 一启动就崩。
+              # 注意这只是"请求"，内核 Kconfig 里 BTF 还 depends on
+              # PAHOLE_VERSION >= 116 —— pahole 不在 PATH 时会被静默关掉，
+              # 所以下面编译前会显式把 dwarves 编出来。
+              echo "CONFIG_KERNEL_DEBUG_INFO=y" >> .config
+              echo "CONFIG_KERNEL_DEBUG_INFO_REDUCED=n" >> .config
+              echo "CONFIG_KERNEL_DEBUG_INFO_BTF=y" >> .config
+              echo "CONFIG_KERNEL_BPF_EVENTS=y" >> .config
+              echo "CONFIG_KERNEL_XDP_SOCKETS=y" >> .config
+              echo "CONFIG_PACKAGE_kmod-sched-core=y" >> .config
+              echo "CONFIG_PACKAGE_kmod-sched-bpf=y" >> .config
+              echo "CONFIG_PACKAGE_kmod-veth=y" >> .config
+              echo "CONFIG_PACKAGE_kmod-xdp-sockets-diag=y" >> .config
+              ;;
+          esac
+
+          echo "--- 请求的 .config ---"
+          cat .config
+
+      - name: defconfig 并核对符号
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+          make defconfig
+          want="$PKGS_BUILTIN $PROXY_PKGS"
+          bad=0
+          for p in $want; do
+            [[ -n "$p" ]] || continue
+            if grep -q "^CONFIG_PACKAGE_${p}=y" .config; then
+              echo "OK  $p"
+            else
+              echo "::error::$p 被 defconfig 丢弃（依赖不满足 / 包不存在）"
+              bad=$((bad + 1))
+            fi
+          done
+          [[ "$bad" -eq 0 ]] || { echo "::error::共 $bad 个包没被选中"; exit 1; }
+          echo "--- 生效的 target / device ---"
+          grep -E "^CONFIG_TARGET_(${QH_TARGET}|DEVICE_|MULTI_PROFILE)" .config
+
+      - name: 下载源码包
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+          for i in 1 2 3; do
+            make download -j"$(nproc)" && exit 0
+            echo "::warning::download 第 $i 次失败，重试"
+          done
+          exit 1
+
+      - name: 编译
+        working-directory: openwrt
+        env:
+          BUILD_LOG: ${{ runner.temp }}/build.log
+        run: |
+          # run 块默认带 -e，接不住 make 的失败；先关掉才能做完"失败现场"。
+          set +e
+          set -uo pipefail
+          : > "$BUILD_LOG"
+
+          (
+            # pahole：内核 BTF 的 Kconfig 依赖 PAHOLE_VERSION >= 116，
+            # pahole 缺失时 olddefconfig 会把 CONFIG_DEBUG_INFO_BTF 静默改成 n，
+            # 构建全绿但 daed 一跑就崩。不用 BTF 的变体不编它，省两分钟。
+            if [[ "$PROXY_STACK" == "daed" ]]; then
+              echo "--- 预编 dwarves（pahole）---"
+              timeout 900 make tools/dwarves/compile V=s </dev/null \
+                || echo "::warning::dwarves 预编失败，内核 BTF 可能被静默关掉"
+            fi
+
+            # V=s：包级输出直接进日志，避免只剩一句 "failed to build"
+            make -j"$(nproc)" V=s
+          ) 2>&1 | tee -a "$BUILD_LOG"
+          rc=${PIPESTATUS[0]}
+          echo "make 退出码：$rc"
+          exit "$rc"
+
+      - name: 失败现场
+        if: failure()
+        run: |
+          log="$RUNNER_TEMP/build.log"
+          df -h / || true
+          if [[ -s "$log" ]]; then
+            # 补丁失败那几类关键词必须在内：2026-11-14 就因为漏了它，
+            # 公开注解里只剩 make 的 Error 1，看不到真正原因。
+            grep -nE '(Patch failed|hunk .*FAILED|patch does not apply|can.t find file to patch|saving rejects to file|ERROR: .* failed to build|\*\*\* \[.*\] Error|No space left on device|Killed|fatal error:|No rule to make target|Error [0-9]+$)' "$log" \
+              | tail -40 | while IFS= read -r line; do echo "::error::$line"; done || true
+            echo "--- build.log 末尾 ---"
+            tail -60 "$log"
+          else
+            echo "没有编译日志（编译步骤之前就失败了）"
+          fi
+
+      - name: 上传编译日志
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-log-run${{ github.run_number }}
+          path: ${{ runner.temp }}/build.log
+          if-no-files-found: ignore
+
+      # ── 产物 ────────────────────────────────────────────────
+      - name: 收集产物
+        if: success()
+        id: collect
+        run: |
+          set -euo pipefail
+          out="openwrt/bin/targets/$QH_TARGET/$QH_SUBTARGET"
+          [[ -d "$out" ]] || { echo "::error::$out 不存在，没编出镜像"; exit 1; }
+          echo "--- 产物 ---"
+          ls -lh "$out"
+          img=$(find "$out" -maxdepth 1 -type f \( -name '*squashfs*sysupgrade*.bin' -o -name '*squashfs*.bin' \) -printf '%s %p\n' | sort -rn | head -1 | awk '{print $2}')
+          [[ -n "$img" ]] || { echo "::error::没找到 squashfs 镜像"; exit 1; }
+          echo "主镜像：$img（$(du -h "$img" | cut -f1)）"
+          echo "IMG=$img" >> "$GITHUB_OUTPUT"
+          {
+            echo
+            echo "## 产物"
+            echo
+            echo "- 镜像：\`$(basename "$img")\`（$(du -h "$img" | cut -f1)）"
+            if ls "$out"/*.manifest >/dev/null 2>&1; then
+              echo "- rootfs 包数：\`$(cat "$out"/*.manifest | wc -l) 行\`"
+            fi
+            echo "- 刷机后默认地址：\`http://$LAN_IP/\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传镜像
+        if: success()
+        uses: actions/upload-artifact@v7
+        with:
+          name: firmware-${{ env.PROXY_STACK }}-${{ github.run_number }}
+          path: openwrt/bin/targets/qualcommax/ipq807x
+          if-no-files-found: error

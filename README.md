@@ -1,19 +1,27 @@
 # QHora-301W 固件构建
 
 为 **QNAP QHora-301W**（`qualcommax` / `ipq807x` / `qnap_301w`，IPQ8072A + NSS）
-编译 OpenWrt / ImmortalWrt 固件。两条线，各自一个入口，代理栈在两边都能选。
+编译 OpenWrt / ImmortalWrt 固件。三条线，各自一个入口。
 
 ## 怎么用
 
-Actions 里两个入口，按基座选：
+Actions 里三个入口：
 
-| 入口 | 基座 | NSS 怎么来 |
+| 入口 | 基座 | 用途 |
 |---|---|---|
-| **Build ImmortalWrt** | `immortalwrt/immortalwrt` | **移植**：构建时把 ppe-nss 的 `nss-wifi-drv` + 18 个 mac80211 补丁搬进来（`nss` 可选，默认开） |
-| **Build OpenWrt (NSS)** | `JuliusBairaktaris/openwrt-ppe-nss@ppe-nss` | **整树**：直接编那棵树，组件本来就在里面 |
+| **Build ImmortalWrt** | `immortalwrt/immortalwrt` | 正式线。**移植** NSS：构建时把 ppe-nss 的 `nss-wifi-drv` + 18 个 mac80211 补丁搬进来（`nss` 可选，默认开） |
+| **Build OpenWrt (NSS)** | `JuliusBairaktaris/openwrt-ppe-nss@ppe-nss` | 正式线。**整树** NSS：直接编那棵树，组件本来就在里面 |
+| **Build · 固件** | 任选（`immortalwrt` / `openwrt` / `lede`） | 简化线：选基座和分支、设默认 LAN 地址、固定 8 个内置包、代理栈单选（配方取自 `kenzok8/small`）。**不带 NSS** |
 
-两边的 `proxy` 取值一样：`daed` `dae` `honk` `homeproxy` `singbox` `passwall`
+前两个的 `proxy` 取值一样：`daed` `dae` `honk` `homeproxy` `singbox` `passwall`
 `passwall2` `none`。另有 `extra_packages`（额外插件，逗号分隔）和 `release`。
+
+第三个只有四个选项：`base_repo` + `base_ref`、`lan_ip`（默认 `192.168.35.1`）、
+`proxy_stack`（`none` `openclash` `passwall` `passwall2` `ssr-plus` `homeproxy`
+`daed` `nikki`）。内置包固定为 `ddns-go` `msd_lite` `luci-app-ddns-go`
+`luci-app-msd_lite` `wireguard-tools` `kmod-wireguard` `luci-proto-wireguard`
+`qrencode` + `luci`，不用选。它不调用本仓库的脚本、不叠 `configs/*.config`，
+`.config` 与 LAN 覆盖都是现场生成的 —— 定位「上游的问题还是我们的问题」时也用它。
 
 ## NSS：一套东西，两种落法
 
