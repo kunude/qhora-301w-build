@@ -487,6 +487,30 @@ jobs:
           # 不打开这个开关时，整棵树一个 zh-cn 语言包都不会编出来，界面就是英文。
           echo "CONFIG_LUCI_LANG_zh_Hans=y" >> .config
 
+          # 掐掉 kenzok8/small 里 ssr-plus 的一组"全局 choice"默认值，否则 xray-core
+          # 会被悄悄 select 进固件（实测：即使用不到 ssr-plus、连父包都写 =n 也拦不住）。
+          # 根因：small 的 luci-app-ssr-plus 把 V2ray-core Selection 写成
+          #   choice / default PACKAGE_luci-app-ssr-plus_INCLUDE_Xray
+          # 而 INCLUDE_Xray / INCLUDE_Http_Proxy / INCLUDE_GeoData 这些 config 是顶层的，
+          # 没有 depends on PACKAGE_luci-app-ssr-plus。Kconfig 处理 choice 时必定按
+          # default 落一个值，INCLUDE_Xray 就 select PACKAGE_xray-core，
+          # INCLUDE_Http_Proxy 默认 y 又 select PACKAGE_3proxy —— 于是选了 honk/dae，
+          # rootfs 里却多出 xray-core + 3proxy（manifest 实测有，buildinfo 里却没有，
+          # 因为它们是 select 进来的，不是显式配置的）。
+          # 解法：把这一组 choice 显式落到"什么都不带"的分支：V2ray 选 NONE，
+          # 其余默认 y 的 INCLUDE_* 全部置 n。注意父包写 =n 无效（顶层符号不认），
+          # 必须针对这几个符号本身；NONE 要写 =y 才能赢过 choice 的 default Xray。
+          # 只有接入了 small feed 才有这组符号（none 场景不接 small）。
+          if [[ "$PROXY_STACK" != "none" ]]; then
+            {
+              echo "CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_NONE_V2RAY=y"
+              echo "CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_Xray=n"
+              echo "CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_Http_Proxy=n"
+              echo "CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_Mihomo=n"
+              echo "CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_GeoData=n"
+            } >> .config
+          fi
+
           # daed / dae / honk 的 eBPF 程序靠 CO-RE 读内核结构，没有 BTF 一启动就崩。
           # 注意这只是"请求"：内核 Kconfig 里 BTF 还 depends on PAHOLE_VERSION >= 116，
           # pahole 不在 PATH 时会被静默关掉，所以下面编译前会显式把 dwarves 编出来。
@@ -645,6 +669,17 @@ jobs:
             grep -q "^CONFIG_KERNEL_DEBUG_INFO_BTF=y" .config \
               || { echo "::error::honk 需要内核 BTF，但 CONFIG_KERNEL_DEBUG_INFO_BTF 不是 y"; bad=$((bad + 1)); }
           fi
+
+          # 全局守卫：本构建没有任何代理栈需要 xray-core / 3proxy。它们一旦出现，
+          # 就是 kenzok8/small 里 ssr-plus 那组顶层 choice 默认值没被压住（见生成
+          # .config 那步的注释），会白白把镜像撑大、还带来没配过的安全面。选 none
+          # 时没接 small feed，这两个符号本就不该存在。
+          for stray in xray-core 3proxy; do
+            if grep -q "^CONFIG_PACKAGE_${stray}=y" .config; then
+              echo "::error::$stray 被 ssr-plus 的全局 choice 默认 select 进来了，需在生成 .config 时压住那一组 choice"
+              bad=$((bad + 1))
+            fi
+          done
 
           # host LLVM 必须活到 defconfig 之后，否则 bpf-headers 会在 bpf.mk 里
           # 直接 Stop，报错只有一句 "LLVM/clang version too old ... found: ."。
