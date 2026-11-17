@@ -1,19 +1,18 @@
-name: Build · 固件（仓库 / 默认IP / 内置包 / 代理栈）
+name: Build · 固件（仓库 / 默认IP / DDNS / 代理栈）
 
 # ─────────────────────────────────────────────────────────────
 # 一条尽量简单的固件构建线：只依赖上游源码树 + kenzok8/small，不调用本仓库的
 # prepare.sh / prepare-build.sh，也不做 NSS 移植（无线走 ath11k 原生驱动）。
 # 需要 NSS / 出厂 uci 覆盖那一套，用 build-immortalwrt.yml。
 #
-# 四个输入项：
+# 五个输入项：
 #   ① repo + ref      从哪个仓库、哪个分支取源码（tag / commit 也行）
-#   ①② lan_ip          刷机后默认 LAN 地址，出厂即生效；界面语言固定简体中文
-#   ③ 内置包           固定 12 个（immortalwrt 再加一个 autocore），不需要选，见 PKGS_BUILTIN
+#   ② lan_ip          刷机后默认 LAN 地址，出厂即生效；界面语言固定简体中文
+#   ③ ddns            DDNS 二选一：ddns（脚本版+阿里云，<1M）/ ddns-go（Go 版，11M）
 #   ④ proxy_stack     代理栈单选，配方来自 kenzok8/small
-#
-# 为什么内置包不用选：这些是这台机器的常备件（DDNS / 组播转单播 / WG / 二维码 /
-# 流量图 / luci 本体），每次构建都要，放进选项只会让人多点几下。要加东西改
-# PKGS_BUILTIN 即可。
+# 另外固定 11 个内置包（immortalwrt 再加一个 autocore），不需要选，见 PKGS_BUILTIN：
+# 组播转单播 / WG / 二维码 / 流量图 / curl / luci 本体 —— 每次构建都要，
+# 放进选项只会让人多点几下。要加东西改 PKGS_BUILTIN 即可。
 #
 # 代理栈为什么单选：openclash / passwall / ssr-plus / homeproxy / daed / dae /
 # honk / nikki 全都要接管 53 和透明代理端口（daed / dae / honk 直接挂内核 eBPF），
@@ -52,6 +51,14 @@ on:
         type: string
         default: '192.168.35.1'
 
+      ddns:
+        description: '③ DDNS 方案（二选一；ddns=脚本版+阿里云，ddns-go=Go 版）'
+        type: choice
+        default: 'ddns'
+        options:
+          - 'ddns'
+          - 'ddns-go'
+
       proxy_stack:
         description: '④ 代理栈（单选；none = 不装任何代理）'
         type: choice
@@ -84,6 +91,7 @@ env:
   REF: ${{ inputs.ref }}
   PROXY_STACK: ${{ inputs.proxy_stack }}
   LAN_IP: ${{ inputs.lan_ip }}
+  DDNS: ${{ inputs.ddns }}
 
   # ③ 内置包：与选项无关，恒定编入。
   # curl 必带：kenzok8/small 的 honk 包 DEPENDS 里漏了它，但 rpcd 的
@@ -92,12 +100,12 @@ env:
   # "Honk is running, but its management interface is not ready."
   # honk 自带的 diagnose 也会直接报"缺少 curl 命令"。加进公共列，各仓库都有
   # packages/net/curl，自检能过。
-  # DDNS 用源码仓库自带的 ddns-scripts（纯 shell 脚本，724K）+ luci-app-ddns（前端 128K），
-  # 不用 ddns-go（单个 Go 二进制 11M）。两者功能等价（都是动态域名更新客户端），
-  # 但 ddns-scripts 装进固件不到 1M，能让镜像小约 10M。
-  # 依赖 ddns-scripts-services / resolveip / ip 会自动拉进来，不用手写。
+  # DDNS 单独一列、按 inputs.ddns 二选一（见解析步骤），不放这里。
+  #   ddns     → ddns-scripts + luci-app-ddns + ddns-scripts-aliyun（脚本版，<1M）
+  #   ddns-go  → ddns-go + luci-app-ddns-go（Go 版，单个二进制 11M）
+  # curl 两种方案都要（aliyun 插件 DEPENDS +curl，honk 探活也要），放公共列。
   PKGS_BUILTIN: >-
-    luci curl ddns-scripts msd_lite luci-app-ddns luci-app-msd_lite
+    luci curl msd_lite luci-app-msd_lite
     wireguard-tools kmod-wireguard luci-proto-wireguard qrencode
     luci-app-statistics collectd-mod-thermal
 
@@ -151,9 +159,22 @@ jobs:
             *) fail "未知 proxy_stack：$PROXY_STACK" ;;
           esac
 
-          # 内置包 = 固定列 + （immortalwrt 才有）autocore。
+          # DDNS 二选一 → 实际包名。
+          # ddns（脚本版）：ddns-scripts + 前端 + services（update 脚本）+ aliyun 插件。
+          #   ddns-scripts-aliyun 依赖 ddns-scripts +curl +openssl-util，
+          #   curl 在公共列；openssl-util / resolveip / ip 由 defconfig 自动拉。
+          #   luci-i18n-ddns-zh-cn 是 hidden 包，不写在这里 —— 靠下面
+          #   CONFIG_LUCI_LANG_zh_Hans=y 带出来，核对步骤会单独断言它落地。
+          # ddns-go：Go 二进制版，官方 feed 的 ddns-go + luci-app-ddns-go。
+          case "$DDNS" in
+            ddns)     ddns_pkgs="ddns-scripts ddns-scripts-services ddns-scripts-aliyun luci-app-ddns" ;;
+            ddns-go)  ddns_pkgs="ddns-go luci-app-ddns-go" ;;
+            *) fail "未知 ddns：$DDNS（只能是 ddns 或 ddns-go）" ;;
+          esac
+
+          # 内置包 = 固定列 + DDNS 选择 + （immortalwrt 才有）autocore。
           # 结果写进 PKGS_ON，后面几步统一用它，免得两处各算一遍再走偏。
-          pkgs_on="$PKGS_BUILTIN"
+          pkgs_on="$PKGS_BUILTIN $ddns_pkgs"
           if [[ "$REPO" == "immortalwrt/immortalwrt" ]]; then
             pkgs_on="$pkgs_on $PKGS_IMMORTAL"
           fi
@@ -287,6 +308,30 @@ jobs:
           echo "--- 生成的 $g ---"
           cat "$g"
 
+          # ddns-go 官方版读 /etc/ddns-go/config.yaml；从 kenzo 版固件保留设置刷过来
+          # 时账号密钥域名在旧文件 ddns-go-config.yaml 里，首次开机改名过来。
+          # 只在选 ddns-go 时生成（ddns 脚本版用 UCI，没有这个 YAML）。
+          if [[ "${DDNS:-}" == "ddns-go" ]]; then
+            h=openwrt/files/etc/uci-defaults/97-migrate-ddns-go
+            cat > "$h" <<'EOF'
+          #!/bin/sh
+          # 构建时生成：kenzo 版 ddns-go 的 YAML 改名成官方版路径。
+          OLD=/etc/ddns-go/ddns-go-config.yaml
+          NEW=/etc/ddns-go/config.yaml
+          if [ -s "$OLD" ] && [ ! -s "$NEW" ]; then
+          	mkdir -p /etc/ddns-go
+          	mv "$OLD" "$NEW" 2>/dev/null || cp "$OLD" "$NEW"
+          	chown ddns-go:ddns-go /etc/ddns-go "$NEW" 2>/dev/null
+          	chmod 644 "$NEW" 2>/dev/null
+          	logger -t ddns-go-migrate "已把 $OLD 迁移为 $NEW"
+          fi
+          exit 0
+          EOF
+            chmod +x "$h"
+            echo "--- 生成的 $h ---"
+            cat "$h"
+          fi
+
       # ── ④ 代理栈：接入 kenzok8 的两个 feed ────────────────────
       # 放在 feeds 更新之后、install 之前 —— 要先把官方 feed 拉下来，
       # 才能删掉和 small 重名的那些目录。
@@ -323,6 +368,24 @@ jobs:
           #   git clone --depth 1 -b 1.26 https://github.com/kenzok8/golang.git feeds/packages/lang/golang
 
           ./scripts/feeds install -a
+
+          # ddns-go 选官方版：kenzo.index 里仍有 ddns-go 的 stanza（删目录没用，
+          # install 读的是索引），会建一条指向空目录的断链 package/feeds/kenzo/ddns-go；
+          # 官方版因 kenzo 在 feeds.conf 排最前而没被 install。选 ddns-go 时把断链
+          # 换成官方软链，否则 defconfig 时 CONFIG_PACKAGE_ddns-go 会消失。
+          # 两版 UCI 不兼容：kenzo 用 section=basic / ddns-go-config.yaml，
+          # 官方用 section=ddns-go / config.yaml，混用会表现为"ddns-go 没启动"。
+          if [[ "$DDNS" == "ddns-go" ]]; then
+            for spec in \
+              "kenzo/ddns-go|packages/net/ddns-go|packages/ddns-go" \
+              "kenzo/luci-app-ddns-go|luci/applications/luci-app-ddns-go|luci/luci-app-ddns-go"; do
+              IFS='|' read -r old src dst <<<"$spec"
+              [[ -f "feeds/$src/Makefile" ]] || { echo "::error::官方包 feeds/$src 不存在，无法替换 kenzo 版"; exit 1; }
+              rm -f "package/feeds/$old"
+              ln -sfn "../../../feeds/$src" "package/feeds/$dst"
+              echo "OK  package/feeds/$dst -> $(readlink "package/feeds/$dst")"
+            done
+          fi
 
       - name: 初始化官方 feed
         if: inputs.proxy_stack == 'none'
@@ -389,7 +452,7 @@ jobs:
           if (( ${#missing[@]} > 0 )); then
             total=$(wc -w <<<"$PKGS_ON")
             echo "::error::$REPO@$REF 里找不到：${missing[*]}"
-            echo "::error::内置包共 $total 个（PKGS_BUILTIN + autocore）。缺包时把 repo 换成 immortalwrt/immortalwrt，或改 PKGS_BUILTIN 去掉缺的那个"
+            echo "::error::本次要装 $total 个包（固定列 + DDNS 选择 + autocore）。缺包时把 repo 换成 immortalwrt/immortalwrt，或去掉缺的那个"
             exit 1
           fi
           echo "内置包自检通过"
@@ -517,6 +580,33 @@ jobs:
           else
             echo "OK  中文语言包 $i18n 个（luci-i18n-*-zh-cn）"
           fi
+
+          # DDNS 二选一后的落地断言。
+          case "$DDNS" in
+            ddns)
+              # 阿里云插件 + 它的依赖链都要真的活下来。ddns-scripts-aliyun 的
+              # DEPENDS 是 ddns-scripts +curl +openssl-util；ddns-scripts 再拉
+              # ddns-scripts-services / resolveip / ip。缺一个运行时就报"更新失败"。
+              for p in ddns-scripts ddns-scripts-services ddns-scripts-aliyun \
+                       luci-app-ddns openssl-util resolveip; do
+                grep -q "^CONFIG_PACKAGE_${p}=y" .config \
+                  || { echo "::error::ddns 方案缺 $p（aliyun 插件依赖链没满足）"; bad=$((bad + 1)); }
+              done
+              # zh-cn 语言包是 hidden 符号，只能靠 CONFIG_LUCI_LANG_zh_Hans 带出来；
+              # 单独断言 ddns 的那一支确实落地，否则 ddns 界面还是英文。
+              grep -q "^CONFIG_PACKAGE_luci-i18n-ddns-zh-cn=y" .config \
+                || { echo "::error::luci-i18n-ddns-zh-cn 没落地，DDNS 界面会是英文"; bad=$((bad + 1)); }
+              ;;
+            ddns-go)
+              # 官方版 ddns-go 用 section=ddns-go / config.yaml，不能是 kenzo 版。
+              for p in ddns-go luci-app-ddns-go; do
+                grep -q "^CONFIG_PACKAGE_${p}=y" .config \
+                  || { echo "::error::ddns-go 方案缺 $p（feed 断链没修好？）"; bad=$((bad + 1)); }
+              done
+              grep -q "^CONFIG_PACKAGE_luci-i18n-ddns-go-zh-cn=y" .config \
+                || { echo "::error::luci-i18n-ddns-go-zh-cn 没落地，ddns-go 界面会是英文"; bad=$((bad + 1)); }
+              ;;
+          esac
 
           # daed 与 dae 共用一个前端，后端是 choice。选错会连另一个一起装进来，
           # 或者两个都没选（dae 还要求内核真的带 BTF 才会给出 DAE_USE_KERNEL_BTF）。
