@@ -1,15 +1,19 @@
 name: Build · 固件（仓库 / 默认IP / DDNS / 代理栈）
 
 # ─────────────────────────────────────────────────────────────
-# 一条尽量简单的固件构建线：只依赖上游源码树 + kenzok8/small，不调用本仓库的
+# 一条尽量简单的固件构建线：只依赖上游源码树 + 代理 feed，不调用本仓库的
 # prepare.sh / prepare-build.sh，也不做 NSS 移植（无线走 ath11k 原生驱动）。
 # 需要 NSS / 出厂 uci 覆盖那一套，用 build-immortalwrt.yml。
+#
+# 代理 feed 按栈分流（2026-11-19 起）：
+#   · 大多数栈（openclash / passwall / ssr-plus / daed / nikki…）→ kenzok8 的 openwrt-packages + small
+#   · dae / honk 两条线 → daeuniverse 官方 openwrt-packages（项目组自维护，避开 k8 上游反复出问题）
 #
 # 五个输入项：
 #   ① repo + ref      从哪个仓库、哪个分支取源码（tag / commit 也行）
 #   ② lan_ip          刷机后默认 LAN 地址，出厂即生效；界面语言固定简体中文
 #   ③ ddns            DDNS 二选一：ddns（脚本版+阿里云，<1M）/ ddns-go（Go 版，11M）
-#   ④ proxy_stack     代理栈单选，配方来自 kenzok8/small
+#   ④ proxy_stack     代理栈单选；配方来源见上面的 feed 分流
 # 另外固定 11 个内置包（immortalwrt 再加一个 autocore），不需要选，见 PKGS_BUILTIN：
 # 组播转单播 / WG / 二维码 / 流量图 / curl / luci 本体 —— 每次构建都要，
 # 放进选项只会让人多点几下。要加东西改 PKGS_BUILTIN 即可。
@@ -94,16 +98,13 @@ env:
   DDNS: ${{ inputs.ddns }}
 
   # ③ 内置包：与选项无关，恒定编入。
-  # curl 必带：kenzok8/small 的 honk 包 DEPENDS 里漏了它，但 rpcd 的
-  # honk_lifecycle_api_owned 和 install 自检都用 `curl --noproxy '*'` 探活
-  # /api；设备没 curl 时 API 明明通着，LuCI 仍判 api_ready=0，报
-  # "Honk is running, but its management interface is not ready."
-  # honk 自带的 diagnose 也会直接报"缺少 curl 命令"。加进公共列，各仓库都有
-  # packages/net/curl，自检能过。
+  # curl 必带：ddns（脚本版）的阿里云插件 ddns-scripts-aliyun DEPENDS +curl，
+  # 缺了它 DDNS 更新会失败。各仓库都有 packages/net/curl，自检能过。
+  # （早期 k8 版 honk 还靠它探活 /api；官方 honk 用 native API，不再依赖 curl，
+  #   但 curl 本身就是 DDNS 的硬依赖，仍留公共列。）
   # DDNS 单独一列、按 inputs.ddns 二选一（见解析步骤），不放这里。
   #   ddns     → ddns-scripts + luci-app-ddns + ddns-scripts-aliyun（脚本版，<1M）
   #   ddns-go  → ddns-go + luci-app-ddns-go（Go 版，单个二进制 11M）
-  # curl 两种方案都要（aliyun 插件 DEPENDS +curl，honk 探活也要），放公共列。
   PKGS_BUILTIN: >-
     luci curl msd_lite luci-app-msd_lite
     wireguard-tools kmod-wireguard luci-proto-wireguard qrencode
@@ -142,9 +143,17 @@ jobs:
             0.*|127.*|169.254.*|255.*) fail "lan_ip 不能是 $ip（回环 / 链路本地 / 广播）" ;;
           esac
 
-          # 代理栈 → 实际包名。配方都在 kenzok8/small，别名见 README。
-          # daed 与 dae 共用 luci-app-daede 这个前端，后端靠 choice 区分，
-          # 具体选哪个在「生成 .config」那步写死（默认是 daed）。
+          # 代理栈 → 实际包名。
+          # 大多数栈的配方在 kenzok8/small；但 dae / honk 两条线走 daeuniverse 官方 feed
+          # （仓库 daeuniverse/openwrt-packages，包名见其 README），原因是 small 的 dae
+          # 曾整周挂在上游缺失 patch（见 d53b911），官方 feed 由项目组自己维护、无此问题。
+          #
+          # 两条线的差异（务必按官方包名写，别混）：
+          #   dae  → dae + luci-app-dae + luci-lib-daeuniverse（前端共用库）
+          #   honk → honk + luci-app-honk + luci-lib-daeuniverse（doona 内嵌在 honk-core）
+          # 两者都依赖 +vmlinux-btf，在内核自带 BTF 的树上由 vmlinux-btf-builtin 空包满足。
+          # daed 仍是 k8 那一支，和 dae 不是一回事：它俩以前共 luci-app-daede，
+          # 现在 dae 换官方前端后各走各的，互不干扰。
           case "$PROXY_STACK" in
             none)      pkgs="" ;;
             openclash) pkgs="luci-app-openclash" ;;
@@ -153,8 +162,8 @@ jobs:
             ssr-plus)  pkgs="luci-app-ssr-plus" ;;
             homeproxy) pkgs="luci-app-homeproxy" ;;
             daed)      pkgs="luci-app-daede daed" ;;
-            dae)       pkgs="luci-app-daede dae" ;;
-            honk)      pkgs="luci-app-honk honk" ;;
+            dae)       pkgs="dae luci-app-dae luci-lib-daeuniverse vmlinux-btf-builtin" ;;
+            honk)      pkgs="honk luci-app-honk luci-lib-daeuniverse vmlinux-btf-builtin" ;;
             nikki)     pkgs="luci-app-nikki" ;;
             *) fail "未知 proxy_stack：$PROXY_STACK" ;;
           esac
@@ -224,11 +233,13 @@ jobs:
             libssl-dev make patch perl python3 python3-setuptools rsync unzip wget \
             zlib1g-dev zstd
 
-          # dae / daed 要编 eBPF，bpf-headers 硬性要求 host 有 clang 和 llvm 那套
+          # daed 要编 eBPF，bpf-headers 硬性要求 host 有 clang 和 llvm 那套
           # 工具（llc / opt / llvm-dis / llvm-strip），版本 ≥ 12。runner 一般自带，
           # 缺哪个补哪个；不装的话会在 bpf.mk 里直接 Stop，报错信息还看不到原因。
+          # dae（官方 feed）不用 bpf-headers：它的 build.sh 用 host clang 直接编
+          # bpf2go，同样要 clang/llvm-strip，放下面 dae 分支里单独确认。
           case "$PROXY_STACK" in
-            daed|dae)
+            daed)
               for t in clang llc opt llvm-dis llvm-strip; do
                 command -v "$t" >/dev/null 2>&1 || { echo "缺 $t，安装 clang + llvm"; sudo apt-get install -y clang llvm; break; }
               done
@@ -244,6 +255,62 @@ jobs:
           ref: ${{ inputs.ref }}
           fetch-depth: 1
           path: openwrt
+
+      # dae / honk 走 daeuniverse 官方 feed，核心都是"从源码编"，工具链比 k8 的
+      # 预编译 tarball 重，单独一个步骤装好。版本全部按官方 feed 里 build.sh
+      # 的 pins 钉死，别升级：源码 pin 的是 v2.1.2 / v0.1.0-beta.6，工具链版本
+      # 一变，go generate / cargo build 的行为就可能飘。
+      - name: 安装 dae/honk 官方构建工具链
+        if: inputs.proxy_stack == 'dae' || inputs.proxy_stack == 'honk'
+        run: |
+          set -euo pipefail
+
+          # ---- dae：Go ≥ 1.27（go.mod 的 `go 1.27.0`）+ host clang/llvm-strip ----
+          # dae 的 build.sh 走 Go 自己的 toolchain，不经过 buildroot 的 golang feed；
+          # runner 预装的 Go 版本不定，这里用 setup-go 钉到 1.27。
+          if [[ "$PROXY_STACK" == "dae" ]]; then
+            for t in clang llvm-strip; do
+              command -v "$t" >/dev/null 2>&1 || { sudo apt-get install -y clang llvm; break; }
+            done
+            clang --version | head -1
+            llvm-strip --version 2>/dev/null | head -1 || true
+          fi
+
+          # ---- honk：Rust stable 1.99.1 + nightly-2026-10-20 + bpf-linker 0.11.0 ----
+          # 数字来自 honk v0.1.0-beta.6 的 rust-toolchain.toml /
+          # crates/honk-ebpf/rust-toolchain.toml / .github/ci/pins.env。
+          # stable 编 honk-core，nightly 编 eBPF 对象（rust-src + llvm-tools），
+          # bpf-linker 链 eBPF。缺一都会在上游 build.sh 里报得很难懂。
+          if [[ "$PROXY_STACK" == "honk" ]]; then
+            sudo apt-get install -y cmake libclang-dev libbpf-dev pkg-config
+
+            command -v rustup >/dev/null 2>&1 \
+              || { echo "::error::runner 没有 rustup，无法编 honk（需 Rust 1.99.1 + nightly-2026-10-20）"; exit 1; }
+            rustup toolchain install 1.99.1 --profile minimal --component rustfmt,clippy
+            rustup toolchain install nightly-2026-10-20 --profile minimal \
+              --component rust-src,llvm-tools
+            rustup target add aarch64-unknown-linux-musl --toolchain 1.99.1
+
+            # bpf-linker：官方 pins.env 里 SHA-256 钉死，下载后校验再装到 cargo bin。
+            BPF_LINKER_VERSION=0.11.0
+            BPF_LINKER_SHA256=10f62ba9ab7e544d538370552660efcb4f1a19153d5752bbf0f6b51f3bada450
+            curl -fsSL --retry 3 -o "${RUNNER_TEMP}/bpf-linker.tar.zst" \
+              "https://github.com/aya-rs/bpf-linker/releases/download/v${BPF_LINKER_VERSION}/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
+            echo "${BPF_LINKER_SHA256}  ${RUNNER_TEMP}/bpf-linker.tar.zst" | sha256sum -c -
+            zstd -dc "${RUNNER_TEMP}/bpf-linker.tar.zst" \
+              | tar -xf - -C "${HOME}/.cargo/bin"
+            bpf-linker --version
+
+            rustc +1.99.1 --version
+            rustc +nightly-2026-10-20 --version
+          fi
+
+      - name: 设置 dae 的 Go 版本
+        if: inputs.proxy_stack == 'dae'
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.0'
+          cache: false
 
       - name: 记录基线并确认设备存在
         working-directory: openwrt
@@ -339,7 +406,10 @@ jobs:
       # 顺序很重要：这两个 feed 写在 feeds.conf 最前面，同名包由它们提供。
       # 官方 feed 里也有 xray-core / sing-box / mosdns 等，不删掉会出现重复包定义。
       - name: 接入 kenzok8 feed
-        if: inputs.proxy_stack != 'none'
+        if: >-
+          inputs.proxy_stack != 'none' &&
+          inputs.proxy_stack != 'dae' &&
+          inputs.proxy_stack != 'honk'
         working-directory: openwrt
         run: |
           set -euo pipefail
@@ -352,24 +422,6 @@ jobs:
           cat feeds.conf
 
           ./scripts/feeds update -a
-
-          # 2026-11-18 晚 kenzok8/small 的 d94fd64 把 dae 升到 2026.11.17，
-          # Build/Prepare 里新增 test -s ../ci/patches/dae-core/0001-keep-protocol-wrappers-in-tcp-relay.patch
-          # 并 PatchDir 那个目录，但整个仓库根本没有 ci/ 目录、也没有这个 patch 文件
-          # （11-19 的 962c1e3 仍未修）。结果任何 dae 构建都在 .prepared 阶段挂掉。
-          # 这里只对 dae 把 small 回退到 bug 前的 451dfd7（dae 2026.11.09，已验证可编）；
-          # 其它栈不受影响，继续用最新 small。等上游补上那个 patch 后删掉这段即可。
-          if [[ "$PROXY_STACK" == "dae" ]]; then
-            echo "--- dae：将 small feed 回退到 451dfd7（规避上游缺失 patch）---"
-            # feeds update 可能是浅克隆，老 commit 不在本地时先补 fetch。
-            git -C feeds/small cat-file -e 451dfd7^{commit} 2>/dev/null \
-              || git -C feeds/small fetch -q --depth 1 origin 451dfd7 2>/dev/null \
-              || git -C feeds/small fetch -q --unshallow origin 2>/dev/null \
-              || true
-            git -C feeds/small checkout -q 451dfd7 \
-              || { echo "::error::feeds/small 回退到 451dfd7 失败，dae 会撞上游缺失 patch"; exit 1; }
-            grep -E '^PKG_VERSION' feeds/small/dae/Makefile | head -1
-          fi
 
           # 去重清单照抄 kenzok8/small 的 README：这些包官方 feed 与 small 都有，
           # 留着会重复定义。small 自己的版本因为 feed 排在最前面而生效。
@@ -404,6 +456,46 @@ jobs:
               echo "OK  package/feeds/$dst -> $(readlink "package/feeds/$dst")"
             done
           fi
+
+      # ── ④b dae / honk：接入 daeuniverse 官方 feed ─────────────
+      # 官方 feed 的 dae / honk 包有两个特殊要求，k8 那套容器装不下，所以单独走：
+      #   ① 包 Makefile 旁边必须有 src/ 源码树，Build/Prepare 才会去编（不随 feed
+      #      提交，官方 CI 是 checkout 进去的）。dae 要带 --recurse-submodules，
+      #      honk 要完整历史（build.sh 从 git tag 取内嵌版本号）。
+      #   ② 依赖 +vmlinux-btf 只能由 apk 虚拟提供满足（vmlinux-btf-builtin）。
+      # 因此这两条线不接 k8 feed，xray/3proxy 那堆全局 choice 污染也一并没有了。
+      - name: 接入 daeuniverse 官方 feed（dae / honk）
+        if: inputs.proxy_stack == 'dae' || inputs.proxy_stack == 'honk'
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+          {
+            echo "src-git daeuniverse https://github.com/daeuniverse/openwrt-packages.git"
+            cat feeds.conf.default
+          } > feeds.conf
+          echo "--- feeds.conf ---"
+          cat feeds.conf
+
+          ./scripts/feeds update -a
+
+          # 源码落位：官方 Makefile 用 $(CURDIR)/src，脚本里写死了相对路径。
+          case "$PROXY_STACK" in
+            dae)
+              echo "--- dae：clone daeuniverse/dae v2.1.2（含子模块）到 feeds/daeuniverse/dae/src ---"
+              git clone --depth 1 --branch v2.1.2 --recurse-submodules \
+                https://github.com/daeuniverse/dae.git feeds/daeuniverse/dae/src
+              grep -E '^PKG_VERSION|^PKG_RELEASE' feeds/daeuniverse/dae/Makefile | head -2
+              ;;
+            honk)
+              echo "--- honk：clone daeuniverse/honk v0.1.0-beta.6（完整历史）到 feeds/daeuniverse/honk/src ---"
+              # fetch-depth 0：build.sh 用 git describe / tag 派生内嵌版本号，浅克隆会退化成 fallback。
+              git clone --branch v0.1.0-beta.6 \
+                https://github.com/daeuniverse/honk.git feeds/daeuniverse/honk/src
+              grep -E '^PKG_VERSION|^HONK_GIT_TAG' feeds/daeuniverse/honk/Makefile | head -2
+              ;;
+          esac
+
+          ./scripts/feeds install -a
 
       - name: 初始化官方 feed
         if: inputs.proxy_stack == 'none'
@@ -518,16 +610,20 @@ jobs:
           # 解法：把这一组 choice 显式落到"什么都不带"的分支：V2ray 选 NONE，
           # 其余默认 y 的 INCLUDE_* 全部置 n。注意父包写 =n 无效（顶层符号不认），
           # 必须针对这几个符号本身；NONE 要写 =y 才能赢过 choice 的 default Xray。
-          # 只有接入了 small feed 才有这组符号（none 场景不接 small）。
-          if [[ "$PROXY_STACK" != "none" ]]; then
-            {
-              echo "CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_NONE_V2RAY=y"
-              echo "CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_Xray=n"
-              echo "CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_Http_Proxy=n"
-              echo "CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_Mihomo=n"
-              echo "CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_GeoData=n"
-            } >> .config
-          fi
+          # 只有接入了 small feed 才有这组符号（none / dae / honk 不接 small），
+          # 别的场景写进去只会让 defconfig 报 unknown symbol。
+          case "$PROXY_STACK" in
+            none|dae|honk) ;;
+            *)
+              {
+                echo "CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_NONE_V2RAY=y"
+                echo "CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_Xray=n"
+                echo "CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_Http_Proxy=n"
+                echo "CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_Mihomo=n"
+                echo "CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_GeoData=n"
+              } >> .config
+              ;;
+          esac
 
           # daed / dae / honk 的 eBPF 程序靠 CO-RE 读内核结构，没有 BTF 一启动就崩。
           # 注意这只是"请求"：内核 Kconfig 里 BTF 还 depends on PAHOLE_VERSION >= 116，
@@ -546,6 +642,18 @@ jobs:
               ;;
           esac
 
+          # 官方 feed 的 dae / honk 依赖 +vmlinux-btf，这一条只有 apk 的 PROVIDES:=@
+          # 能满足（vmlinux-btf-builtin 空包）。ImmortalWrt / OpenWrt 默认就是 apk，
+          # 但 coolsnowwolf/lede 默认 opkg —— 那里必须显式开 USE_APK，否则依赖无解。
+          # 同时显式关掉 vmlinux-btf 真包：它需要 SDK 现场产出的 BTF blob，我们没有，
+          # 一旦被选进来 Build/Prepare 就会因找不到 blob 直接挂。
+          case "$PROXY_STACK" in
+            dae|honk)
+              echo "CONFIG_USE_APK=y" >> .config
+              echo "CONFIG_PACKAGE_vmlinux-btf=n" >> .config
+              ;;
+          esac
+
           case "$PROXY_STACK" in
             openclash)
               # openclash 的 DEPENDS 是 dnsmasq-full；不显式关掉会和默认的
@@ -555,41 +663,32 @@ jobs:
               ;;
           esac
 
-          # dae / daed 的 eBPF 要 bpf-headers，而 bpf-headers 需要一套 host LLVM。
+          # daed 的 eBPF 走 OpenWrt 的 bpf-headers，需要一套 host LLVM。
           # 「用哪套 LLVM」是 toolchain/Config.in 里的 choice BPF_TOOLCHAIN，它的
           # prompt 带 `if DEVEL` —— 不开 DEVEL 就不可见，而 kconfig 对不可见符号
           # 一律取 default、无视 .config 里写的值（和隐藏包是同一个坑）。
           # 默认值是 BUILD_LLVM：在 git 树上（没有 llvm-bpf/.llvm-version）等于
           # 现场编一遍 LLVM 22，一小时起步、十几 G 磁盘，CI 里根本跑不完。
           # 所以开 DEVEL 把这个 choice 露出来，显式选 host LLVM。
+          # 官方 dae / honk 不走 bpf-headers（build.sh 自己用 host clang / Rust），
+          # 不需要这套，开了反而白编 LLVM。
           # DEVEL 在本树里只影响这一个 choice（其余 !DEVEL 条件都在同一处）。
           case "$PROXY_STACK" in
-            daed|dae)
+            daed)
               echo "CONFIG_DEVEL=y" >> .config
               echo "CONFIG_BPF_TOOLCHAIN_HOST=y" >> .config
               echo "CONFIG_USE_LLVM_HOST=y" >> .config
               ;;
           esac
 
+          # daed 前端 luci-app-daede 的后端 choice 默认选 daed。dae 现在走官方
+          # luci-app-dae（独立前端，不再是这个 choice 的一员），所以这里只有 daed。
+          # 顺手把 dae 后端显式关掉，防止 k8 的 luci-app-daede 若被别的包 select 进来
+          # 时又拖一个 daed 核心 —— 两个 eBPF 代理抢同一挂载点会跑不起来。
           case "$PROXY_STACK" in
-            daed|dae)
-              # daed 与 dae 共用 luci-app-daede 前端，后端是个 choice，默认选 daed。
-              # 不显式改过去，选 dae 时会连 daed 一起拖进来 —— 两个 eBPF 代理
-              # 抢同一套挂载点，跑不起来。
-              #
-              # 符号名别猜错：后端选项在 luci-app-daede 自己的 Package/config 里，
-              # 名字带前端前缀 —— CONFIG_PACKAGE_luci-app-daede_dae / …_daed。
-              # 很容易顺手写成 CONFIG_PACKAGE_luci-app-dae=y，那是另一个包：
-              # 官方 luci feed 的独立前端，DEPENDS +dae-geoip +dae-geosite，
-              # 而本构建里 dae 来自 kenzok8/small（用 v2ray-geoip/v2ray-geosite），
-              # dae-geoip / dae-geosite 根本不存在，符号能留下来但一编就报缺依赖。
-              for b in daed dae; do
-                if [[ "$b" == "$PROXY_STACK" ]]; then
-                  echo "CONFIG_PACKAGE_luci-app-daede_${b}=y" >> .config
-                else
-                  echo "CONFIG_PACKAGE_luci-app-daede_${b}=n" >> .config
-                fi
-              done
+            daed)
+              echo "CONFIG_PACKAGE_luci-app-daede_daed=y" >> .config
+              echo "CONFIG_PACKAGE_luci-app-daede_dae=n" >> .config
               ;;
           esac
 
@@ -650,43 +749,36 @@ jobs:
               ;;
           esac
 
-          # daed 与 dae 共用一个前端，后端是 choice。选错会连另一个一起装进来，
-          # 或者两个都没选（dae 还要求内核真的带 BTF 才会给出 DAE_USE_KERNEL_BTF）。
+          # daed 的 luci-app-daede 后端是 choice，默认 daed；显式选了才算数，
+          # 且不能把 dae 核心一起拖进来（两者抢同一挂载点）。
+          if [[ "$PROXY_STACK" == "daed" ]]; then
+            grep -q "^CONFIG_PACKAGE_luci-app-daede_daed=y" .config \
+              || { echo "::error::luci-app-daede 的后端没选成 daed"; bad=$((bad + 1)); }
+            if grep -q "^CONFIG_PACKAGE_dae=y" .config; then
+              echo "::error::daed 栈里混进了官方 dae 核心，两者必须互斥"
+              bad=$((bad + 1))
+            fi
+          fi
+
+          # dae / honk 走官方 feed：核心 + 官方前端 + 共享库 + BTF 空包缺一不可。
+          # vmlinux-btf-builtin 是 apk 虚拟提供，TE 缺了它 dae/honk 的 +vmlinux-btf
+          # 依赖无解；选了 vmlinux-btf 真包则会在 Build/Prepare 找不到 blob 而挂。
           case "$PROXY_STACK" in
-            daed|dae)
-              other=$([[ "$PROXY_STACK" == "dae" ]] && echo daed || echo dae)
-              grep -q "^CONFIG_PACKAGE_luci-app-daede_${PROXY_STACK}=y" .config \
-                || { echo "::error::luci-app-daede 的后端没选成 $PROXY_STACK"; bad=$((bad + 1)); }
-              if grep -q "^CONFIG_PACKAGE_${other}=y" .config; then
-                echo "::error::luci-app-daede 把 $other 也带进来了，两者必须互斥"
+            dae|honk)
+              for p in luci-lib-daeuniverse vmlinux-btf-builtin; do
+                grep -q "^CONFIG_PACKAGE_${p}=y" .config \
+                  || { echo "::error::$PROXY_STACK 栈缺 $p（官方 feed 的共享库 / BTF 依赖）"; bad=$((bad + 1)); }
+              done
+              if grep -q "^CONFIG_PACKAGE_vmlinux-btf=y" .config; then
+                echo "::error::vmlinux-btf 真包被选进来了，它没有 blob 会编不过；应该用 vmlinux-btf-builtin"
                 bad=$((bad + 1))
               fi
-              # 顺手挡住"符号写错成官方 luci-app-dae / daed"这种情况：这两个包的
-              # 依赖 dae-geoip / dae-geosite 在本构建里不存在，符号能留下但编不过。
-              for wrong in luci-app-dae luci-app-daed; do
-                if grep -q "^CONFIG_PACKAGE_${wrong}=y" .config; then
-                  echo "::error::$wrong 被选进来了：前端应该用 luci-app-daede（small），后端靠它的 choice 区分"
-                  bad=$((bad + 1))
-                fi
-              done
+              grep -q "^CONFIG_USE_APK=y" .config \
+                || { echo "::error::官方 dae/honk 依赖 apk 虚拟提供，CONFIG_USE_APK 必须是 y"; bad=$((bad + 1)); }
+              grep -q "^CONFIG_KERNEL_DEBUG_INFO_BTF=y" .config \
+                || { echo "::error::$PROXY_STACK 需要内核 BTF，但 CONFIG_KERNEL_DEBUG_INFO_BTF 不是 y"; bad=$((bad + 1)); }
               ;;
           esac
-
-          # dae 的 BTF 来源也是 choice：内核真带 BTF 时才选得中 DAE_USE_KERNEL_BTF，
-          # 否则会掉到 vmlinux-btf 包（我们没有装），运行时起不来。
-          if [[ "$PROXY_STACK" == "dae" ]]; then
-            grep -q "^CONFIG_KERNEL_DEBUG_INFO_BTF=y" .config \
-              || { echo "::error::dae 需要内核 BTF，但 CONFIG_KERNEL_DEBUG_INFO_BTF 不是 y"; bad=$((bad + 1)); }
-            grep -q "^CONFIG_DAE_USE_KERNEL_BTF=y" .config \
-              || { echo "::error::dae 没有选到 DAE_USE_KERNEL_BTF，CO-RE 会缺 BTF 来源"; bad=$((bad + 1)); }
-          fi
-
-          # honk-core 同理：它是预编译的 eBPF 程序，靠 CO-RE 读内核结构，
-          # 内核没有 .BTF 段时能装能起、但一加载规则就崩，所以也要卡住。
-          if [[ "$PROXY_STACK" == "honk" ]]; then
-            grep -q "^CONFIG_KERNEL_DEBUG_INFO_BTF=y" .config \
-              || { echo "::error::honk 需要内核 BTF，但 CONFIG_KERNEL_DEBUG_INFO_BTF 不是 y"; bad=$((bad + 1)); }
-          fi
 
           # 全局守卫：本构建没有任何代理栈需要 xray-core / 3proxy。它们一旦出现，
           # 就是 kenzok8/small 里 ssr-plus 那组顶层 choice 默认值没被压住（见生成
@@ -701,8 +793,9 @@ jobs:
 
           # host LLVM 必须活到 defconfig 之后，否则 bpf-headers 会在 bpf.mk 里
           # 直接 Stop，报错只有一句 "LLVM/clang version too old ... found: ."。
+          # 只有 daed 走 bpf-headers；官方 dae/honk 自带 host clang / Rust，不需要。
           case "$PROXY_STACK" in
-            daed|dae)
+            daed)
               grep -q "^CONFIG_USE_LLVM_HOST=y" .config \
                 || { echo "::error::CONFIG_USE_LLVM_HOST 没活下来，eBPF 会退化成源码编 LLVM"; bad=$((bad + 1)); }
               ;;
@@ -744,12 +837,13 @@ jobs:
                 ;;
             esac
 
-            # po2lmo：luci-app-daede（daed / dae 的前端）与 small 版 openclash 的
+            # po2lmo：luci-app-daede（daed 前端）与 small 版 openclash 的
             # Makefile 里直接调它，但这两个配方都没写 PKG_BUILD_DEPENDS:=luci-base/host，
             # 并行编译时就可能先编到它们、po2lmo 还没生成，报 "po2lmo: not found"。
             # 单独把 host 版编出来只要一两秒，换掉这条最莫名其妙的失败。
+            # 官方 luci-app-dae / luci-app-honk 走 luci.mk 标准依赖，不需要这条。
             case "$PROXY_STACK" in
-              daed|dae|openclash)
+              daed|openclash)
                 echo "--- 预编 luci-base/host（po2lmo / jsmin）---"
                 timeout 900 make package/luci-base/host/compile V=s </dev/null \
                   || echo "::warning::luci-base/host 预编失败，luci 的多语言编译可能受影响"
@@ -777,7 +871,7 @@ jobs:
           # 末尾全是后来编译成功的包（如 iptables）。所以按两类信号分别抓：
           #   1) 关键词行：patch/go/下载/解压/OOM 等真正错误；
           #   2) 每个 "failed to build" 前 120 行上下文——根因通常就在它紧上方。
-          grep -nE '(Patch failed|hunk .*FAILED|patch does not apply|can.t find file to patch|saving rejects to file|ERROR: .* failed to build|\*\*\* \[.*\] Error|No space left on device|Killed|fatal error:|No rule to make target|Error [0-9]+$|undefined:|cannot find package|cannot find module|go: (error|download|mod|building|finding)|not found|\.rej|apply_patch|make.*: \*\*\*)' "$log" \
+          grep -nE '(Patch failed|hunk .*FAILED|patch does not apply|can.t find file to patch|saving rejects to file|ERROR: .* failed to build|\*\*\* \[.*\] Error|No space left on device|Killed|fatal error:|No rule to make target|Error [0-9]+$|undefined:|cannot find package|cannot find module|go: (error|download|mod|building|finding)|cargo:|error\[E[0-9]+\]|rustc|bpf-linker|toolchain .* is not installed|linking with .* failed|not found|\.rej|apply_patch|make.*: \*\*\*)' "$log" \
             | tail -40 | while IFS= read -r line; do echo "::error::$line"; done || true
 
           echo "--- 失败包上下文（每个 failed to build 前 120 行）---"

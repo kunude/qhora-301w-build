@@ -11,7 +11,7 @@ Actions 里三个入口：
 |---|---|---|
 | **Build ImmortalWrt** | `immortalwrt/immortalwrt` | 正式线。**移植** NSS：构建时把 ppe-nss 的 `nss-wifi-drv` + 18 个 mac80211 补丁搬进来（`nss` 可选，默认开） |
 | **Build OpenWrt (NSS)** | `JuliusBairaktaris/openwrt-ppe-nss@ppe-nss` | 正式线。**整树** NSS：直接编那棵树，组件本来就在里面 |
-| **Build · 固件** | 任选（`immortalwrt` / `openwrt` / `lede`） | 简化线：选仓库和分支、设默认 LAN 地址、DDNS 二选一（`ddns` 脚本版+阿里云 / `ddns-go` Go 版）、固定 11 个内置包（msd_lite / WG / qrencode / 流量图 / curl，immortalwrt 另加 autocore）、界面默认简体中文、代理栈单选（配方取自 `kenzok8/small`）。**不带 NSS** |
+| **Build · 固件** | 任选（`immortalwrt` / `openwrt` / `lede`） | 简化线：选仓库和分支、设默认 LAN 地址、DDNS 二选一（`ddns` 脚本版+阿里云 / `ddns-go` Go 版）、固定 11 个内置包（msd_lite / WG / qrencode / 流量图 / curl，immortalwrt 另加 autocore）、界面默认简体中文、代理栈单选。多数栈配方取自 `kenzok8/small`，`dae` / `honk` 取自 `daeuniverse/openwrt-packages` 官方 feed。**不带 NSS** |
 
 前两个的 `proxy` 取值一样：`daed` `dae` `honk` `homeproxy` `singbox` `passwall`
 `passwall2` `none`。另有 `extra_packages`（额外插件，逗号分隔）和 `release`。
@@ -26,15 +26,25 @@ Actions 里三个入口：
 `ddns-go` + `luci-app-ddns-go`。其余内置包固定为 `msd_lite` `luci-app-msd_lite`
 `wireguard-tools` `kmod-wireguard` `luci-proto-wireguard` `qrencode`
 `luci-app-statistics` `collectd-mod-thermal` `curl` + `luci`，不用选。
-其中 `curl` 是给 honk 探活 /api
-用的：上游 `honk` 包的 DEPENDS 漏了它，缺了会导致 doona 面板通着但 LuCI 仍报
-"管理界面尚未就绪"。它不调用
-本仓库的脚本、不叠 `configs/*.config`，`.config` 与 LAN 覆盖都是现场生成的 ——
+其中 `curl` 主要是给 `ddns` 脚本版的阿里云插件用的（DEPENDS +curl）；
+早期 k8 版 honk 还靠它探活 /api，官方 honk 改用 native API 后不再依赖它。
+它不调用本仓库的脚本、不叠 `configs/*.config`，`.config` 与 LAN 覆盖都是现场生成的 ——
 定位「上游的问题还是我们的问题」时也用它。
 
-> `daed` 与 `dae` 共用 `luci-app-daede` 这个 LuCI 前端，后端由 workflow 里的
-> choice 指定（默认 daed）。选 `dae` 时会显式把 daed 后端关掉，两者不会同时装。
-> `dae` / `daed` / `honk` 都要内核 BTF，构建前会自动编 `tools/dwarves` 拿 pahole。
+> **代理栈的来源分流**：`openclash` / `passwall` / `passwall2` / `ssr-plus` /
+> `homeproxy` / `daed` / `nikki` 走 `kenzok8/small`；`dae` / `honk` 走
+> [`daeuniverse/openwrt-packages`](https://github.com/daeuniverse/openwrt-packages)
+> 官方 feed（项目组自维护，避开 k8 那套反复缺 patch / 断链的问题）。
+> 两条线不再共用前端：`daed` 用 k8 的 `luci-app-daede`（后端 choice），
+> `dae` 用官方 `luci-app-dae`，`honk` 用官方 `luci-app-honk`（doona 内嵌在 honk-core）。
+>
+> 官方 feed 的版本钉在 `dae v2.1.2` / `honk v0.1.0-beta.6`，比 k8 的日期快照
+> （`2026.11.17` / `2026.11.18.1`）旧一点，但都是官方 release 的稳定版本。
+> 这两条线**从源码编**：dae 要 Go 1.27 + host clang，honk 要 Rust 1.99.1 +
+> nightly-2026-10-20 + bpf-linker 0.11.0（workflow 会自动装好）。
+> 官方包依赖 apk 虚拟提供 `vmlinux-btf-builtin` 来满足 `+vmlinux-btf`，
+> 因此这两条线强制 `CONFIG_USE_APK=y`；内核 BTF 仍需构建前编 `tools/dwarves`
+> 拿 pahole。`daed` 不受影响，仍是原来的 bpf-headers 路线。
 
 ## NSS：一套东西，两种落法
 
@@ -80,8 +90,8 @@ Rust 重写，配置语法沿用 dae，出站组 / Clash 兼容 API 借自 sing-
 
 | | |
 |---|---|
-| 包从哪来 | `kenzok8/small` 的 `honk` + `luci-app-honk`（后者自带 doona） |
-| 核心形态 | 预编译 aarch64 二进制（kenzok8 CI 从上游源码交叉编译），**不拉 Rust 工具链** |
+| 包从哪来 | `daeuniverse/openwrt-packages` 官方 feed 的 `honk` + `luci-app-honk`（`native-ui` 把 doona 编进 honk-core） |
+| 核心形态 | workflow 从源码编：Rust 1.99.1 + nightly-2026-10-20 + bpf-linker 0.11.0，交叉编译 BoringSSL / SQLite，**要拉 Rust 工具链**；版本钉在 `v0.1.0-beta.6` |
 | 内核前提 | Linux ≥ 6.12（当前三棵树都是 6.18）、BTF、`CGROUP_BPF`、cls_bpf、NFQUEUE |
 | 默认出口 | `fallback: proxy` —— 填了订阅就能出国。上游自带配置是 `direct`（全直连），照抄会「装完也不出国」，见下 |
 | 首次使用 | 面板里先「初始化」再「启用」—— 包默认 `enabled=0`，不在开机时自启 |
@@ -114,11 +124,10 @@ Rust 重写，配置语法沿用 dae，出站组 / Clash 兼容 API 借自 sing-
 已经卡住时不用慌：残留的 `dae0` 会在旧进程退出后由下一次 preflight 自动回收，
 再 `start` 一次就正常。
 
-small 里那两个 Makefile 只是骨架：**下载地址与哈希在三个不随仓库提交的
-`generated-*.mk` / `provenance.json` 里**，而它们默认指向一个已经删掉的
-`staging` 标签（实测 404）。所以 `scripts/fetch-honk-stage.sh` 会在 feeds 落位之后，
-按 small 写死的 `CORE_COMMIT` 去 `kenzok8/openwrt-honk` 的 `source-*` 发布里
-**匹配资产名**（不是取最新：取错就是 404），把三个文件补齐并校验后落位。
+官方 feed 的 `honk/Makefile` 要求源码放在包目录的 `src/` 下（不随 feed 提交，
+workflow 会 clone `v0.1.0-beta.6` 并保留完整历史——build.sh 要从 git tag 取内嵌版本号）。
+`native-ui` 特性会把 doona 面板编进 honk-core，由构建脚本从 release 下载并校验；
+面板走 native API 在 `127.0.0.1` 上提供，不再需要独立的 curl 探活。
 
 ### passwall 与 passwall2 是两代，不是两个皮肤
 
