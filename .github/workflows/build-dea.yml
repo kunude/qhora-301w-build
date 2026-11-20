@@ -10,9 +10,11 @@ name: Build ·dae(honk)
 #   ② lan_ip          刷机后默认 LAN 地址，出厂即生效；界面语言固定简体中文
 #   ③ ddns            DDNS 二选一：ddns（脚本版+阿里云，<1M）/ ddns-go（Go 版，11M）
 #   ④ proxy_stack     代理栈单选，配方来自 kenzok8/small
-# 另外固定 11 个内置包（immortalwrt 再加一个 autocore），不需要选，见 PKGS_BUILTIN：
-# 组播转单播 / WG / 二维码 / 流量图 / curl / luci 本体 —— 每次构建都要，
+# 另外固定内置包（immortalwrt 再加一个 autocore），不需要选，见 PKGS_BUILTIN：
+# 组播转单播 / WG / 二维码 / 流量图 / curl / luci 本体 / 指定网关插件 —— 每次构建都要，
 # 放进选项只会让人多点几下。要加东西改 PKGS_BUILTIN 即可。
+# 指定网关插件（luci-app-device-gateway）来自独立单包仓库，在「检出源码」后
+# clone 到源码树 package/ 下；它运行需要 flock（Makefile 未声明），一并内置。
 #
 # 代理栈为什么单选：openclash / passwall / ssr-plus / homeproxy / daed / dae /
 # honk / nikki 全都要接管 53 和透明代理端口（daed / dae / honk 直接挂内核 eBPF），
@@ -108,6 +110,7 @@ env:
     luci curl msd_lite luci-app-msd_lite
     wireguard-tools kmod-wireguard luci-proto-wireguard qrencode
     luci-app-statistics collectd-mod-thermal
+    luci-app-device-gateway flock
   # 只有 immortalwrt 有的包（package/emortal/autocore）：CPU 负载 / 温度那套状态页。
   # 别的仓库没这个目录，硬塞进 PKGS_BUILTIN 会让自检直接报缺包，所以单独一列，
   # 按 REPO 决定加不加。
@@ -232,6 +235,24 @@ jobs:
           ref: ${{ inputs.ref }}
           fetch-depth: 1
           path: openwrt
+
+      - name: 接入 luci-app-device-gateway 插件
+        # 独立单包仓库（Makefile 在根目录，不是 feed 布局），只能 clone 到源码树
+        # package/ 下，让 feeds install -a 建立软链、defconfig 认到 CONFIG_PACKAGE 符号。
+        # 固定到具体 commit，避免上游改动导致构建不可复现。
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+          repo=https://github.com/huladabang/luci-app-device-gateway.git
+          commit=c593d0d4407dfa4505bf055afa01082ce1af682c
+          rm -rf package/luci-app-device-gateway
+          git clone "$repo" package/luci-app-device-gateway
+          git -C package/luci-app-device-gateway checkout -q "$commit" \
+            || { echo "::error::插件无法固定到 $commit"; exit 1; }
+          echo "插件 commit：$(git -C package/luci-app-device-gateway rev-parse HEAD)"
+          echo "--- 插件 Makefile 关键行 ---"
+          grep -E '^(PKG_VERSION|LUCI_PKGARCH|LUCI_DEPENDS)' package/luci-app-device-gateway/Makefile
+          echo "插件接入完成：package/luci-app-device-gateway"
 
       - name: 记录基线并确认设备存在
         working-directory: openwrt

@@ -11,7 +11,7 @@ Actions 里三个入口：
 |---|---|---|
 | **Build ImmortalWrt** | `immortalwrt/immortalwrt` | 正式线。**移植** NSS：构建时把 ppe-nss 的 `nss-wifi-drv` + 18 个 mac80211 补丁搬进来（`nss` 可选，默认开） |
 | **Build OpenWrt (NSS)** | `JuliusBairaktaris/openwrt-ppe-nss@ppe-nss` | 正式线。**整树** NSS：直接编那棵树，组件本来就在里面 |
-| **Build · 固件** | 任选（`immortalwrt` / `openwrt` / `lede`） | 简化线：选仓库和分支、设默认 LAN 地址、DDNS 二选一（`ddns` 脚本版+阿里云 / `ddns-go` Go 版）、固定 11 个内置包（msd_lite / WG / qrencode / 流量图 / curl，immortalwrt 另加 autocore）、界面默认简体中文、代理栈单选（配方取自 `kenzok8/small`）。**不带 NSS** |
+| **Build · 固件** | 任选（`immortalwrt` / `openwrt` / `lede`） | 简化线：选仓库和分支、设默认 LAN 地址、DDNS 二选一（`ddns` 脚本版+阿里云 / `ddns-go` Go 版）、固定内置包（msd_lite / WG / qrencode / 流量图 / curl / 指定网关插件，immortalwrt 另加 autocore）、界面默认简体中文、代理栈单选（配方取自 `kenzok8/small`）。**不带 NSS** |
 
 前两个的 `proxy` 取值一样：`daed` `dae` `honk` `homeproxy` `singbox` `passwall`
 `passwall2` `none`。另有 `extra_packages`（额外插件，逗号分隔）和 `release`。
@@ -28,9 +28,15 @@ Actions 里三个入口：
 `luci-app-statistics` `collectd-mod-thermal` `curl` + `luci`，不用选。
 其中 `curl` 是给 honk 探活 /api
 用的：上游 `honk` 包的 DEPENDS 漏了它，缺了会导致 doona 面板通着但 LuCI 仍报
-"管理界面尚未就绪"。它不调用
+"管理界面尚未就绪"。
+
+`Build · 固件` 与 `Build · dae(honk)` 两条线还都内置了 **指定网关**
+（`luci-app-device-gateway`，按设备下发固定 IP / 网关 / DNS）。它是独立单包仓库，
+构建时固定到 commit `c593d0d4` 并 clone 到源码树 `package/` 下；插件同步脚本要用
+`flock`（v1.0.0 的 Makefile 没声明这个依赖），所以一并内置 `flock`。
+两条线都是纯上游构建，都不调
 本仓库的脚本、不叠 `configs/*.config`，`.config` 与 LAN 覆盖都是现场生成的 ——
-定位「上游的问题还是我们的问题」时也用它。
+定位「上游的问题还是我们的问题」时也用它们。
 
 > `daed` 与 `dae` 共用 `luci-app-daede` 这个 LuCI 前端，后端由 workflow 里的
 > choice 指定（默认 daed）。选 `dae` 时会显式把 daed 后端关掉，两者不会同时装。
