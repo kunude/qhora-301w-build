@@ -1,0 +1,750 @@
+name: Build ·dae(honl)
+
+# ─────────────────────────────────────────────────────────────
+# 一条尽量简单的固件构建线：只依赖上游源码树 + kenzok8/small，不调用本仓库的
+# prepare.sh / prepare-build.sh，也不做 NSS 移植（无线走 ath11k 原生驱动）。
+# 需要 NSS / 出厂 uci 覆盖那一套，用 build-immortalwrt.yml。
+#
+# 五个输入项：
+#   ① repo + ref      从哪个仓库、哪个分支取源码（tag / commit 也行）
+#   ② lan_ip          刷机后默认 LAN 地址，出厂即生效；界面语言固定简体中文
+#   ③ ddns            DDNS 二选一：ddns（脚本版+阿里云，<1M）/ ddns-go（Go 版，11M）
+#   ④ proxy_stack     代理栈单选，配方来自 kenzok8/small
+# 另外固定 11 个内置包（immortalwrt 再加一个 autocore），不需要选，见 PKGS_BUILTIN：
+# 组播转单播 / WG / 二维码 / 流量图 / curl / luci 本体 —— 每次构建都要，
+# 放进选项只会让人多点几下。要加东西改 PKGS_BUILTIN 即可。
+#
+# 代理栈为什么单选：openclash / passwall / ssr-plus / homeproxy / daed / dae /
+# honk / nikki 全都要接管 53 和透明代理端口（daed / dae / honk 直接挂内核 eBPF），
+# 同时装通常编得出来，但跑起来会互相抢流量。一次只装一个，省得排查。
+#
+# 各仓库的兼容性（2026-11 实测）：
+#   immortalwrt/immortalwrt  内置包全在（ddns-scripts / msd_lite 在 packages feed，
+#                            两个 luci-app 与 statistics 在 luci feed，wireguard-tools
+#                            与 kmod-wireguard 在源码树 package/ 里，collectd-mod-thermal
+#                            是 collectd 的子包、autocore 在 package/emortal）
+#   coolsnowwolf/lede        有 ddns-scripts / msd_lite，缺 luci-app-msd_lite 等
+#   openwrt/openwrt          官方 feed 里这几个 ddns / msd 包不齐全，也没有 autocore
+# 所以默认 immortalwrt；换别的仓库会在「内置包自检」这一步直接报缺哪个，
+# 不会白编一小时才失败。
+# ─────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: '① 源码仓库'
+        type: choice
+        default: 'immortalwrt/immortalwrt'
+        options:
+          - 'immortalwrt/immortalwrt'
+          - 'openwrt/openwrt'
+          - 'coolsnowwolf/lede'
+
+      ref:
+        description: '① 分支 / tag / commit（属于上面选中的仓库）'
+        type: string
+        default: 'master'
+
+      lan_ip:
+        description: '② 默认 LAN 地址（刷机首次启动即生效）'
+        type: string
+        default: '192.168.35.1'
+
+      ddns:
+        description: '③ DDNS 方案（二选一；ddns=脚本版+阿里云，ddns-go=Go 版）'
+        type: choice
+        default: 'ddns'
+        options:
+          - 'ddns'
+          - 'ddns-go'
+
+      proxy_stack:
+        description: '④ 代理栈（单选；none = 不装任何代理）'
+        type: choice
+        default: 'none'
+        options:
+          - 'none'
+          - 'openclash'
+          - 'passwall'
+          - 'passwall2'
+          - 'ssr-plus'
+          - 'homeproxy'
+          - 'daed'
+          - 'dae'
+          - 'honk'
+          - 'nikki'
+
+permissions:
+  contents: read
+
+env:
+  # 别叫 TARGET / SUBTARGET：这两个名字会被 autotools 当成自己的变量读走，
+  # 历史上有过 libffi 把构建目录建错、一路编到最后才报错的事故。
+  QH_TARGET: qualcommax
+  QH_SUBTARGET: ipq807x
+  QH_DEVICE: qnap_301w
+
+  # 这四个来自 inputs，在 job 级声明，下面 `if:` 才能引用（env 上下文在
+  # 求值 if 时只看静态定义，$GITHUB_ENV 里写进去的值是拿不到的）。
+  REPO: ${{ inputs.repo }}
+  REF: ${{ inputs.ref }}
+  PROXY_STACK: ${{ inputs.proxy_stack }}
+  LAN_IP: ${{ inputs.lan_ip }}
+  DDNS: ${{ inputs.ddns }}
+
+  # ③ 内置包：与选项无关，恒定编入。
+  # curl 必带：kenzok8/small 的 honk 包 DEPENDS 里漏了它，但 rpcd 的
+  # honk_lifecycle_api_owned 和 install 自检都用 `curl --noproxy '*'` 探活
+  # /api；设备没 curl 时 API 明明通着，LuCI 仍判 api_ready=0，报
+  # "Honk is running, but its management interface is not ready."
+  # honk 自带的 diagnose 也会直接报"缺少 curl 命令"。加进公共列，各仓库都有
+  # packages/net/curl，自检能过。
+  # DDNS 单独一列、按 inputs.ddns 二选一（见解析步骤），不放这里。
+  #   ddns     → ddns-scripts + luci-app-ddns + ddns-scripts-aliyun（脚本版，<1M）
+  #   ddns-go  → ddns-go + luci-app-ddns-go（Go 版，单个二进制 11M）
+  # curl 两种方案都要（aliyun 插件 DEPENDS +curl，honk 探活也要），放公共列。
+  PKGS_BUILTIN: >-
+    luci curl msd_lite luci-app-msd_lite
+    wireguard-tools kmod-wireguard luci-proto-wireguard qrencode
+    luci-app-statistics collectd-mod-thermal
+  # 只有 immortalwrt 有的包（package/emortal/autocore）：CPU 负载 / 温度那套状态页。
+  # 别的仓库没这个目录，硬塞进 PKGS_BUILTIN 会让自检直接报缺包，所以单独一列，
+  # 按 REPO 决定加不加。
+  PKGS_IMMORTAL: autocore
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      # ── 输入校验：把能提前发现的错误挡在这里 ──────────────────
+      - name: 解析并校验输入
+        env:
+          LAN_IP: ${{ inputs.lan_ip }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+          [[ -n "${REF// }" ]] || fail "ref（分支 / tag / commit）不能为空"
+          [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail "repo 要写成 owner/name：$REPO"
+          [[ "$REF" =~ ^[A-Za-z0-9_./-]+$ ]] || fail "ref 里出现了非法字符：$REF"
+          # lan_ip：允许带 "/24"，统一去掉；逐段查范围；挡掉明显不能当 LAN 的地址。
+          ip="${LAN_IP%%/*}"
+          [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] \
+            || fail "lan_ip 不是 IPv4 地址：$LAN_IP"
+          for o in "${BASH_REMATCH[@]:1}"; do
+            (( 10#$o <= 255 )) || fail "lan_ip 有超出 255 的段：$LAN_IP"
+          done
+          case "$ip" in
+            0.*|127.*|169.254.*|255.*) fail "lan_ip 不能是 $ip（回环 / 链路本地 / 广播）" ;;
+          esac
+          # 代理栈 → 实际包名。配方都在 kenzok8/small，别名见 README。
+          # daed 与 dae 共用 luci-app-daede 这个前端，后端靠 choice 区分，
+          # 具体选哪个在「生成 .config」那步写死（默认是 daed）。
+          case "$PROXY_STACK" in
+            none)      pkgs="" ;;
+            openclash) pkgs="luci-app-openclash" ;;
+            passwall)  pkgs="luci-app-passwall" ;;
+            passwall2) pkgs="luci-app-passwall2" ;;
+            ssr-plus)  pkgs="luci-app-ssr-plus" ;;
+            homeproxy) pkgs="luci-app-homeproxy" ;;
+            daed)      pkgs="luci-app-daede daed" ;;
+            dae)       pkgs="luci-app-daede dae" ;;
+            honk)      pkgs="luci-app-honk honk" ;;
+            nikki)     pkgs="luci-app-nikki" ;;
+            *) fail "未知 proxy_stack：$PROXY_STACK" ;;
+          esac
+          # DDNS 二选一 → 实际包名。
+          # ddns（脚本版）：ddns-scripts + 前端 + services（update 脚本）+ aliyun 插件。
+          #   ddns-scripts-aliyun 依赖 ddns-scripts +curl +openssl-util，
+          #   curl 在公共列；openssl-util / resolveip / ip 由 defconfig 自动拉。
+          #   luci-i18n-ddns-zh-cn 是 hidden 包，不写在这里 —— 靠下面
+          #   CONFIG_LUCI_LANG_zh_Hans=y 带出来，核对步骤会单独断言它落地。
+          # ddns-go：Go 二进制版，官方 feed 的 ddns-go + luci-app-ddns-go。
+          case "$DDNS" in
+            ddns)     ddns_pkgs="ddns-scripts ddns-scripts-services ddns-scripts-aliyun luci-app-ddns" ;;
+            ddns-go)  ddns_pkgs="ddns-go luci-app-ddns-go" ;;
+            *) fail "未知 ddns：$DDNS（只能是 ddns 或 ddns-go）" ;;
+          esac
+          # 内置包 = 固定列 + DDNS 选择 + （immortalwrt 才有）autocore。
+          # 结果写进 PKGS_ON，后面几步统一用它，免得两处各算一遍再走偏。
+          pkgs_on="$PKGS_BUILTIN $ddns_pkgs"
+          if [[ "$REPO" == "immortalwrt/immortalwrt" ]]; then
+            pkgs_on="$pkgs_on $PKGS_IMMORTAL"
+          fi
+          # 只往下传这两个：LAN_IP 是归一化后的地址，PROXY_PKGS 是查表结果。
+          # REPO / REF / PROXY_STACK 已经是 job 级 env，不用再写。
+          {
+            echo "LAN_IP=$ip"
+            echo "PROXY_PKGS=$pkgs"
+            echo "PKGS_ON=$pkgs_on"
+          } >> "$GITHUB_ENV"
+          {
+            echo "## 构建参数"
+            echo
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 源码 | \`$REPO\` @ \`$REF\` |"
+            echo "| 默认 LAN | \`$ip/24\` |"
+            echo "| 界面语言 | 简体中文（\`luci-i18n-*-zh-cn\`，默认 zh_cn） |"
+            echo "| 内置包 | \`$pkgs_on\` |"
+            echo "| 代理栈 | \`$PROXY_STACK\`${pkgs:+ → \`$pkgs\`} |"
+            echo "| 目标 | \`$QH_TARGET/$QH_SUBTARGET\` → \`$QH_DEVICE\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "参数 OK：$REPO@$REF | LAN=$ip | proxy=$PROXY_STACK($pkgs)"
+      # runner 只有 ~14G 可用，整树编译要 ~30G。不清理会满盘，
+      # 症状是「包级 failed to build 但没有编译错误」，非常误导。
+      - name: 释放磁盘空间
+        run: |
+          set -euo pipefail
+          df -h / | tail -1
+          sudo rm -rf /opt/hostedtoolcache /usr/share/dotnet /usr/local/lib/android \
+            /usr/share/swift /opt/ghc /usr/local/.ghcup /opt/az /usr/share/miniconda \
+            /usr/local/share/boost /usr/local/share/powershell /usr/local/share/chromium \
+            /usr/local/go /usr/lib/jvm || true
+          sudo apt-get clean
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          df -h / | tail -1
+      - name: 安装构建依赖
+        run: |
+          set -euo pipefail
+          sudo apt-get update || true
+          sudo apt-get install -y \
+            bzip2 file flex bison g++ gawk gcc gettext git libelf-dev libncurses-dev \
+            libssl-dev make patch perl python3 python3-setuptools rsync unzip wget \
+            zlib1g-dev zstd
+          # dae / daed 要编 eBPF，bpf-headers 硬性要求 host 有 clang 和 llvm 那套
+          # 工具（llc / opt / llvm-dis / llvm-strip），版本 ≥ 12。runner 一般自带，
+          # 缺哪个补哪个；不装的话会在 bpf.mk 里直接 Stop，报错信息还看不到原因。
+          case "$PROXY_STACK" in
+            daed|dae)
+              for t in clang llc opt llvm-dis llvm-strip; do
+                command -v "$t" >/dev/null 2>&1 || { echo "缺 $t，安装 clang + llvm"; sudo apt-get install -y clang llvm; break; }
+              done
+              clang --version | head -1
+              llc --version 2>/dev/null | head -3 | tail -1 || true
+              ;;
+          esac
+      - name: 检出源码
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.repo }}
+          ref: ${{ inputs.ref }}
+          fetch-depth: 1
+          path: openwrt
+
+      - name: 记录基线并确认设备存在
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+          git log -1 --format='%H %ci %s'
+          {
+            echo "- 实际 commit：\`$(git log -1 --format='%H %ci %s')\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          # 三个仓库都有 ipq807x.mk，但万一将来某个分支把 qnap_301w 挪走/删掉，
+          # 这里立刻红，比编到 image 阶段才发现强。
+          dev_mk="target/linux/$QH_TARGET/image/$QH_SUBTARGET.mk"
+          [[ -f "$dev_mk" ]] || { echo "::error::$dev_mk 不存在，$REPO@$REF 里没有 $QH_TARGET/$QH_SUBTARGET"; exit 1; }
+          grep -q "Device/$QH_DEVICE" "$dev_mk" \
+            || { echo "::error::$dev_mk 里没有 Device/$QH_DEVICE，$REPO@$REF 不支持这台机器"; exit 1; }
+          echo "设备定义 OK：$dev_mk 含 Device/$QH_DEVICE"
+      # ── ② 默认 LAN 地址 / 界面语言 ───────────────────────────
+      # 用 uci-defaults 而不是改 target 的 /etc/config/network：
+      #   · 不绑死具体设备，换仓库也对
+      #   · uci-defaults 由 /etc/init.d/boot（START=10）跑，network 是 START=20，
+      #     所以首次开机网络起来时地址已经是新的，不用再重启一次
+      #   · 脚本执行后自动删除，不会在系统里留垃圾
+      # DHCP 范围不用动：dhcp.lan 的 start=100/limit=150 是相对网段算的。
+      - name: 写入默认 LAN 地址与界面语言
+        run: |
+          set -euo pipefail
+          mkdir -p openwrt/files/etc/uci-defaults
+          f=openwrt/files/etc/uci-defaults/99-set-lan-ip
+          cat > "$f" <<EOF
+          #!/bin/sh
+          # 构建时生成（build-firmware.yml）：把出厂 LAN 地址改成 ${LAN_IP}/24。
+          # 首次启动执行一次，成功后由 OpenWrt 自动删除。
+          if uci -q get network.lan >/dev/null 2>&1; then
+          	uci -q set network.lan.ipaddr='${LAN_IP}/24'
+          	uci -q commit network
+          else
+          	logger -t build-firmware "network.lan 不存在，跳过 LAN 地址设置"
+          fi
+          exit 0
+          EOF
+          chmod +x "$f"
+          echo "--- 生成的 $f ---"
+          cat "$f"
+          # 默认语言钉成简体中文。语言包本身由 CONFIG_LUCI_LANG_zh_Hans 带进来，
+          # 但 /etc/config/luci 出厂是 lang='auto'（跟浏览器走）——浏览器是英文环境的
+          # 时候还是英文界面。这里只在没被人改过（auto / 空）时写 zh_cn。
+          g=openwrt/files/etc/uci-defaults/98-set-luci-lang
+          cat > "$g" <<'EOF'
+          #!/bin/sh
+          # 构建时生成（build-firmware.yml）：默认界面语言改为简体中文。
+          cur="$(uci -q get luci.main.lang)"
+          if [ -z "$cur" ] || [ "$cur" = "auto" ]; then
+          	uci -q set luci.main.lang='zh_cn'
+          	uci -q commit luci
+          fi
+          exit 0
+          EOF
+          chmod +x "$g"
+          echo "--- 生成的 $g ---"
+          cat "$g"
+          # ddns-go 官方版读 /etc/ddns-go/config.yaml；从 kenzo 版固件保留设置刷过来
+          # 时账号密钥域名在旧文件 ddns-go-config.yaml 里，首次开机改名过来。
+          # 只在选 ddns-go 时生成（ddns 脚本版用 UCI，没有这个 YAML）。
+          if [[ "${DDNS:-}" == "ddns-go" ]]; then
+            h=openwrt/files/etc/uci-defaults/97-migrate-ddns-go
+            cat > "$h" <<'EOF'
+          #!/bin/sh
+          # 构建时生成：kenzo 版 ddns-go 的 YAML 改名成官方版路径。
+          OLD=/etc/ddns-go/ddns-go-config.yaml
+          NEW=/etc/ddns-go/config.yaml
+          if [ -s "$OLD" ] && [ ! -s "$NEW" ]; then
+          	mkdir -p /etc/ddns-go
+          	mv "$OLD" "$NEW" 2>/dev/null || cp "$OLD" "$NEW"
+          	chown ddns-go:ddns-go /etc/ddns-go "$NEW" 2>/dev/null
+          	chmod 644 "$NEW" 2>/dev/null
+          	logger -t ddns-go-migrate "已把 $OLD 迁移为 $NEW"
+          fi
+          exit 0
+          EOF
+            chmod +x "$h"
+            echo "--- 生成的 $h ---"
+            cat "$h"
+          fi
+      # ── ④ 代理栈：接入 kenzok8 的两个 feed ────────────────────
+      # 放在 feeds 更新之后、install 之前 —— 要先把官方 feed 拉下来，
+      # 才能删掉和 small 重名的那些目录。
+      #
+      # 顺序很重要：这两个 feed 写在 feeds.conf 最前面，同名包由它们提供。
+      # 官方 feed 里也有 xray-core / sing-box / mosdns 等，不删掉会出现重复包定义。
+      - name: 接入 kenzok8 feed
+        if: inputs.proxy_stack != 'none'
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+          {
+            echo "src-git kenzo https://github.com/kenzok8/openwrt-packages.git"
+            echo "src-git small https://github.com/kenzok8/small.git"
+            cat feeds.conf.default
+          } > feeds.conf
+          echo "--- feeds.conf ---"
+          cat feeds.conf
+          ./scripts/feeds update -a
+          # 去重清单照抄 kenzok8/small 的 README：这些包官方 feed 与 small 都有，
+          # 留着会重复定义。small 自己的版本因为 feed 排在最前面而生效。
+          rm -rf feeds/packages/net/alist feeds/packages/net/adguardhome \
+                 feeds/packages/net/mosdns feeds/packages/net/xray* \
+                 feeds/packages/net/v2ray* feeds/packages/net/sing* \
+                 feeds/packages/net/smartdns feeds/packages/utils/v2dat
+          rm -rf feeds/luci/applications/luci-app-mosdns
+          # golang 不换：immortalwrt / lede 当前 feed 里的 Go 都够新（lede 已到 1.27），
+          # README 里那步 `git clone kenzok8/golang -b 1.26` 是给老树的补丁，照抄反而降级。
+          # 真遇到 "go: module requires go >= x.y" 再在这里补：
+          #   rm -rf feeds/packages/lang/golang
+          #   git clone --depth 1 -b 1.26 https://github.com/kenzok8/golang.git feeds/packages/lang/golang
+          ./scripts/feeds install -a
+          # ddns-go 选官方版：kenzo.index 里仍有 ddns-go 的 stanza（删目录没用，
+          # install 读的是索引），会建一条指向空目录的断链 package/feeds/kenzo/ddns-go；
+          # 官方版因 kenzo 在 feeds.conf 排最前而没被 install。选 ddns-go 时把断链
+          # 换成官方软链，否则 defconfig 时 CONFIG_PACKAGE_ddns-go 会消失。
+          # 两版 UCI 不兼容：kenzo 用 section=basic / ddns-go-config.yaml，
+          # 官方用 section=ddns-go / config.yaml，混用会表现为"ddns-go 没启动"。
+          if [[ "$DDNS" == "ddns-go" ]]; then
+            for spec in \
+              "kenzo/ddns-go|packages/net/ddns-go|packages/ddns-go" \
+              "kenzo/luci-app-ddns-go|luci/applications/luci-app-ddns-go|luci/luci-app-ddns-go"; do
+              IFS='|' read -r old src dst <<<"$spec"
+              [[ -f "feeds/$src/Makefile" ]] || { echo "::error::官方包 feeds/$src 不存在，无法替换 kenzo 版"; exit 1; }
+              rm -f "package/feeds/$old"
+              ln -sfn "../../../feeds/$src" "package/feeds/$dst"
+              echo "OK  package/feeds/$dst -> $(readlink "package/feeds/$dst")"
+            done
+          fi
+      - name: 初始化官方 feed
+        if: inputs.proxy_stack == 'none'
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+      # 早失败：仓库里缺内置包时不要等到编一小时后再发现。
+      #
+      # 判"包在不在"有三个来源，缺一不可：
+      #   ① 独立目录        package/…/foo、feeds/…/foo（ddns-scripts、autocore…）
+      #   ② define 宏       kmod-* 只有 package/kernel/linux/modules/*.mk 里的
+      #                     `define KernelPackage/x`，没有以包名命名的目录
+      #   ③ feed 索引       feeds/<feed>.index 是 scripts/feeds update 生成的元数据，
+      #                     最可靠 —— collectd-mod-thermal 这种是
+      #                     `$(eval $(call BuildPlugin,thermal,…))` 拼出来的，
+      #                     Makefile 里连这个字符串都没有，翻文件必然 MISS
+      - name: 内置包自检（是否存在于源码树 / feed 中）
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+          find_pkg() {
+            local p="$1" hit
+            # ① 目录名 == 包名。用 -print -quit 取第一个就停；不要接 `| grep -q .`，
+            #    管道里 grep 提前退出会让 find 收到 SIGPIPE，pipefail 下整条判断翻脸。
+            hit="$(find package feeds -maxdepth 4 -type d -name "$p" -print -quit 2>/dev/null || true)"
+            if [[ -n "$hit" ]]; then
+              echo "  → 目录 $hit"
+              return 0
+            fi
+            # ② 源码树里 define Package/<包名>
+            if grep -rqsE "^define Package/${p}\$" \
+                 --include='*.mk' --include='Makefile' package; then
+              echo "  → define Package/$p"
+              return 0
+            fi
+            # ② kmod-xxx → define KernelPackage/xxx
+            if [[ "$p" == kmod-* ]] && grep -rqsE "^define KernelPackage/${p#kmod-}\$" \
+                 --include='*.mk' --include='Makefile' package; then
+              echo "  → KernelPackage/${p#kmod-}"
+              return 0
+            fi
+            # ③ feed 索引里登记过
+            if grep -qsE "^Package: ${p}\$" feeds/*.index; then
+              echo "  → feed 索引"
+              return 0
+            fi
+            return 1
+          }
+          missing=()
+          for p in $PKGS_ON; do
+            if find_pkg "$p"; then
+              echo "OK   $p"
+            else
+              echo "MISS $p"
+              missing+=("$p")
+            fi
+          done
+          if (( ${#missing[@]} > 0 )); then
+            total=$(wc -w <<<"$PKGS_ON")
+            echo "::error::$REPO@$REF 里找不到：${missing[*]}"
+            echo "::error::本次要装 $total 个包（固定列 + DDNS 选择 + autocore）。缺包时把 repo 换成 immortalwrt/immortalwrt，或去掉缺的那个"
+            exit 1
+          fi
+          echo "内置包自检通过"
+      # ── 生成 .config ─────────────────────────────────────────
+      # 只写 target/device + 包名，其余交给 kconfig 自己解依赖。
+      # 放在 feeds install 之后：第三方包名要先存在，符号才不会被丢弃。
+      - name: 生成 .config
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+          {
+            echo "CONFIG_TARGET_${QH_TARGET}=y"
+            echo "CONFIG_TARGET_${QH_TARGET}_${QH_SUBTARGET}=y"
+            echo "CONFIG_TARGET_MULTI_PROFILE=y"
+            echo "CONFIG_TARGET_PER_DEVICE_ROOTFS=y"
+            echo "CONFIG_TARGET_DEVICE_${QH_TARGET}_${QH_SUBTARGET}_DEVICE_${QH_DEVICE}=y"
+            echo "CONFIG_TARGET_ROOTFS_SQUASHFS=y"
+          } > .config
+          for p in $PKGS_ON $PROXY_PKGS; do
+            [[ -n "$p" ]] || continue
+            [[ "$p" =~ ^[A-Za-z0-9_.+-]+$ ]] || { echo "::error::非法包名：$p"; exit 1; }
+            echo "CONFIG_PACKAGE_${p}=y" >> .config
+          done
+          # 简体中文界面。不能直接写 CONFIG_PACKAGE_luci-i18n-base-zh-cn=y —— 那些
+          # 语言包在 luci.mk 里是 HIDDEN:=1，hidden 符号的 .config 值会被 kconfig 丢掉，
+          # 只认 default。它们的 default 恰好是 `LUCI_LANG_<tag>||(ALL&&m)`，所以打开
+          # 这个可见的 tristate，所有 luci-i18n-*-zh-cn 就一起默认 =y 了（实测 6 个核心
+          # 语言包 + 各 app 的一二十个，别的语言不受影响）。
+          # 不打开这个开关时，整棵树一个 zh-cn 语言包都不会编出来，界面就是英文。
+          echo "CONFIG_LUCI_LANG_zh_Hans=y" >> .config
+          # 掐掉 kenzok8/small 里 ssr-plus 的一组"全局 choice"默认值，否则 xray-core
+          # 会被悄悄 select 进固件（实测：即使用不到 ssr-plus、连父包都写 =n 也拦不住）。
+          # 根因：small 的 luci-app-ssr-plus 把 V2ray-core Selection 写成
+          #   choice / default PACKAGE_luci-app-ssr-plus_INCLUDE_Xray
+          # 而 INCLUDE_Xray / INCLUDE_Http_Proxy / INCLUDE_GeoData 这些 config 是顶层的，
+          # 没有 depends on PACKAGE_luci-app-ssr-plus。Kconfig 处理 choice 时必定按
+          # default 落一个值，INCLUDE_Xray 就 select PACKAGE_xray-core，
+          # INCLUDE_Http_Proxy 默认 y 又 select PACKAGE_3proxy —— 于是选了 honk/dae，
+          # rootfs 里却多出 xray-core + 3proxy（manifest 实测有，buildinfo 里却没有，
+          # 因为它们是 select 进来的，不是显式配置的）。
+          # 解法：把这一组 choice 显式落到"什么都不带"的分支：V2ray 选 NONE，
+          # 其余默认 y 的 INCLUDE_* 全部置 n。注意父包写 =n 无效（顶层符号不认），
+          # 必须针对这几个符号本身；NONE 要写 =y 才能赢过 choice 的 default Xray。
+          # 只有接入了 small feed 才有这组符号（none 场景不接 small）。
+          if [[ "$PROXY_STACK" != "none" ]]; then
+            {
+              echo "CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_NONE_V2RAY=y"
+              echo "CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_Xray=n"
+              echo "CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_Http_Proxy=n"
+              echo "CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_Mihomo=n"
+              echo "CONFIG_PACKAGE_luci-app-ssr-plus_INCLUDE_GeoData=n"
+            } >> .config
+          fi
+          # daed / dae / honk 的 eBPF 程序靠 CO-RE 读内核结构，没有 BTF 一启动就崩。
+          # 注意这只是"请求"：内核 Kconfig 里 BTF 还 depends on PAHOLE_VERSION >= 116，
+          # pahole 不在 PATH 时会被静默关掉，所以下面编译前会显式把 dwarves 编出来。
+          case "$PROXY_STACK" in
+            daed|dae|honk)
+              echo "CONFIG_KERNEL_DEBUG_INFO=y" >> .config
+              echo "CONFIG_KERNEL_DEBUG_INFO_REDUCED=n" >> .config
+              echo "CONFIG_KERNEL_DEBUG_INFO_BTF=y" >> .config
+              echo "CONFIG_KERNEL_BPF_EVENTS=y" >> .config
+              echo "CONFIG_KERNEL_XDP_SOCKETS=y" >> .config
+              echo "CONFIG_PACKAGE_kmod-sched-core=y" >> .config
+              echo "CONFIG_PACKAGE_kmod-sched-bpf=y" >> .config
+              echo "CONFIG_PACKAGE_kmod-veth=y" >> .config
+              echo "CONFIG_PACKAGE_kmod-xdp-sockets-diag=y" >> .config
+              ;;
+          esac
+          case "$PROXY_STACK" in
+            openclash)
+              # openclash 的 DEPENDS 是 dnsmasq-full；不显式关掉会和默认的
+              # dnsmasq 撞成 recursive dependency，defconfig 直接报错。
+              echo "CONFIG_PACKAGE_dnsmasq=n" >> .config
+              echo "CONFIG_PACKAGE_dnsmasq-full=y" >> .config
+              ;;
+          esac
+          # dae / daed 的 eBPF 要 bpf-headers，而 bpf-headers 需要一套 host LLVM。
+          # 「用哪套 LLVM」是 toolchain/Config.in 里的 choice BPF_TOOLCHAIN，它的
+          # prompt 带 `if DEVEL` —— 不开 DEVEL 就不可见，而 kconfig 对不可见符号
+          # 一律取 default、无视 .config 里写的值（和隐藏包是同一个坑）。
+          # 默认值是 BUILD_LLVM：在 git 树上（没有 llvm-bpf/.llvm-version）等于
+          # 现场编一遍 LLVM 22，一小时起步、十几 G 磁盘，CI 里根本跑不完。
+          # 所以开 DEVEL 把这个 choice 露出来，显式选 host LLVM。
+          # DEVEL 在本树里只影响这一个 choice（其余 !DEVEL 条件都在同一处）。
+          case "$PROXY_STACK" in
+            daed|dae)
+              echo "CONFIG_DEVEL=y" >> .config
+              echo "CONFIG_BPF_TOOLCHAIN_HOST=y" >> .config
+              echo "CONFIG_USE_LLVM_HOST=y" >> .config
+              ;;
+          esac
+          case "$PROXY_STACK" in
+            daed|dae)
+              # daed 与 dae 共用 luci-app-daede 前端，后端是个 choice，默认选 daed。
+              # 不显式改过去，选 dae 时会连 daed 一起拖进来 —— 两个 eBPF 代理
+              # 抢同一套挂载点，跑不起来。
+              #
+              # 符号名别猜错：后端选项在 luci-app-daede 自己的 Package/config 里，
+              # 名字带前端前缀 —— CONFIG_PACKAGE_luci-app-daede_dae / …_daed。
+              # 很容易顺手写成 CONFIG_PACKAGE_luci-app-dae=y，那是另一个包：
+              # 官方 luci feed 的独立前端，DEPENDS +dae-geoip +dae-geosite，
+              # 而本构建里 dae 来自 kenzok8/small（用 v2ray-geoip/v2ray-geosite），
+              # dae-geoip / dae-geosite 根本不存在，符号能留下来但一编就报缺依赖。
+              for b in daed dae; do
+                if [[ "$b" == "$PROXY_STACK" ]]; then
+                  echo "CONFIG_PACKAGE_luci-app-daede_${b}=y" >> .config
+                else
+                  echo "CONFIG_PACKAGE_luci-app-daede_${b}=n" >> .config
+                fi
+              done
+              ;;
+          esac
+          echo "--- 请求的 .config ---"
+          cat .config
+      - name: defconfig 并核对符号
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+          make defconfig
+          want="$PKGS_ON $PROXY_PKGS"
+          bad=0
+          for p in $want; do
+            [[ -n "$p" ]] || continue
+            if grep -q "^CONFIG_PACKAGE_${p}=y" .config; then
+              echo "OK  $p"
+            else
+              echo "::error::$p 被 defconfig 丢弃（依赖不满足 / 包不存在）"
+              bad=$((bad + 1))
+            fi
+          done
+          # 中文语言包是 hidden 符号，只在 LUCI_LANG_zh_Hans 打开时按 default 生效。
+          # 它要是没落地，固件起来就是英文界面 —— 这里直接卡住。
+          i18n=$(grep -cE "^CONFIG_PACKAGE_luci-i18n-.*-zh-cn=y" .config)
+          if [[ "$i18n" -lt 3 ]]; then
+            echo "::error::中文语言包只落了 $i18n 个，CONFIG_LUCI_LANG_zh_Hans 没生效，界面会是英文"
+            bad=$((bad + 1))
+          else
+            echo "OK  中文语言包 $i18n 个（luci-i18n-*-zh-cn）"
+          fi
+          # DDNS 二选一后的落地断言。
+          case "$DDNS" in
+            ddns)
+              # 阿里云插件 + 它的依赖链都要真的活下来。ddns-scripts-aliyun 的
+              # DEPENDS 是 ddns-scripts +curl +openssl-util；ddns-scripts 再拉
+              # ddns-scripts-services / resolveip / ip。缺一个运行时就报"更新失败"。
+              for p in ddns-scripts ddns-scripts-services ddns-scripts-aliyun \
+                       luci-app-ddns openssl-util resolveip; do
+                grep -q "^CONFIG_PACKAGE_${p}=y" .config \
+                  || { echo "::error::ddns 方案缺 $p（aliyun 插件依赖链没满足）"; bad=$((bad + 1)); }
+              done
+              # zh-cn 语言包是 hidden 符号，只能靠 CONFIG_LUCI_LANG_zh_Hans 带出来；
+              # 单独断言 ddns 的那一支确实落地，否则 ddns 界面还是英文。
+              grep -q "^CONFIG_PACKAGE_luci-i18n-ddns-zh-cn=y" .config \
+                || { echo "::error::luci-i18n-ddns-zh-cn 没落地，DDNS 界面会是英文"; bad=$((bad + 1)); }
+              ;;
+            ddns-go)
+              # 官方版 ddns-go 用 section=ddns-go / config.yaml，不能是 kenzo 版。
+              for p in ddns-go luci-app-ddns-go; do
+                grep -q "^CONFIG_PACKAGE_${p}=y" .config \
+                  || { echo "::error::ddns-go 方案缺 $p（feed 断链没修好？）"; bad=$((bad + 1)); }
+              done
+              grep -q "^CONFIG_PACKAGE_luci-i18n-ddns-go-zh-cn=y" .config \
+                || { echo "::error::luci-i18n-ddns-go-zh-cn 没落地，ddns-go 界面会是英文"; bad=$((bad + 1)); }
+              ;;
+          esac
+          # daed 与 dae 共用一个前端，后端是 choice。选错会连另一个一起装进来，
+          # 或者两个都没选（dae 还要求内核真的带 BTF 才会给出 DAE_USE_KERNEL_BTF）。
+          case "$PROXY_STACK" in
+            daed|dae)
+              other=$([[ "$PROXY_STACK" == "dae" ]] && echo daed || echo dae)
+              grep -q "^CONFIG_PACKAGE_luci-app-daede_${PROXY_STACK}=y" .config \
+                || { echo "::error::luci-app-daede 的后端没选成 $PROXY_STACK"; bad=$((bad + 1)); }
+              if grep -q "^CONFIG_PACKAGE_${other}=y" .config; then
+                echo "::error::luci-app-daede 把 $other 也带进来了，两者必须互斥"
+                bad=$((bad + 1))
+              fi
+              # 顺手挡住"符号写错成官方 luci-app-dae / daed"这种情况：这两个包的
+              # 依赖 dae-geoip / dae-geosite 在本构建里不存在，符号能留下但编不过。
+              for wrong in luci-app-dae luci-app-daed; do
+                if grep -q "^CONFIG_PACKAGE_${wrong}=y" .config; then
+                  echo "::error::$wrong 被选进来了：前端应该用 luci-app-daede（small），后端靠它的 choice 区分"
+                  bad=$((bad + 1))
+                fi
+              done
+              ;;
+          esac
+          # dae 的 BTF 来源也是 choice：内核真带 BTF 时才选得中 DAE_USE_KERNEL_BTF，
+          # 否则会掉到 vmlinux-btf 包（我们没有装），运行时起不来。
+          if [[ "$PROXY_STACK" == "dae" ]]; then
+            grep -q "^CONFIG_KERNEL_DEBUG_INFO_BTF=y" .config \
+              || { echo "::error::dae 需要内核 BTF，但 CONFIG_KERNEL_DEBUG_INFO_BTF 不是 y"; bad=$((bad + 1)); }
+            grep -q "^CONFIG_DAE_USE_KERNEL_BTF=y" .config \
+              || { echo "::error::dae 没有选到 DAE_USE_KERNEL_BTF，CO-RE 会缺 BTF 来源"; bad=$((bad + 1)); }
+          fi
+          # honk-core 同理：它是预编译的 eBPF 程序，靠 CO-RE 读内核结构，
+          # 内核没有 .BTF 段时能装能起、但一加载规则就崩，所以也要卡住。
+          if [[ "$PROXY_STACK" == "honk" ]]; then
+            grep -q "^CONFIG_KERNEL_DEBUG_INFO_BTF=y" .config \
+              || { echo "::error::honk 需要内核 BTF，但 CONFIG_KERNEL_DEBUG_INFO_BTF 不是 y"; bad=$((bad + 1)); }
+          fi
+          # 全局守卫：本构建没有任何代理栈需要 xray-core / 3proxy。它们一旦出现，
+          # 就是 kenzok8/small 里 ssr-plus 那组顶层 choice 默认值没被压住（见生成
+          # .config 那步的注释），会白白把镜像撑大、还带来没配过的安全面。选 none
+          # 时没接 small feed，这两个符号本就不该存在。
+          for stray in xray-core 3proxy; do
+            if grep -q "^CONFIG_PACKAGE_${stray}=y" .config; then
+              echo "::error::$stray 被 ssr-plus 的全局 choice 默认 select 进来了，需在生成 .config 时压住那一组 choice"
+              bad=$((bad + 1))
+            fi
+          done
+          # host LLVM 必须活到 defconfig 之后，否则 bpf-headers 会在 bpf.mk 里
+          # 直接 Stop，报错只有一句 "LLVM/clang version too old ... found: ."。
+          case "$PROXY_STACK" in
+            daed|dae)
+              grep -q "^CONFIG_USE_LLVM_HOST=y" .config \
+                || { echo "::error::CONFIG_USE_LLVM_HOST 没活下来，eBPF 会退化成源码编 LLVM"; bad=$((bad + 1)); }
+              ;;
+          esac
+          [[ "$bad" -eq 0 ]] || { echo "::error::共 $bad 项没通过"; exit 1; }
+          echo "--- 生效的 target / device ---"
+          grep -E "^CONFIG_TARGET_(${QH_TARGET}|DEVICE_|MULTI_PROFILE)" .config
+      - name: 下载源码包
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+          for i in 1 2 3; do
+            make download -j"$(nproc)" && exit 0
+            echo "::warning::download 第 $i 次失败，重试"
+          done
+          exit 1
+      - name: 编译
+        working-directory: openwrt
+        env:
+          BUILD_LOG: ${{ runner.temp }}/build.log
+        run: |
+          # run 块默认带 -e，接不住 make 的失败；先关掉才能做完"失败现场"。
+          set +e
+          set -uo pipefail
+          : > "$BUILD_LOG"
+          (
+            # pahole：内核 BTF 的 Kconfig 依赖 PAHOLE_VERSION >= 116，
+            # pahole 缺失时 olddefconfig 会把 CONFIG_DEBUG_INFO_BTF 静默改成 n，
+            # 构建全绿但 daed / dae / honk 一跑就崩。不用 BTF 的变体不编它，省两分钟。
+            case "$PROXY_STACK" in
+              daed|dae|honk)
+                echo "--- 预编 dwarves（pahole）---"
+                timeout 900 make tools/dwarves/compile V=s </dev/null \
+                  || echo "::warning::dwarves 预编失败，内核 BTF 可能被静默关掉"
+                ;;
+            esac
+            # po2lmo：luci-app-daede（daed / dae 的前端）与 small 版 openclash 的
+            # Makefile 里直接调它，但这两个配方都没写 PKG_BUILD_DEPENDS:=luci-base/host，
+            # 并行编译时就可能先编到它们、po2lmo 还没生成，报 "po2lmo: not found"。
+            # 单独把 host 版编出来只要一两秒，换掉这条最莫名其妙的失败。
+            case "$PROXY_STACK" in
+              daed|dae|openclash)
+                echo "--- 预编 luci-base/host（po2lmo / jsmin）---"
+                timeout 900 make package/luci-base/host/compile V=s </dev/null \
+                  || echo "::warning::luci-base/host 预编失败，luci 的多语言编译可能受影响"
+                ;;
+            esac
+            # V=s：包级输出直接进日志，避免只剩一句 "failed to build"
+            make -j"$(nproc)" V=s
+          ) 2>&1 | tee -a "$BUILD_LOG"
+          rc=${PIPESTATUS[0]}
+          echo "make 退出码：$rc"
+          exit "$rc"
+      - name: 失败现场
+        if: failure()
+        run: |
+          log="$RUNNER_TEMP/build.log"
+          df -h / || true
+          if [[ -s "$log" ]]; then
+            # 补丁失败那几类关键词必须在内：2026-11-14 就因为漏了它，
+            # 公开注解里只剩 make 的 Error 1，看不到真正原因。
+            grep -nE '(Patch failed|hunk .*FAILED|patch does not apply|can.t find file to patch|saving rejects to file|ERROR: .* failed to build|\*\*\* \[.*\] Error|No space left on device|Killed|fatal error:|No rule to make target|Error [0-9]+$)' "$log" \
+              | tail -40 | while IFS= read -r line; do echo "::error::$line"; done || true
+            echo "--- build.log 末尾 ---"
+            tail -60 "$log"
+          else
+            echo "没有编译日志（编译步骤之前就失败了）"
+          fi
+      - name: 上传编译日志
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-log-run${{ github.run_number }}
+          path: ${{ runner.temp }}/build.log
+          if-no-files-found: ignore
+
+      # ── 产物 ────────────────────────────────────────────────
+      - name: 收集产物
+        if: success()
+        id: collect
+        run: |
+          set -euo pipefail
+          out="openwrt/bin/targets/$QH_TARGET/$QH_SUBTARGET"
+          [[ -d "$out" ]] || { echo "::error::$out 不存在，没编出镜像"; exit 1; }
+          echo "--- 产物 ---"
+          ls -lh "$out"
+          img=$(find "$out" -maxdepth 1 -type f \( -name '*squashfs*sysupgrade*.bin' -o -name '*squashfs*.bin' \) -printf '%s %p\n' | sort -rn | head -1 | awk '{print $2}')
+          [[ -n "$img" ]] || { echo "::error::没找到 squashfs 镜像"; exit 1; }
+          echo "主镜像：$img（$(du -h "$img" | cut -f1)）"
+          echo "IMG=$img" >> "$GITHUB_OUTPUT"
+          {
+            echo
+            echo "## 产物"
+            echo
+            echo "- 镜像：\`$(basename "$img")\`（$(du -h "$img" | cut -f1)）"
+            if ls "$out"/*.manifest >/dev/null 2>&1; then
+              echo "- rootfs 包数：\`$(cat "$out"/*.manifest | wc -l) 行\`"
+            fi
+            echo "- 刷机后默认地址：\`http://$LAN_IP/\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: 上传镜像
+        if: success()
+        uses: actions/upload-artifact@v7
+        with:
+          name: firmware-${{ env.PROXY_STACK }}-${{ github.run_number }}
+          path: openwrt/bin/targets/qualcommax/ipq807x
+          if-no-files-found: error
