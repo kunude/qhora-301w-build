@@ -356,23 +356,30 @@ jobs:
           cat feeds.conf
           ./scripts/feeds update -a
 
-          # 2026-11-18 晚 kenzok8/small 的 d94fd64 把 dae 升到 2026.11.17，
-          # Build/Prepare 里新增 test -s ../ci/patches/dae-core/0001-keep-protocol-wrappers-in-tcp-relay.patch
-          # 并 PatchDir 那个目录，但整个仓库根本没有 ci/ 目录、也没有这个 patch 文件
-          # （11-20 的 master 仍是 2026.11.17、仍未修）。结果任何 dae 构建都在
-          # .prepared 阶段挂掉（Makefile:155 ... /core/.prepared_xxx Error 1）。
-          # 这里只对 dae 把 small 回退到 bug 前的 451dfd7（dae 2026.11.09，已验证可编）；
-          # 其它栈不受影响，继续用最新 small。等上游补上那个 patch 后删掉这段即可。
+          # dae 的 Build/Prepare 会 test -s ../ci/patches/dae-core/0001-keep-protocol-wrappers-in-tcp-relay.patch
+          # 并 PatchDir 那个目录，但 small 仓库漏带了这个文件（整个 ci/ 目录都没有），
+          # 任何 dae 构建都在 .prepared 阶段挂掉。
+          #
+          # 不回退到旧版了：这个 patch 的真身在 kenzok8/openwrt-daede 仓库，
+          # 而且 small 用的 dae 源码 tarball（dae-src-<ver>-<hash>.tar.gz）也来自同一仓库 ——
+          # 版本配套，patch 能干净应用（本地 patch -p1 --dry-run 两文件全过）。
+          # 这里把补丁文件拉下来放进 small 的 ci/patches/dae-core/，即可用新版 dae
+          # 并吃到这个 TCP 中继的正确性+性能优化。上游补齐 ci/ 目录后这段可删。
           if [[ "$PROXY_STACK" == "dae" ]]; then
-            echo "--- dae：将 small feed 回退到 451dfd7（规避上游缺失 patch）---"
-            # feeds update 可能是浅克隆，老 commit 不在本地时先补 fetch。
-            git -C feeds/small cat-file -e 451dfd7^{commit} 2>/dev/null \
-              || git -C feeds/small fetch -q --depth 1 origin 451dfd7 2>/dev/null \
-              || git -C feeds/small fetch -q --unshallow origin 2>/dev/null \
-              || true
-            git -C feeds/small checkout -q 451dfd7 \
-              || { echo "::error::feeds/small 回退到 451dfd7 失败，dae 会撞上游缺失 patch"; exit 1; }
+            patch_url="https://raw.githubusercontent.com/kenzok8/openwrt-daede/main/ci/patches/dae-core/0001-keep-protocol-wrappers-in-tcp-relay.patch"
+            patch_dir="feeds/small/ci/patches/dae-core"
+            patch_file="$patch_dir/0001-keep-protocol-wrappers-in-tcp-relay.patch"
+            echo "--- dae：补齐 small 漏带的 TCP 中继补丁（用新版 dae，不回退）---"
             grep -E '^PKG_VERSION' feeds/small/dae/Makefile | head -1
+            mkdir -p "$patch_dir"
+            curl -fsSL --retry 3 -o "$patch_file" "$patch_url" \
+              || { echo "::error::拉取 dae TCP 中继补丁失败：$patch_url"; exit 1; }
+            # 校验：非空 + 必须同时含两个目标文件的 diff（防止拿到 404 页面或半成品）。
+            test -s "$patch_file" \
+              && grep -q 'control/tcp_relay_capabilities.go' "$patch_file" \
+              && grep -q 'control/frozen_ad_regression_test.go' "$patch_file" \
+              || { echo "::error::dae 补丁内容不完整，构建会在 .prepared 挂掉"; exit 1; }
+            echo "补丁已就位：$(wc -l < "$patch_file") 行"
           fi
 
           # 去重清单照抄 kenzok8/small 的 README：这些包官方 feed 与 small 都有，
